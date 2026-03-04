@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Model weights (too large for git)
+floorplan3d/model/weights/
+*.pt
+*.pth
+*.onnx
+
+# Training runs
+runs/
+
+# Datasets (downloaded separately)
+floorplan3d/model/data/cubicasa5k/
+floorplan3d/model/data/robin/
+floorplan3d/model/data/yolo_format/
+
+# Blender
+*.blend1
+*.blend2
+
+# Packaged add-on
+*.zip
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

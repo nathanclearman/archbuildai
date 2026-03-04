@@ -1,0 +1,36 @@
+{
+  "scale": { "pixels_per_meter": 50 },
+  "walls": [
+    { "start": [0, 0], "end": [5, 0], "thickness": 0.15 },
+    { "start": [5, 0], "end": [5, 4], "thickness": 0.15 },
+    { "start": [5, 4], "end": [0, 4], "thickness": 0.15 },
+    { "start": [0, 4], "end": [0, 0], "thickness": 0.15 },
+    { "start": [0, 2.5], "end": [2, 2.5], "thickness": 0.1 },
+    { "start": [2, 2.5], "end": [2, 4], "thickness": 0.1 }
+  ],
+  "doors": [
+    { "position": [2.5, 0], "width": 0.9, "type": "hinged", "wall_index": 0 },
+    { "position": [2, 3.2], "width": 0.7, "type": "hinged", "wall_index": 5 }
+  ],
+  "windows": [
+    { "position": [3.5, 4], "width": 1.5, "wall_index": 2 },
+    { "position": [5, 2], "width": 1.0, "wall_index": 1 }
+  ],
+  "rooms": [
+    {
+      "label": "main_room",
+      "polygon": [[0, 0], [5, 0], [5, 2.5], [2, 2.5], [0, 2.5]],
+      "area": 12.5
+    },
+    {
+      "label": "kitchenette",
+      "polygon": [[2, 2.5], [5, 2.5], [5, 4], [2, 4]],
+      "area": 4.5
+    },
+    {
+      "label": "bathroom",
+      "polygon": [[0, 2.5], [2, 2.5], [2, 4], [0, 4]],
+      "area": 3.0
+    }
+  ]
+}
