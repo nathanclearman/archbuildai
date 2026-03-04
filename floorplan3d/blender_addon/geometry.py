@@ -1,0 +1,411 @@
+"""
+Geometry generation from parsed floor plan JSON data.
+
+Creates Blender meshes for walls, floors, ceilings, door/window openings,
+and room labels from the structured JSON output of the floor plan parser.
+"""
+
+import bpy
+import bmesh
+import math
+from mathutils import Vector, Matrix
+
+
+def create_floorplan_collection(context):
+    """Create or clear the FloorPlan3D collection."""
+    collection = bpy.data.collections.get("FloorPlan3D")
+    if collection:
+        for obj in list(collection.objects):
+            bpy.data.objects.remove(obj, do_unlink=True)
+    else:
+        collection = bpy.data.collections.new("FloorPlan3D")
+        context.scene.collection.children.link(collection)
+    return collection
+
+
+def _link_to_collection(obj, collection):
+    """Link an object to the given collection only."""
+    collection.objects.link(obj)
+
+
+def _wall_direction(start, end):
+    """Return normalized direction and length between two 2D points."""
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.sqrt(dx * dx + dy * dy)
+    if length < 1e-6:
+        return Vector((1, 0)), 0.0
+    return Vector((dx / length, dy / length)), length
+
+
+def _perpendicular_2d(direction):
+    """Return the 2D perpendicular (rotated 90 degrees CCW)."""
+    return Vector((-direction.y, direction.x))
+
+
+def generate_walls(floor_plan_data, collection, wall_height):
+    """Generate wall meshes from floor plan data.
+
+    Each wall is a rectangular box defined by start/end points, thickness, and height.
+    Returns the number of walls generated.
+    """
+    from . import materials
+
+    count = 0
+    walls = floor_plan_data.get("walls", [])
+    for i, wall_data in enumerate(walls):
+        start = Vector(wall_data["start"])
+        end = Vector(wall_data["end"])
+        thickness = wall_data.get("thickness", 0.15)
+
+        direction, length = _wall_direction(start, end)
+        if length < 1e-6:
+            continue
+
+        perp = _perpendicular_2d(direction)
+        half_t = thickness / 2.0
+
+        # Four corners of the wall base
+        corners = [
+            Vector((start.x - perp.x * half_t, start.y - perp.y * half_t, 0)),
+            Vector((start.x + perp.x * half_t, start.y + perp.y * half_t, 0)),
+            Vector((end.x + perp.x * half_t, end.y + perp.y * half_t, 0)),
+            Vector((end.x - perp.x * half_t, end.y - perp.y * half_t, 0)),
+        ]
+
+        mesh = bpy.data.meshes.new(f"Wall_{i}")
+        bm = bmesh.new()
+
+        # Create base face
+        verts = [bm.verts.new(c) for c in corners]
+        bm.faces.new(verts)
+
+        # Extrude upward
+        result = bmesh.ops.extrude_face_region(bm, geom=bm.faces[:])
+        extruded_verts = [v for v in result["geom"] if isinstance(v, bmesh.types.BMVert)]
+        bmesh.ops.translate(bm, vec=Vector((0, 0, wall_height)), verts=extruded_verts)
+
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+        obj = bpy.data.objects.new(f"Wall_{i}", mesh)
+        obj["fp3d_type"] = "wall"
+        obj["fp3d_wall_index"] = i
+        obj["fp3d_original_height"] = wall_height
+        _link_to_collection(obj, collection)
+
+        materials.assign_wall_material(obj)
+        count += 1
+
+    return count
+
+
+def generate_door_openings(floor_plan_data, collection, wall_height):
+    """Cut door openings into walls using boolean modifiers.
+
+    Doors are full-height openings (default 2.1m) cut from the bottom of the wall.
+    Returns the number of door openings created.
+    """
+    count = 0
+    doors = floor_plan_data.get("doors", [])
+    walls = floor_plan_data.get("walls", [])
+
+    for i, door_data in enumerate(doors):
+        wall_idx = door_data.get("wall_index", 0)
+        if wall_idx >= len(walls):
+            continue
+
+        wall_data = walls[wall_idx]
+        start = Vector(wall_data["start"])
+        end = Vector(wall_data["end"])
+        thickness = wall_data.get("thickness", 0.15)
+
+        direction, wall_length = _wall_direction(start, end)
+        if wall_length < 1e-6:
+            continue
+
+        perp = _perpendicular_2d(direction)
+        half_t = thickness / 2.0
+
+        # Door position along wall (distance from start)
+        door_pos = door_data.get("position", [0, 0])
+        # Position can be [x, y] absolute or a distance along the wall
+        if isinstance(door_pos, (list, tuple)) and len(door_pos) == 2:
+            # Calculate distance along wall from start
+            dp = Vector(door_pos) - start
+            dist_along = dp.dot(direction)
+        else:
+            dist_along = float(door_pos)
+
+        door_width = door_data.get("width", 0.9)
+        door_height = door_data.get("height", 2.1)
+
+        # Center of door along the wall
+        center_along = dist_along
+        half_w = door_width / 2.0
+
+        # Create cutter box
+        cutter_center = (
+            start.x + direction.x * center_along,
+            start.y + direction.y * center_along,
+            door_height / 2.0,
+        )
+
+        mesh = bpy.data.meshes.new(f"DoorCutter_{i}")
+        bm = bmesh.new()
+
+        # Cutter box slightly larger than wall thickness to ensure clean cut
+        margin = thickness * 1.5
+        corners = [
+            Vector((-half_w, -margin, -door_height / 2.0)),
+            Vector((half_w, -margin, -door_height / 2.0)),
+            Vector((half_w, margin, -door_height / 2.0)),
+            Vector((-half_w, margin, -door_height / 2.0)),
+        ]
+        verts = [bm.verts.new(c) for c in corners]
+        bm.faces.new(verts)
+        result = bmesh.ops.extrude_face_region(bm, geom=bm.faces[:])
+        extruded_verts = [v for v in result["geom"] if isinstance(v, bmesh.types.BMVert)]
+        bmesh.ops.translate(bm, vec=Vector((0, 0, door_height)), verts=extruded_verts)
+
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+        cutter_obj = bpy.data.objects.new(f"DoorCutter_{i}", mesh)
+        cutter_obj.location = Vector(cutter_center)
+
+        # Rotate cutter to align with wall direction
+        angle = math.atan2(direction.y, direction.x)
+        cutter_obj.rotation_euler.z = angle
+
+        _link_to_collection(cutter_obj, collection)
+
+        # Apply boolean modifier to the wall
+        wall_obj_name = f"Wall_{wall_idx}"
+        wall_obj = bpy.data.objects.get(wall_obj_name)
+        if wall_obj:
+            mod = wall_obj.modifiers.new(name=f"Door_{i}", type='BOOLEAN')
+            mod.operation = 'DIFFERENCE'
+            mod.object = cutter_obj
+            mod.solver = 'FLOAT'
+
+            # Apply the modifier
+            bpy.context.view_layer.objects.active = wall_obj
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+
+            # Hide/remove cutter
+            bpy.data.objects.remove(cutter_obj, do_unlink=True)
+            count += 1
+
+    return count
+
+
+def generate_window_openings(floor_plan_data, collection, wall_height):
+    """Cut window openings into walls.
+
+    Windows are openings at a given sill height (default 0.9m) with a
+    default height of 1.2m.
+    Returns the number of window openings created.
+    """
+    count = 0
+    windows = floor_plan_data.get("windows", [])
+    walls = floor_plan_data.get("walls", [])
+
+    for i, win_data in enumerate(windows):
+        wall_idx = win_data.get("wall_index", 0)
+        if wall_idx >= len(walls):
+            continue
+
+        wall_data = walls[wall_idx]
+        start = Vector(wall_data["start"])
+        end = Vector(wall_data["end"])
+        thickness = wall_data.get("thickness", 0.15)
+
+        direction, wall_length = _wall_direction(start, end)
+        if wall_length < 1e-6:
+            continue
+
+        perp = _perpendicular_2d(direction)
+
+        win_pos = win_data.get("position", [0, 0])
+        if isinstance(win_pos, (list, tuple)) and len(win_pos) == 2:
+            dp = Vector(win_pos) - start
+            dist_along = dp.dot(direction)
+        else:
+            dist_along = float(win_pos)
+
+        win_width = win_data.get("width", 1.2)
+        win_height = win_data.get("height", 1.2)
+        sill_height = win_data.get("sill_height", 0.9)
+
+        center_along = dist_along
+        half_w = win_width / 2.0
+
+        cutter_center = (
+            start.x + direction.x * center_along,
+            start.y + direction.y * center_along,
+            sill_height + win_height / 2.0,
+        )
+
+        mesh = bpy.data.meshes.new(f"WindowCutter_{i}")
+        bm = bmesh.new()
+
+        margin = thickness * 1.5
+        corners = [
+            Vector((-half_w, -margin, -win_height / 2.0)),
+            Vector((half_w, -margin, -win_height / 2.0)),
+            Vector((half_w, margin, -win_height / 2.0)),
+            Vector((-half_w, margin, -win_height / 2.0)),
+        ]
+        verts = [bm.verts.new(c) for c in corners]
+        bm.faces.new(verts)
+        result = bmesh.ops.extrude_face_region(bm, geom=bm.faces[:])
+        extruded_verts = [v for v in result["geom"] if isinstance(v, bmesh.types.BMVert)]
+        bmesh.ops.translate(bm, vec=Vector((0, 0, win_height)), verts=extruded_verts)
+
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+        cutter_obj = bpy.data.objects.new(f"WindowCutter_{i}", mesh)
+        cutter_obj.location = Vector(cutter_center)
+
+        angle = math.atan2(direction.y, direction.x)
+        cutter_obj.rotation_euler.z = angle
+
+        _link_to_collection(cutter_obj, collection)
+
+        wall_obj_name = f"Wall_{wall_idx}"
+        wall_obj = bpy.data.objects.get(wall_obj_name)
+        if wall_obj:
+            mod = wall_obj.modifiers.new(name=f"Window_{i}", type='BOOLEAN')
+            mod.operation = 'DIFFERENCE'
+            mod.object = cutter_obj
+            mod.solver = 'FLOAT'
+
+            bpy.context.view_layer.objects.active = wall_obj
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+
+            bpy.data.objects.remove(cutter_obj, do_unlink=True)
+            count += 1
+
+    return count
+
+
+def generate_floors(floor_plan_data, collection):
+    """Generate floor planes from room polygons. Returns the number of floors generated."""
+    from . import materials
+
+    count = 0
+    rooms = floor_plan_data.get("rooms", [])
+    for i, room_data in enumerate(rooms):
+        polygon = room_data.get("polygon", [])
+        if len(polygon) < 3:
+            continue
+
+        label = room_data.get("label", f"Room_{i}")
+
+        mesh = bpy.data.meshes.new(f"Floor_{label}_{i}")
+        bm = bmesh.new()
+
+        verts = [bm.verts.new(Vector((p[0], p[1], 0))) for p in polygon]
+        try:
+            bm.faces.new(verts)
+        except ValueError:
+            # Face creation can fail if verts are collinear
+            bm.free()
+            continue
+
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+        obj = bpy.data.objects.new(f"Floor_{label}_{i}", mesh)
+        obj["fp3d_type"] = "floor"
+        obj["fp3d_room_label"] = label
+        _link_to_collection(obj, collection)
+
+        materials.assign_floor_material(obj)
+        count += 1
+
+    return count
+
+
+def generate_ceilings(floor_plan_data, collection, wall_height):
+    """Generate ceiling planes from room polygons. Returns the number of ceilings generated."""
+    from . import materials
+
+    count = 0
+    rooms = floor_plan_data.get("rooms", [])
+    for i, room_data in enumerate(rooms):
+        polygon = room_data.get("polygon", [])
+        if len(polygon) < 3:
+            continue
+
+        label = room_data.get("label", f"Room_{i}")
+
+        mesh = bpy.data.meshes.new(f"Ceiling_{label}_{i}")
+        bm = bmesh.new()
+
+        verts = [bm.verts.new(Vector((p[0], p[1], wall_height))) for p in polygon]
+        try:
+            face = bm.faces.new(verts)
+            # Flip normal to face downward
+            face.normal_flip()
+        except ValueError:
+            bm.free()
+            continue
+
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+        obj = bpy.data.objects.new(f"Ceiling_{label}_{i}", mesh)
+        obj["fp3d_type"] = "ceiling"
+        obj["fp3d_room_label"] = label
+        _link_to_collection(obj, collection)
+
+        materials.assign_ceiling_material(obj)
+        count += 1
+
+    return count
+
+
+def generate_room_labels(floor_plan_data, collection):
+    """Create text objects for room labels positioned at room centroids.
+    Returns the number of labels generated.
+    """
+    count = 0
+    rooms = floor_plan_data.get("rooms", [])
+    for i, room_data in enumerate(rooms):
+        label = room_data.get("label", f"Room_{i}")
+        polygon = room_data.get("polygon", [])
+        if len(polygon) < 3:
+            continue
+
+        # Calculate centroid
+        cx = sum(p[0] for p in polygon) / len(polygon)
+        cy = sum(p[1] for p in polygon) / len(polygon)
+
+        # Create text object
+        font_curve = bpy.data.curves.new(name=f"Label_{label}_{i}", type='FONT')
+        font_curve.body = label.replace("_", " ").title()
+        font_curve.size = 0.3
+        font_curve.align_x = 'CENTER'
+        font_curve.align_y = 'CENTER'
+
+        obj = bpy.data.objects.new(f"Label_{label}_{i}", font_curve)
+        obj.location = Vector((cx, cy, 0.01))  # Slightly above floor
+        obj.rotation_euler.x = 0  # Flat on the floor
+        obj["fp3d_type"] = "label"
+        obj["fp3d_room_label"] = label
+        _link_to_collection(obj, collection)
+
+        area = room_data.get("area")
+        if area is not None:
+            obj["fp3d_room_area"] = area
+        count += 1
+
+    return count
