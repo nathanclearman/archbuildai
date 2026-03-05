@@ -71,24 +71,40 @@ class CubiCasaConverter:
         print("Conversion complete!")
 
     def _find_samples(self):
-        """Find all valid floor plan samples in the CubiCasa5k directory."""
+        """Find all valid floor plan samples in the CubiCasa5k directory.
+
+        Recursively searches for folders containing both a floor plan image
+        and an SVG annotation file, regardless of directory depth.
+        """
         samples = []
 
-        # CubiCasa5k structure: category/subcategory/image.png + model.svg
-        for category_dir in sorted(self.source_dir.iterdir()):
-            if not category_dir.is_dir():
-                continue
-            for sample_dir in sorted(category_dir.iterdir()):
-                if not sample_dir.is_dir():
-                    continue
-                image_path = sample_dir / "F1_scaled.png"
-                svg_path = sample_dir / "model.svg"
-                if image_path.exists() and svg_path.exists():
-                    samples.append({
-                        "image": image_path,
-                        "annotation": svg_path,
-                        "name": f"{category_dir.name}_{sample_dir.name}",
-                    })
+        # Search for all SVG annotation files recursively
+        for svg_path in sorted(self.source_dir.rglob("model.svg")):
+            sample_dir = svg_path.parent
+
+            # Look for floor plan image (try multiple naming conventions)
+            image_path = None
+            for img_name in ["F1_scaled.png", "F1_original.png", "image.png"]:
+                candidate = sample_dir / img_name
+                if candidate.exists():
+                    image_path = candidate
+                    break
+
+            # Also check for any .png file in the directory
+            if image_path is None:
+                png_files = list(sample_dir.glob("*.png"))
+                if png_files:
+                    image_path = png_files[0]
+
+            if image_path is not None:
+                # Create a unique name from the relative path
+                rel_path = sample_dir.relative_to(self.source_dir)
+                name = str(rel_path).replace("/", "_").replace("\\", "_")
+                samples.append({
+                    "image": image_path,
+                    "annotation": svg_path,
+                    "name": name,
+                })
 
         return samples
 
