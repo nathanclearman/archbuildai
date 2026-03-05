@@ -17,6 +17,30 @@ from pathlib import Path
 import yaml
 
 
+def detect_device(config_device="auto"):
+    """Auto-detect the best available device for training.
+
+    Ultralytics doesn't support 'auto' — it needs an explicit device string.
+    Returns: '0' for CUDA GPU 0, 'mps' for Apple Silicon, or 'cpu'.
+    """
+    import torch
+
+    if config_device not in ("auto", None):
+        return config_device
+
+    if torch.cuda.is_available():
+        device = "0"
+        print(f"Using CUDA GPU: {torch.cuda.get_device_name(0)}")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+        print("Using Apple Silicon MPS")
+    else:
+        device = "cpu"
+        print("Using CPU (no GPU detected)")
+
+    return device
+
+
 def load_config(config_path):
     """Load training configuration from YAML file."""
     with open(config_path, 'r') as f:
@@ -53,6 +77,7 @@ def train_detection_model(config, dataset_yaml, resume_weights=None):
 
     train_cfg = config["training"]
     aug_cfg = train_cfg.get("augmentation", {})
+    device = detect_device(train_cfg.get("device", "auto"))
 
     results = model.train(
         data=str(dataset_yaml),
@@ -63,7 +88,7 @@ def train_detection_model(config, dataset_yaml, resume_weights=None):
         weight_decay=train_cfg["weight_decay"],
         warmup_epochs=train_cfg["warmup_epochs"],
         patience=train_cfg["patience"],
-        device=train_cfg["device"],
+        device=device,
         workers=train_cfg["workers"],
         # Augmentation
         hsv_h=aug_cfg.get("hsv_h", 0.015),
@@ -97,6 +122,7 @@ def train_segmentation_model(config, dataset_yaml, resume_weights=None):
         model = YOLO(seg_config.get("base_weights", "yolov8m-seg.pt"))
 
     train_cfg = config["training"]
+    device = detect_device(train_cfg.get("device", "auto"))
 
     results = model.train(
         data=str(dataset_yaml),
@@ -105,7 +131,7 @@ def train_segmentation_model(config, dataset_yaml, resume_weights=None):
         imgsz=config["model"]["input_size"],
         lr0=train_cfg["learning_rate"],
         patience=train_cfg["patience"],
-        device=train_cfg["device"],
+        device=device,
         workers=train_cfg["workers"],
         project="runs/floorplan",
         name="segmentation",
