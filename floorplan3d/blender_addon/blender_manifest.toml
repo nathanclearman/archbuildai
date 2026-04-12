@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "floorplan3d"
+version = "0.2.0"
+name = "FloorPlan3D"
+tagline = "AI-powered 2D floor plan to 3D Blender model"
+maintainer = "FloorPlan3D Team <team@floorplan3d.local>"
+
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = [
+    "SPDX:MIT",
+]
+
+tags = ["3D View", "Mesh", "Import-Export"]

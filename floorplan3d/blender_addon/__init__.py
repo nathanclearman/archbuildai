@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FloorPlan3D",
     "author": "FloorPlan3D Team",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > FloorPlan3D",
     "description": "Generate 3D architectural models from 2D floor plan images",
