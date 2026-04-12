@@ -129,13 +129,52 @@ class FP3D_OT_GenerateModel(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def _run_inference(self, image_path):
-        """Run model inference in background thread."""
+        """Run model inference in background thread.
+
+        Routing:
+          * If the user explicitly enabled Claude Vision and an API key is set,
+            use Claude Opus 4.6 as the primary parser.
+          * Otherwise run the local CV model. If it fails AND an API key is
+            available, auto-fall back to Claude Vision.
+        """
+        scene = bpy.context.scene
+        api_key = (scene.fp3d_claude_api_key or "").strip()
+        use_claude = bool(scene.fp3d_use_claude_vision) and bool(api_key)
+
+        if use_claude:
+            try:
+                self._result = self._run_claude_vision(image_path, api_key)
+                return
+            except Exception as e:
+                # If the user asked for Claude Vision and it failed, surface the
+                # error — do not silently fall back to a possibly-untrained
+                # local model.
+                self._error = f"Claude Vision parse failed: {e}"
+                return
+
         try:
             from .api.local_model import LocalModelClient
             client = LocalModelClient()
             self._result = client.predict(image_path)
-        except Exception as e:
-            self._error = str(e)
+        except Exception as local_err:
+            if api_key:
+                try:
+                    self._result = self._run_claude_vision(image_path, api_key)
+                    return
+                except Exception as claude_err:
+                    self._error = (
+                        f"Local model failed ({local_err}); "
+                        f"Claude Vision fallback also failed ({claude_err})"
+                    )
+                    return
+            self._error = str(local_err)
+
+    @staticmethod
+    def _run_claude_vision(image_path, api_key):
+        """Parse a floor plan image via Claude Opus 4.6 vision + tool use."""
+        from .api.claude_client import ClaudeClient
+        client = ClaudeClient(api_key)
+        return client.parse_floor_plan_from_image(image_path)
 
     def modal(self, context, event):
         if event.type != 'TIMER':

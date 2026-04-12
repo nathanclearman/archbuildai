@@ -71,7 +71,7 @@ class FP3D_PT_ExportPanel(bpy.types.Panel):
 
 
 class FP3D_PT_ClaudePanel(bpy.types.Panel):
-    bl_label = "AI Assistant (Optional)"
+    bl_label = "Claude Vision (Opus 4.6)"
     bl_idname = "FP3D_PT_claude"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -83,5 +83,15 @@ class FP3D_PT_ClaudePanel(bpy.types.Panel):
         scene = context.scene
 
         layout.prop(scene, "fp3d_claude_api_key")
-        layout.prop(scene, "fp3d_claude_prompt", text="")
-        layout.label(text="(Phase 3 feature)", icon='TIME')
+        layout.prop(scene, "fp3d_use_claude_vision")
+
+        col = layout.column()
+        col.enabled = bool(scene.fp3d_claude_api_key)
+        col.prop(scene, "fp3d_claude_prompt", text="Notes")
+
+        if not scene.fp3d_claude_api_key:
+            layout.label(text="Enter an API key to enable.", icon='INFO')
+        elif scene.fp3d_use_claude_vision:
+            layout.label(text="Claude Vision is primary parser.", icon='CHECKMARK')
+        else:
+            layout.label(text="Auto-fallback if local model fails.", icon='INFO')
