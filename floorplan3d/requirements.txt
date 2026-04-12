@@ -1,24 +1,17 @@
 # FloorPlan3D Dependencies
 
-# === Model Training & Inference ===
-torch>=2.0
-torchvision>=0.15
-ultralytics>=8.0          # YOLOv8 framework
-Pillow>=9.0               # Image loading
-numpy>=1.24
-shapely>=2.0              # Polygon simplification
-pyyaml>=6.0               # Config files
-
-# === Dataset Preparation ===
-# (only needed for training)
-# lxml                    # SVG parsing (optional, falls back to xml.etree)
-
 # === Claude API (optional) ===
 requests>=2.28            # HTTP client for Claude API
 
 # === Blender Add-on ===
 # Note: bpy is provided by Blender's bundled Python — do NOT install it via pip.
 # The add-on code runs inside Blender's Python interpreter.
+
+# === Model Training & Inference ===
+# The VLM stack (torch, transformers, mlx, peft, trl, datasets, pillow, ...)
+# will be pinned in model/requirements.txt once the training pipeline lands.
+# These are intentionally NOT installed here to keep the Blender-side install
+# light — the model runs out-of-process via model/inference.py.
 
 # === Development & Testing ===
 # pytest                  # For running tests outside Blender

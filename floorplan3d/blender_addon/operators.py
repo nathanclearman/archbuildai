@@ -5,60 +5,6 @@ import threading
 from pathlib import Path
 
 
-class FP3D_OT_GenerateSample(bpy.types.Operator):
-    bl_idname = "fp3d.generate_sample"
-    bl_label = "Generate Sample Model"
-    bl_description = "Generate a sample 3D model using built-in mock data (no model or image needed)"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    sample: bpy.props.EnumProperty(
-        name="Sample",
-        items=[
-            ('APARTMENT', "Simple Apartment", "Two-room apartment with doors and windows"),
-            ('STUDIO', "Studio", "Studio apartment with bathroom"),
-            ('THREE_BEDROOM', "Three Bedroom", "Three-bedroom house with kitchen and living room"),
-        ],
-        default='APARTMENT',
-    )
-
-    def execute(self, context):
-        from . import geometry
-        from .api.local_model import get_mock_output, get_mock_studio, get_mock_three_bedroom
-
-        if self.sample == 'STUDIO':
-            data = get_mock_studio()
-        elif self.sample == 'THREE_BEDROOM':
-            data = get_mock_three_bedroom()
-        else:
-            data = get_mock_output()
-
-        try:
-            wall_height = context.scene.fp3d_wall_height
-            generate_ceiling = context.scene.fp3d_generate_ceiling
-
-            collection = geometry.create_floorplan_collection(context)
-            stats = {}
-            stats["walls"] = geometry.generate_walls(data, collection, wall_height)
-            stats["doors"] = geometry.generate_door_openings(data, collection, wall_height)
-            stats["windows"] = geometry.generate_window_openings(data, collection, wall_height)
-            stats["floors"] = geometry.generate_floors(data, collection)
-            if generate_ceiling:
-                stats["ceilings"] = geometry.generate_ceilings(data, collection, wall_height)
-            stats["labels"] = geometry.generate_room_labels(data, collection)
-
-            summary = ", ".join(f"{v} {k}" for k, v in stats.items() if v)
-            context.scene.fp3d_status = f"Sample generated: {summary}"
-            self.report({'INFO'}, f"Sample model generated: {summary}")
-            return {'FINISHED'}
-        except Exception as e:
-            context.scene.fp3d_status = f"Error: {e}"
-            self.report({'ERROR'}, f"Sample generation failed: {e}")
-            return {'CANCELLED'}
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self)
-
-
 class FP3D_OT_LoadFloorPlan(bpy.types.Operator):
     bl_idname = "fp3d.load_floor_plan"
     bl_label = "Load Floor Plan"

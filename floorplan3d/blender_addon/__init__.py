@@ -13,7 +13,6 @@ from . import operators, panels
 
 
 classes = [
-    operators.FP3D_OT_GenerateSample,
     operators.FP3D_OT_GenerateModel,
     operators.FP3D_OT_AdjustWallHeight,
     operators.FP3D_OT_ExportModel,

@@ -27,9 +27,6 @@ class FP3D_PT_MainPanel(bpy.types.Panel):
         row.scale_y = 1.5
         row.operator("fp3d.generate_model", icon='MOD_BUILD')
 
-        row = layout.row(align=True)
-        row.operator("fp3d.generate_sample", icon='MESH_CUBE', text="Generate Sample")
-
         if scene.fp3d_status and scene.fp3d_status != "Ready":
             box = layout.box()
             status = scene.fp3d_status
