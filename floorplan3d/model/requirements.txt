@@ -1,0 +1,25 @@
+# ML-side dependencies — install only in the training / inference environment,
+# NOT inside Blender's bundled Python. The Blender add-on talks to this
+# environment out-of-process via model/inference.py.
+
+# Core
+torch>=2.3
+transformers>=4.45       # Qwen2.5-VL support landed in 4.45
+accelerate>=0.33
+peft>=0.12               # LoRA / QLoRA
+bitsandbytes>=0.43       # 4-bit quantization
+datasets>=2.20
+Pillow>=10.0
+numpy>=1.24
+
+# VLM-specific
+qwen-vl-utils>=0.0.10    # processor helpers
+
+# CV fallback + synthetic data
+opencv-python-headless>=4.9
+
+# Optional: Claude refiner
+anthropic>=0.39
+
+# Dev / eval
+tqdm>=4.66

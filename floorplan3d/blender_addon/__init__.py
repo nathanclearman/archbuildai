@@ -71,6 +71,18 @@ def register():
         description="Generate ceiling planes for each room",
         default=False,
     )
+    bpy.types.Scene.fp3d_cv_only = bpy.props.BoolProperty(
+        name="CV Only (no VLM)",
+        description="Skip the fine-tuned VLM and use only the classical "
+                    "OpenCV wall extractor. Useful before a model is trained.",
+        default=False,
+    )
+    bpy.types.Scene.fp3d_use_refiner = bpy.props.BoolProperty(
+        name="Claude Refiner",
+        description="Run the optional Claude Opus post-processing pass. "
+                    "Requires ANTHROPIC_API_KEY in the environment.",
+        default=False,
+    )
     bpy.types.Scene.fp3d_status = bpy.props.StringProperty(
         name="Status",
         default="Ready",
@@ -88,6 +100,8 @@ def unregister():
     del bpy.types.Scene.fp3d_claude_prompt
     del bpy.types.Scene.fp3d_json_path
     del bpy.types.Scene.fp3d_generate_ceiling
+    del bpy.types.Scene.fp3d_cv_only
+    del bpy.types.Scene.fp3d_use_refiner
     del bpy.types.Scene.fp3d_status
 
 

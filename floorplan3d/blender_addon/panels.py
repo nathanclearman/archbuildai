@@ -23,6 +23,11 @@ class FP3D_PT_MainPanel(bpy.types.Panel):
         layout.prop(scene, "fp3d_generate_ceiling")
 
         layout.separator()
+        layout.label(text="Pipeline", icon='NODETREE')
+        layout.prop(scene, "fp3d_cv_only")
+        layout.prop(scene, "fp3d_use_refiner")
+
+        layout.separator()
         row = layout.row(align=True)
         row.scale_y = 1.5
         row.operator("fp3d.generate_model", icon='MOD_BUILD')

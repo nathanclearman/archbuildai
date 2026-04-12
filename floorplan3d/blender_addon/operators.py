@@ -63,6 +63,8 @@ class FP3D_OT_GenerateModel(bpy.types.Operator):
 
         self._result = None
         self._error = None
+        self._cv_only = bool(getattr(context.scene, "fp3d_cv_only", False))
+        self._refine = bool(getattr(context.scene, "fp3d_use_refiner", False))
         self._thread = threading.Thread(
             target=self._run_inference,
             args=(image_path,),
@@ -78,8 +80,12 @@ class FP3D_OT_GenerateModel(bpy.types.Operator):
         """Run model inference in background thread."""
         try:
             from .api.local_model import LocalModelClient
+            scene_props = {
+                "cv_only": bool(getattr(self, "_cv_only", False)),
+                "refine": bool(getattr(self, "_refine", False)),
+            }
             client = LocalModelClient()
-            self._result = client.predict(image_path)
+            self._result = client.predict(image_path, **scene_props)
         except Exception as e:
             self._error = str(e)
 

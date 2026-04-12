@@ -29,14 +29,18 @@ class LocalModelClient:
         self.python_bin = python_bin or sys.executable
         self.timeout = timeout
 
-    def predict(self, image_path):
+    def predict(self, image_path, cv_only=False, refine=False):
         """Run inference on a floor plan image.
 
         Args:
             image_path: Path to the floor plan image file.
+            cv_only: If True, skip the VLM and use the OpenCV fallback only.
+                     Useful for testing without trained weights.
+            refine: If True, run the optional Claude Opus refinement pass.
+                    Requires ANTHROPIC_API_KEY in the environment.
 
         Returns:
-            dict: Parsed floor plan data in the standard JSON format
+            dict: Parsed floor plan data in the canonical JSON schema
                   (walls, doors, windows, rooms, scale).
         """
         image_path = str(image_path)
@@ -50,14 +54,20 @@ class LocalModelClient:
                 "The VLM inference entry point has not been implemented yet."
             )
 
+        cmd = [
+            self.python_bin,
+            str(INFERENCE_SCRIPT),
+            "--image", image_path,
+            "--weights", str(self.weights_dir),
+            "--output", "json",
+        ]
+        if cv_only:
+            cmd.append("--cv-only")
+        if refine:
+            cmd.append("--refine")
+
         result = subprocess.run(
-            [
-                self.python_bin,
-                str(INFERENCE_SCRIPT),
-                "--image", image_path,
-                "--weights", str(self.weights_dir),
-                "--output", "json",
-            ],
+            cmd,
             capture_output=True,
             text=True,
             timeout=self.timeout,
