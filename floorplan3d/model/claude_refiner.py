@@ -40,9 +40,14 @@ Specifically:
 - Snap wall endpoints that are obviously meant to coincide.
 - Correct wall_index references on doors/windows to point at the actual
   wall they lie on.
-- Normalize room labels to snake_case from this vocabulary:
-  living_room, bedroom, kitchen, bathroom, hallway, dining_room, foyer,
-  closet, office, laundry, garage, storage, balcony.
+- Normalize room labels to snake_case from this US-focused vocabulary:
+  great_room, living_room, family_room, dining_room, kitchen,
+  master_bedroom, bedroom, en_suite, bathroom, powder_room,
+  walk_in_closet, closet, foyer, hallway, mudroom, laundry_room,
+  pantry, garage, office, den.
+  Prefer master_bedroom over bedroom if it is attached to an en_suite
+  and/or a walk_in_closet. Prefer great_room when living, dining, and
+  kitchen are one contiguous open space.
 
 Respond with ONLY the corrected JSON object. No prose, no code fences.
 """

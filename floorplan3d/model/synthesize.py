@@ -1,230 +1,373 @@
 """
-Procedural floor plan generator.
+US-style procedural floor plan generator.
 
-Renders synthetic floor plans with known ground truth to augment the real
-training data. Uses only numpy + Pillow so it runs anywhere, no heavy deps.
+Produces synthetic training data with the room conventions a US-market
+product needs to recognize: great rooms (merged living + dining + kitchen),
+master suites (bedroom + en-suite + walk-in closet as a connected triplet),
+attached garages, mudrooms, powder rooms, pantries.
+
+Two templates so far:
+  - ranch_open_concept: single-floor rectangular ranch with open great
+    room, bedroom wing, attached garage. Most common US SFH layout.
+  - colonial_compartmentalized: single-floor compartmentalized layout
+    with separate living / dining / kitchen rooms.
 
 Each emitted sample is an (image.png, image.json) pair where the JSON
-conforms to schema.py. Run this once to produce N samples, then point
-dataset.build_training_set(synthetic_root=...) at the output directory.
+conforms to schema.py. No ML dependencies — pure numpy + Pillow.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from schema import FloorPlan, serialize  # type: ignore
 
 
-ROOM_LABELS = [
-    "living_room", "bedroom", "kitchen", "bathroom", "hallway",
-    "dining_room", "foyer", "closet", "office", "laundry",
+# US room vocabulary used throughout the project. Keep this list in sync
+# with claude_refiner.py's prompt — drift between them = bad eval numbers.
+US_ROOM_LABELS = [
+    "great_room", "living_room", "family_room", "dining_room", "kitchen",
+    "master_bedroom", "bedroom", "en_suite", "bathroom", "powder_room",
+    "walk_in_closet", "closet", "foyer", "hallway", "mudroom",
+    "laundry_room", "pantry", "garage", "office", "den",
 ]
 
 
 @dataclass
 class SynthConfig:
-    image_size: int = 800
-    pixels_per_meter: float = 50.0
+    image_size: int = 900
+    pixels_per_meter: float = 40.0
     wall_thickness_m: float = 0.15
-    min_rooms: int = 3
-    max_rooms: int = 8
+    draw_labels: bool = True
+    draw_fixtures: bool = True
 
 
-def generate_one(seed: int, cfg: SynthConfig | None = None):
-    """Generate one synthetic plan. Returns (PIL.Image, floor_plan_dict)."""
-    from PIL import Image, ImageDraw
-    cfg = cfg or SynthConfig()
-    rng = random.Random(seed)
+# ---------- data model ----------
 
-    size = cfg.image_size
-    ppm = cfg.pixels_per_meter
-
-    # 1. Pick a building footprint (in meters).
-    width_m = rng.uniform(8, 14)
-    height_m = rng.uniform(6, 12)
-
-    # 2. Recursively split the footprint into rooms.
-    n_rooms = rng.randint(cfg.min_rooms, cfg.max_rooms)
-    rects_m = _bsp_split(0, 0, width_m, height_m, n_rooms, rng, min_side=2.0)
-
-    # 3. Convert to walls + rooms in our schema.
-    walls_m, rooms_m = _rects_to_schema(rects_m, rng)
-
-    # 4. Sprinkle doors and windows along walls.
-    doors_m = _sprinkle_doors(walls_m, rects_m, rng)
-    windows_m = _sprinkle_windows(walls_m, width_m, height_m, rng)
-
-    fp = FloorPlan(
-        walls=walls_m,
-        doors=doors_m,
-        windows=windows_m,
-        rooms=rooms_m,
-        scale={"pixels_per_meter": int(ppm)},
-    )
-
-    # 5. Render.
-    img = Image.new("RGB", (size, size), "white")
-    draw = ImageDraw.Draw(img)
-    # Center the footprint in the image.
-    off_x = (size - width_m * ppm) / 2
-    off_y = (size - height_m * ppm) / 2
-
-    def to_px(p):
-        return (off_x + p[0] * ppm, off_y + p[1] * ppm)
-
-    for r in rooms_m:
-        poly = [to_px(p) for p in r["polygon"]]
-        fill = (240, 240, 235) if r["label"] == "living_room" else (250, 247, 240)
-        draw.polygon(poly, fill=fill, outline=None)
-
-    wall_px = max(2, int(cfg.wall_thickness_m * ppm * 0.8))
-    for w in walls_m:
-        draw.line([to_px(w["start"]), to_px(w["end"])], fill=(20, 20, 20), width=wall_px)
-
-    door_px = max(3, wall_px + 1)
-    for d in doors_m:
-        cx, cy = to_px(d["position"])
-        half = d["width"] * ppm / 2
-        draw.line([(cx - half, cy), (cx + half, cy)], fill=(220, 220, 220), width=door_px)
-
-    for w in windows_m:
-        cx, cy = to_px(w["position"])
-        half = w["width"] * ppm / 2
-        draw.line([(cx - half, cy), (cx + half, cy)], fill=(140, 180, 220), width=door_px)
-
-    return img, fp.to_dict()
+@dataclass
+class Room:
+    label: str
+    # axis-aligned rectangle in meters: (x, y, w, h)
+    rect: tuple[float, float, float, float]
+    # doors connecting this room to neighbors, placed on shared walls
+    # as (shared_with_label, position_along_shared_wall_0to1, width)
+    doors: list[tuple[str, float, float]] = field(default_factory=list)
 
 
-def _bsp_split(x, y, w, h, target_rooms, rng, min_side):
-    """Binary space partition into `target_rooms` rectangles."""
-    rects = [(x, y, w, h)]
-    while len(rects) < target_rooms:
-        # pick the largest rect to split.
-        rects.sort(key=lambda r: r[2] * r[3], reverse=True)
-        rx, ry, rw, rh = rects.pop(0)
-        # split along the longer dimension if possible.
-        if rw >= rh and rw >= 2 * min_side:
-            cut = rng.uniform(min_side, rw - min_side)
-            rects.append((rx, ry, cut, rh))
-            rects.append((rx + cut, ry, rw - cut, rh))
-        elif rh >= 2 * min_side:
-            cut = rng.uniform(min_side, rh - min_side)
-            rects.append((rx, ry, rw, cut))
-            rects.append((rx, ry + cut, rw, rh - cut))
-        else:
-            rects.append((rx, ry, rw, rh))  # can't split further
-            break
-    return rects
+@dataclass
+class Plan:
+    rooms: list[Room]
+    footprint: tuple[float, float]  # overall width, height in meters
+    exterior_door: tuple[str, float] | None = None  # (room_label, side) where side ∈ {N,S,E,W}
 
 
-def _rects_to_schema(rects, rng):
-    walls = []
-    rooms = []
-    seen_edges: set[tuple] = set()
+# ---------- templates ----------
 
-    def add_wall(a, b):
+def ranch_open_concept(rng: random.Random) -> Plan:
+    """Single-floor open-concept ranch, ~1800-2400 sqft.
+
+    Layout (axes: +x east, +y south):
+      +-----------------------------------------+
+      |   garage  |  mudroom  |     kitchen     |
+      |           +-----------+-----------------+
+      |           |                             |
+      +-----------+  great_room (LR+DR+kitchen) |
+      |   bed2    |                             |
+      +-----+-----+-----+---------+-------------+
+      | bath| bed3| hall|  M.BR   | walk-in-cl  |
+      +-----+-----+-----+---------+------+------+
+                        |  en-suite      |
+                        +----------------+
+    """
+    w = rng.uniform(16, 20)           # overall width (meters)
+    h = rng.uniform(11, 14)           # overall height
+    garage_w = rng.uniform(5.5, 6.5)
+    garage_h = rng.uniform(6.0, 6.5)
+    mud_w = rng.uniform(1.8, 2.6)
+    great_w = w - garage_w
+    great_h = h * rng.uniform(0.45, 0.55)
+
+    bed_wing_h = h - great_h
+    mbr_w = rng.uniform(4.5, 5.5)
+    wic_w = rng.uniform(1.8, 2.5)
+    ens_w = rng.uniform(2.2, 2.8)
+    hall_w = rng.uniform(1.2, 1.5)
+    bed2_w = rng.uniform(3.0, 3.8)
+    bath_w = rng.uniform(2.0, 2.6)
+    bed3_w = w - garage_w - bath_w - bed2_w - hall_w - mbr_w
+    if bed3_w < 2.5:
+        # fell short; steal from garage
+        garage_w = max(5.0, garage_w - (2.5 - bed3_w))
+        bed3_w = w - garage_w - bath_w - bed2_w - hall_w - mbr_w
+
+    rooms: list[Room] = []
+
+    # --- top half: garage | mudroom | great room (kitchen merged) ---
+    rooms.append(Room("garage", (0, 0, garage_w, garage_h)))
+    rooms.append(Room("mudroom", (garage_w, 0, mud_w, garage_h * 0.5)))
+    rooms.append(Room("laundry_room", (garage_w, garage_h * 0.5, mud_w, garage_h * 0.5)))
+    rooms.append(Room("great_room", (garage_w + mud_w, 0, great_w - mud_w, great_h)))
+
+    # powder room carved from mudroom/great room boundary
+    pow_x = garage_w + mud_w
+    pow_w = rng.uniform(1.4, 1.8)
+    pow_h = rng.uniform(1.8, 2.2)
+    rooms.append(Room("powder_room", (pow_x, great_h - pow_h, pow_w, pow_h)))
+
+    # --- bottom half: bedroom wing ---
+    y0 = great_h
+    # leftmost: bedroom 2 over garage footprint, bath next to it
+    rooms.append(Room("bedroom", (0, y0, garage_w * 0.55, bed_wing_h), doors=[("hallway", 0.5, 0.9)]))
+    rooms.append(Room("bedroom", (garage_w * 0.55, y0, garage_w * 0.45, bed_wing_h), doors=[("hallway", 0.5, 0.9)]))
+    # hallway runs east-west through the bedroom wing
+    hall_x = garage_w
+    hall_y = y0 + bed_wing_h * 0.35
+    hall_h = bed_wing_h * 0.3
+    rooms.append(Room("hallway", (hall_x, hall_y, w - hall_x - mbr_w - wic_w, hall_h)))
+
+    # shared bath
+    rooms.append(Room("bathroom", (hall_x, y0, bath_w, hall_y - y0)))
+
+    # master suite: bedroom + en-suite + walk-in
+    mbr_x = w - mbr_w - wic_w
+    rooms.append(Room("master_bedroom", (mbr_x, y0, mbr_w, bed_wing_h * 0.6),
+                      doors=[("hallway", 0.9, 0.9), ("en_suite", 0.5, 0.8), ("walk_in_closet", 0.7, 0.7)]))
+    rooms.append(Room("en_suite", (mbr_x, y0 + bed_wing_h * 0.6, mbr_w - ens_w * 0.3, bed_wing_h * 0.4)))
+    rooms.append(Room("walk_in_closet", (w - wic_w, y0, wic_w, bed_wing_h * 0.6)))
+
+    plan = Plan(rooms=rooms, footprint=(w, h), exterior_door=("great_room", "S"))
+    return plan
+
+
+def colonial_compartmentalized(rng: random.Random) -> Plan:
+    """Compartmentalized single-floor plan with separate living / dining /
+    kitchen, no merged great room. Closer to traditional US colonial."""
+    w = rng.uniform(12, 15)
+    h = rng.uniform(10, 12)
+
+    foyer_w = rng.uniform(1.8, 2.4)
+    foyer_h = rng.uniform(2.5, 3.2)
+    dining_w = rng.uniform(3.5, 4.2)
+    kitchen_w = rng.uniform(3.8, 4.5)
+    living_w = w - foyer_w - dining_w
+
+    # Front row (top): dining | foyer | living
+    front_h = rng.uniform(3.8, 4.5)
+    rooms: list[Room] = []
+    rooms.append(Room("dining_room", (0, 0, dining_w, front_h)))
+    rooms.append(Room("foyer", (dining_w, 0, foyer_w, foyer_h)))
+    rooms.append(Room("living_room", (dining_w + foyer_w, 0, living_w, front_h)))
+
+    # Kitchen behind dining
+    kitchen_h = h - front_h - rng.uniform(3.8, 4.5)
+    rooms.append(Room("kitchen", (0, front_h, kitchen_w, kitchen_h)))
+    rooms.append(Room("pantry", (kitchen_w, front_h, rng.uniform(1.4, 1.8), rng.uniform(1.4, 1.8))))
+
+    # Bedroom wing at back
+    y0 = front_h + kitchen_h
+    back_h = h - y0
+    mbr_w = rng.uniform(4.2, 5.0)
+    bed2_w = rng.uniform(3.2, 3.8)
+    bath_w = rng.uniform(2.2, 2.6)
+    hall_w = w - mbr_w - bed2_w - bath_w
+    if hall_w < 1.2:
+        hall_w = 1.2
+        bed2_w = w - mbr_w - bath_w - hall_w
+
+    rooms.append(Room("master_bedroom", (0, y0, mbr_w, back_h),
+                      doors=[("en_suite", 0.8, 0.8), ("hallway", 0.95, 0.9)]))
+    rooms.append(Room("en_suite", (mbr_w - rng.uniform(1.8, 2.2), y0 + back_h - rng.uniform(2.0, 2.4),
+                                    rng.uniform(1.8, 2.2), rng.uniform(2.0, 2.4))))
+    rooms.append(Room("hallway", (mbr_w, y0, hall_w, back_h)))
+    rooms.append(Room("bathroom", (mbr_w + hall_w, y0, bath_w, back_h * 0.5)))
+    rooms.append(Room("bedroom", (mbr_w + hall_w, y0 + back_h * 0.5, bath_w, back_h * 0.5)))
+    rooms.append(Room("bedroom", (mbr_w + hall_w + bath_w, y0, bed2_w, back_h)))
+
+    return Plan(rooms=rooms, footprint=(w, h), exterior_door=("foyer", "N"))
+
+
+TEMPLATES: list[Callable[[random.Random], Plan]] = [
+    ranch_open_concept,
+    colonial_compartmentalized,
+]
+
+
+# ---------- walls + openings from rooms ----------
+
+def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
+    """Convert a template-produced Plan into a canonical floor plan dict."""
+    walls: list[dict] = []
+    seen: dict[tuple, int] = {}
+
+    def add_wall(a, b, thickness=0.15) -> int:
         key = tuple(sorted([tuple(round(c, 3) for c in a), tuple(round(c, 3) for c in b)]))
-        if key in seen_edges:
-            return
-        seen_edges.add(key)
-        walls.append({"start": list(a), "end": list(b), "thickness": 0.15})
+        if key in seen:
+            return seen[key]
+        idx = len(walls)
+        walls.append({"start": list(a), "end": list(b), "thickness": thickness})
+        seen[key] = idx
+        return idx
 
-    for (x, y, w, h) in rects:
-        poly = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
-        add_wall(poly[0], poly[1])
-        add_wall(poly[1], poly[2])
-        add_wall(poly[2], poly[3])
-        add_wall(poly[3], poly[0])
-        label = rng.choice(ROOM_LABELS)
-        rooms.append({"label": label, "polygon": poly, "area": round(w * h, 2)})
-    return walls, rooms
+    # 1. One wall per room edge; shared edges deduplicate via `seen`.
+    for r in plan.rooms:
+        x, y, w, h = r.rect
+        add_wall([x, y], [x + w, y])
+        add_wall([x + w, y], [x + w, y + h])
+        add_wall([x + w, y + h], [x, y + h])
+        add_wall([x, y + h], [x, y])
 
-
-def _sprinkle_doors(walls, rects, rng):
-    doors = []
-    # Put one door between each adjacent pair of rooms (approximate).
-    for i, a in enumerate(rects):
-        for j, b in enumerate(rects):
-            if j <= i:
+    # 2. Doors: declared room-to-room connections.
+    doors: list[dict] = []
+    for r in plan.rooms:
+        for (other_label, t, width) in r.doors:
+            other = _find_room(plan, other_label, after=r)
+            if other is None:
                 continue
-            overlap = _rect_edge_overlap(a, b)
-            if overlap is None:
+            pos = _shared_edge_point(r.rect, other.rect, t)
+            if pos is None:
                 continue
-            cx, cy = overlap
-            # Find nearest wall to this point.
-            wall_idx = _nearest_wall([cx, cy], walls)
+            wall_idx = _nearest_wall(pos, walls)
             doors.append({
-                "position": [round(cx, 2), round(cy, 2)],
-                "width": 0.9,
+                "position": [round(pos[0], 2), round(pos[1], 2)],
+                "width": round(width, 2),
                 "type": "hinged",
                 "wall_index": wall_idx,
             })
-    # Add a front door on an exterior wall.
-    if walls:
-        exterior = walls[0]
-        sx, sy = exterior["start"]
-        ex, ey = exterior["end"]
-        doors.append({
-            "position": [round((sx + ex) / 2, 2), round((sy + ey) / 2, 2)],
-            "width": 1.0,
-            "type": "hinged",
-            "wall_index": 0,
-        })
-    return doors
+
+    # 3. Exterior door on front of house.
+    if plan.exterior_door:
+        label, side = plan.exterior_door
+        room = _find_room(plan, label)
+        if room is not None:
+            pos = _exterior_edge_midpoint(room.rect, side, plan.footprint)
+            wall_idx = _nearest_wall(pos, walls)
+            doors.append({
+                "position": [round(pos[0], 2), round(pos[1], 2)],
+                "width": 1.0,
+                "type": "hinged",
+                "wall_index": wall_idx,
+            })
+
+    # 4. Windows on exterior walls, roughly one per exterior room edge.
+    windows: list[dict] = []
+    fw, fh = plan.footprint
+    for r in plan.rooms:
+        if r.label in {"closet", "walk_in_closet", "pantry", "bathroom", "powder_room", "en_suite", "hallway", "foyer", "mudroom", "laundry_room", "garage"}:
+            # These rooms typically don't get windows, or only small ones —
+            # skip for now to keep windows on visible public rooms.
+            if rng.random() > 0.2:
+                continue
+        for side in ("N", "S", "E", "W"):
+            if not _edge_is_exterior(r.rect, side, fw, fh):
+                continue
+            if rng.random() > 0.55:
+                continue
+            cx, cy = _edge_midpoint(r.rect, side)
+            wall_idx = _nearest_wall((cx, cy), walls)
+            windows.append({
+                "position": [round(cx, 2), round(cy, 2)],
+                "width": round(rng.uniform(0.9, 1.6), 2),
+                "wall_index": wall_idx,
+            })
+
+    rooms_out = [
+        {
+            "label": r.label,
+            "polygon": [
+                [r.rect[0], r.rect[1]],
+                [r.rect[0] + r.rect[2], r.rect[1]],
+                [r.rect[0] + r.rect[2], r.rect[1] + r.rect[3]],
+                [r.rect[0], r.rect[1] + r.rect[3]],
+            ],
+            "area": round(r.rect[2] * r.rect[3], 2),
+        }
+        for r in plan.rooms
+    ]
+
+    return FloorPlan(
+        walls=walls,
+        doors=doors,
+        windows=windows,
+        rooms=rooms_out,
+        scale={"pixels_per_meter": 40},
+    ).to_dict()
 
 
-def _sprinkle_windows(walls, total_w, total_h, rng):
-    """One window per exterior wall segment on average."""
-    windows = []
-    for i, w in enumerate(walls):
-        sx, sy = w["start"]
-        ex, ey = w["end"]
-        on_boundary = (
-            (sx == 0 and ex == 0) or (sy == 0 and ey == 0)
-            or (abs(sx - total_w) < 0.01 and abs(ex - total_w) < 0.01)
-            or (abs(sy - total_h) < 0.01 and abs(ey - total_h) < 0.01)
-        )
-        if not on_boundary:
+def _find_room(plan: Plan, label: str, after: Room | None = None) -> Room | None:
+    """Find a room with the given label. If `after` given, prefers the first
+    matching room that comes after it in plan.rooms (so we don't re-match self)."""
+    if after is not None:
+        seen_self = False
+        for r in plan.rooms:
+            if r is after:
+                seen_self = True
+                continue
+            if seen_self and r.label == label:
+                return r
+    for r in plan.rooms:
+        if r is after:
             continue
-        if rng.random() > 0.6:
-            continue
-        cx, cy = (sx + ex) / 2, (sy + ey) / 2
-        windows.append({
-            "position": [round(cx, 2), round(cy, 2)],
-            "width": round(rng.uniform(0.9, 1.6), 2),
-            "wall_index": i,
-        })
-    return windows
+        if r.label == label:
+            return r
+    return None
 
 
-def _rect_edge_overlap(a, b):
-    """If rects a and b share a wall segment, return its midpoint."""
+def _shared_edge_point(a, b, t):
+    """Return a point on the shared edge between two rects, parameterized
+    by t ∈ [0, 1] along the edge. Returns None if no shared edge."""
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
     # vertical shared edge
-    if abs(ax + aw - bx) < 0.01:
+    if abs(ax + aw - bx) < 0.02:
         y0, y1 = max(ay, by), min(ay + ah, by + bh)
-        if y1 - y0 > 1.0:
-            return (ax + aw, (y0 + y1) / 2)
-    if abs(bx + bw - ax) < 0.01:
+        if y1 - y0 > 0.8:
+            return (ax + aw, y0 + (y1 - y0) * t)
+    if abs(bx + bw - ax) < 0.02:
         y0, y1 = max(ay, by), min(ay + ah, by + bh)
-        if y1 - y0 > 1.0:
-            return (ax, (y0 + y1) / 2)
+        if y1 - y0 > 0.8:
+            return (ax, y0 + (y1 - y0) * t)
     # horizontal shared edge
-    if abs(ay + ah - by) < 0.01:
+    if abs(ay + ah - by) < 0.02:
         x0, x1 = max(ax, bx), min(ax + aw, bx + bw)
-        if x1 - x0 > 1.0:
-            return ((x0 + x1) / 2, ay + ah)
-    if abs(by + bh - ay) < 0.01:
+        if x1 - x0 > 0.8:
+            return (x0 + (x1 - x0) * t, ay + ah)
+    if abs(by + bh - ay) < 0.02:
         x0, x1 = max(ax, bx), min(ax + aw, bx + bw)
-        if x1 - x0 > 1.0:
-            return ((x0 + x1) / 2, ay)
+        if x1 - x0 > 0.8:
+            return (x0 + (x1 - x0) * t, ay)
     return None
+
+
+def _edge_midpoint(rect, side):
+    x, y, w, h = rect
+    if side == "N": return (x + w / 2, y)
+    if side == "S": return (x + w / 2, y + h)
+    if side == "W": return (x, y + h / 2)
+    if side == "E": return (x + w, y + h / 2)
+    return (x + w / 2, y + h / 2)
+
+
+def _edge_is_exterior(rect, side, fw, fh, tol=0.02):
+    x, y, w, h = rect
+    if side == "N": return abs(y) < tol
+    if side == "S": return abs(y + h - fh) < tol
+    if side == "W": return abs(x) < tol
+    if side == "E": return abs(x + w - fw) < tol
+    return False
+
+
+def _exterior_edge_midpoint(rect, side, footprint):
+    x, y, w, h = rect
+    fw, fh = footprint
+    if side == "N": return (x + w / 2, 0)
+    if side == "S": return (x + w / 2, fh)
+    if side == "W": return (0, y + h / 2)
+    if side == "E": return (fw, y + h / 2)
+    return _edge_midpoint(rect, side)
 
 
 def _nearest_wall(point, walls):
@@ -235,19 +378,123 @@ def _nearest_wall(point, walls):
     for i, w in enumerate(walls):
         sx, sy = w["start"]
         ex, ey = w["end"]
-        cx, cy = (sx + ex) / 2, (sy + ey) / 2
-        d = (px - cx) ** 2 + (py - cy) ** 2
+        dx, dy = ex - sx, ey - sy
+        l2 = dx * dx + dy * dy
+        if l2 < 1e-9:
+            d = (px - sx) ** 2 + (py - sy) ** 2
+        else:
+            t = max(0.0, min(1.0, ((px - sx) * dx + (py - sy) * dy) / l2))
+            cx, cy = sx + t * dx, sy + t * dy
+            d = (px - cx) ** 2 + (py - cy) ** 2
         if d < best_d:
             best_d, best_i = d, i
     return best_i
 
 
+# ---------- rendering ----------
+
+# Rough per-label fill color, to vaguely resemble MLS-style colored plans.
+ROOM_COLORS = {
+    "great_room": (245, 240, 225),
+    "living_room": (245, 240, 225),
+    "family_room": (245, 240, 225),
+    "dining_room": (240, 230, 220),
+    "kitchen": (235, 245, 225),
+    "master_bedroom": (235, 230, 245),
+    "bedroom": (230, 235, 245),
+    "en_suite": (225, 235, 240),
+    "bathroom": (225, 235, 240),
+    "powder_room": (225, 235, 240),
+    "walk_in_closet": (240, 232, 230),
+    "closet": (240, 232, 230),
+    "foyer": (245, 245, 240),
+    "hallway": (248, 246, 240),
+    "mudroom": (238, 232, 222),
+    "laundry_room": (238, 232, 222),
+    "pantry": (240, 238, 225),
+    "garage": (225, 225, 225),
+    "office": (238, 238, 230),
+    "den": (238, 238, 230),
+}
+
+
+def render(plan_dict: dict, cfg: SynthConfig):
+    from PIL import Image, ImageDraw, ImageFont
+    size = cfg.image_size
+    ppm = cfg.pixels_per_meter
+
+    # Compute footprint from rooms so centering is accurate.
+    xs = [p[0] for r in plan_dict["rooms"] for p in r["polygon"]]
+    ys = [p[1] for r in plan_dict["rooms"] for p in r["polygon"]]
+    fw = max(xs) - min(xs)
+    fh = max(ys) - min(ys)
+    off_x = (size - fw * ppm) / 2
+    off_y = (size - fh * ppm) / 2
+
+    img = Image.new("RGB", (size, size), "white")
+    draw = ImageDraw.Draw(img)
+
+    def to_px(p):
+        return (off_x + p[0] * ppm, off_y + p[1] * ppm)
+
+    # Fill rooms.
+    for r in plan_dict["rooms"]:
+        color = ROOM_COLORS.get(r["label"], (245, 245, 245))
+        draw.polygon([to_px(p) for p in r["polygon"]], fill=color)
+
+    # Draw walls on top.
+    wall_px = max(3, int(cfg.wall_thickness_m * ppm * 0.9))
+    for w in plan_dict["walls"]:
+        draw.line([to_px(w["start"]), to_px(w["end"])], fill=(25, 25, 25), width=wall_px)
+
+    # Doors: short gap rendered as lighter line.
+    door_px = max(4, wall_px + 1)
+    for d in plan_dict["doors"]:
+        cx, cy = to_px(d["position"])
+        half = d["width"] * ppm / 2
+        draw.line([(cx - half, cy), (cx + half, cy)], fill=(230, 225, 215), width=door_px)
+
+    # Windows: blue-tinted short segments.
+    for win in plan_dict["windows"]:
+        cx, cy = to_px(win["position"])
+        half = win["width"] * ppm / 2
+        draw.line([(cx - half, cy), (cx + half, cy)], fill=(150, 185, 220), width=door_px)
+
+    # Room labels.
+    if cfg.draw_labels:
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+        for r in plan_dict["rooms"]:
+            xs2 = [p[0] for p in r["polygon"]]
+            ys2 = [p[1] for p in r["polygon"]]
+            cx = sum(xs2) / len(xs2)
+            cy = sum(ys2) / len(ys2)
+            label = r["label"].replace("_", " ").title()
+            draw.text(to_px((cx, cy)), label, fill=(60, 60, 60), font=font, anchor="mm")
+
+    return img
+
+
+# ---------- public API ----------
+
+def generate_one(seed: int, cfg: SynthConfig | None = None):
+    cfg = cfg or SynthConfig()
+    rng = random.Random(seed)
+    template = rng.choice(TEMPLATES)
+    plan = template(rng)
+    plan_dict = plan_to_schema(plan, rng)
+    img = render(plan_dict, cfg)
+    return img, plan_dict
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate synthetic floor plans")
-    parser.add_argument("--out", required=True, help="output directory")
+    parser = argparse.ArgumentParser(description="Generate US-style synthetic floor plans")
+    parser.add_argument("--out", required=True)
     parser.add_argument("--count", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--size", type=int, default=800)
+    parser.add_argument("--size", type=int, default=900)
     args = parser.parse_args()
 
     out = Path(args.out)
@@ -258,8 +505,8 @@ def main():
         img, fp = generate_one(args.seed + i, cfg)
         img.save(out / f"plan_{i:06d}.png")
         (out / f"plan_{i:06d}.json").write_text(serialize(fp))
-        if (i + 1) % 100 == 0:
-            print(f"[{i + 1}/{args.count}] generated")
+        if (i + 1) % 200 == 0:
+            print(f"[{i + 1}/{args.count}]")
 
     print(f"done: {args.count} samples in {out}")
 
