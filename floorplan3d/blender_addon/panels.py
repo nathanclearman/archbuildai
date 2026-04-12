@@ -95,3 +95,14 @@ class FP3D_PT_ClaudePanel(bpy.types.Panel):
             layout.label(text="Claude Vision is primary parser.", icon='CHECKMARK')
         else:
             layout.label(text="Auto-fallback if local model fails.", icon='INFO')
+
+        layout.separator()
+        layout.label(text="Accuracy Test", icon='CHECKMARK')
+        row = layout.row(align=True)
+        row.prop(scene, "fp3d_vision_threshold", text="Threshold")
+        row.prop(scene, "fp3d_vision_max_iterations", text="Max Passes")
+
+        test_row = layout.row(align=True)
+        test_row.scale_y = 1.3
+        test_row.enabled = bool(scene.fp3d_claude_api_key) and bool(scene.fp3d_image_path)
+        test_row.operator("fp3d.run_vision_accuracy_test", icon='VIEWZOOM')

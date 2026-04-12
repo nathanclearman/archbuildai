@@ -18,6 +18,7 @@ classes = [
     operators.FP3D_OT_AdjustWallHeight,
     operators.FP3D_OT_ExportModel,
     operators.FP3D_OT_LoadFloorPlan,
+    operators.FP3D_OT_RunVisionAccuracyTest,
     panels.FP3D_PT_MainPanel,
     panels.FP3D_PT_AdjustPanel,
     panels.FP3D_PT_ExportPanel,
@@ -69,6 +70,20 @@ def register():
         ),
         default=False,
     )
+    bpy.types.Scene.fp3d_vision_threshold = bpy.props.FloatProperty(
+        name="Accuracy Threshold",
+        description="Minimum accuracy score (0-1) required for the vision test to pass",
+        default=0.75,
+        min=0.0,
+        max=1.0,
+    )
+    bpy.types.Scene.fp3d_vision_max_iterations = bpy.props.IntProperty(
+        name="Max Repair Passes",
+        description="Maximum number of verify_and_repair rounds if the first parse is below threshold",
+        default=4,
+        min=0,
+        max=10,
+    )
     bpy.types.Scene.fp3d_json_path = bpy.props.StringProperty(
         name="JSON Override",
         description="Optional: load geometry from a JSON file instead of running the model",
@@ -96,6 +111,8 @@ def unregister():
     del bpy.types.Scene.fp3d_claude_api_key
     del bpy.types.Scene.fp3d_claude_prompt
     del bpy.types.Scene.fp3d_use_claude_vision
+    del bpy.types.Scene.fp3d_vision_threshold
+    del bpy.types.Scene.fp3d_vision_max_iterations
     del bpy.types.Scene.fp3d_json_path
     del bpy.types.Scene.fp3d_generate_ceiling
     del bpy.types.Scene.fp3d_status

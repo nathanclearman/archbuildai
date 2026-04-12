@@ -254,6 +254,186 @@ class FP3D_OT_AdjustWallHeight(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class FP3D_OT_RunVisionAccuracyTest(bpy.types.Operator):
+    """Run the Claude Vision accuracy loop on the currently-loaded image.
+
+    Reuses the scene's image path + API key (entered in the Claude Vision
+    panel) and iterates verify_and_repair against the bundled ground truth
+    until the score meets the threshold or the iteration budget is spent.
+    All API work happens on a background thread; results are reported to
+    the status line on the main thread.
+    """
+
+    bl_idname = "fp3d.run_vision_accuracy_test"
+    bl_label = "Run Vision Accuracy Test"
+    bl_description = (
+        "Parse the loaded floor plan with Claude Opus 4.6, score against the "
+        "reference ground truth, and iterate until accurate"
+    )
+
+    _timer = None
+    _thread = None
+    _score = None
+    _iterations = None
+    _error = None
+    _report_path = None
+
+    def execute(self, context):
+        scene = context.scene
+
+        api_key = (scene.fp3d_claude_api_key or "").strip()
+        if not api_key:
+            self.report({'ERROR'}, "Enter your Anthropic API key in the Claude Vision panel")
+            return {'CANCELLED'}
+
+        image_path = bpy.path.abspath(scene.fp3d_image_path or "")
+        if not image_path or not os.path.isfile(image_path):
+            self.report({'ERROR'}, "Load a floor plan image first")
+            return {'CANCELLED'}
+
+        gt_path = Path(__file__).resolve().parent.parent / "tests" / "sample_plans" / "large_house_ground_truth.json"
+        if not gt_path.is_file():
+            self.report({'ERROR'}, f"Ground truth not found: {gt_path}")
+            return {'CANCELLED'}
+
+        threshold = float(scene.fp3d_vision_threshold)
+        max_iter = int(scene.fp3d_vision_max_iterations)
+
+        scene.fp3d_status = "Claude Vision: running parse..."
+
+        self._score = None
+        self._iterations = None
+        self._error = None
+        self._report_path = None
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(api_key, image_path, str(gt_path), threshold, max_iter),
+            daemon=True,
+        )
+        self._thread.start()
+
+        self._timer = context.window_manager.event_timer_add(0.25, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def _run(self, api_key, image_path, gt_path, threshold, max_iter):
+        try:
+            from .api.claude_client import ClaudeClient
+            ground_truth = json.loads(Path(gt_path).read_text())
+
+            client = ClaudeClient(api_key=api_key, use_thinking=True, thinking_budget=8192)
+            attempt = client.parse_floor_plan_from_image(
+                image_path,
+                user_notes=(
+                    "Trace the exterior perimeter precisely. Include every "
+                    "jog and notch. The plan has a triangular balcony on the "
+                    "west side meeting the living room at an angle."
+                ),
+            )
+
+            best_score = _score_plan(attempt, ground_truth)
+            best_attempt = attempt
+            iterations = 0
+
+            while best_score < threshold and iterations < max_iter:
+                iterations += 1
+                repaired = client.verify_and_repair(image_path, best_attempt)
+                s = _score_plan(repaired, ground_truth)
+                if s > best_score:
+                    best_score = s
+                    best_attempt = repaired
+                else:
+                    break
+
+            # Write the final attempt next to the image for inspection.
+            report_path = Path(image_path).with_suffix(".vision_result.json")
+            report_path.write_text(json.dumps(best_attempt, indent=2))
+
+            self._score = best_score
+            self._iterations = iterations
+            self._report_path = str(report_path)
+        except Exception as e:
+            self._error = f"{type(e).__name__}: {e}"
+
+    def modal(self, context, event):
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        if self._thread and self._thread.is_alive():
+            return {'PASS_THROUGH'}
+
+        context.window_manager.event_timer_remove(self._timer)
+        self._timer = None
+
+        if self._error:
+            context.scene.fp3d_status = f"Vision test error: {self._error}"
+            self.report({'ERROR'}, self._error)
+            return {'CANCELLED'}
+
+        score = self._score or 0.0
+        iters = self._iterations if self._iterations is not None else 0
+        threshold = float(context.scene.fp3d_vision_threshold)
+        passed = score >= threshold
+
+        verdict = "PASS" if passed else "FAIL"
+        msg = (
+            f"Vision test {verdict}: score={score:.3f} "
+            f"(threshold {threshold:.2f}), repair passes={iters}"
+        )
+        if self._report_path:
+            msg += f"  →  {self._report_path}"
+
+        context.scene.fp3d_status = msg
+        self.report({'INFO'} if passed else {'WARNING'}, msg)
+        return {'FINISHED'}
+
+
+def _score_plan(predicted, ground_truth):
+    """Inline accuracy scoring — mirrors tools/vision_accuracy_test.py.
+
+    Bounding-box IoU 50%, wall-count 20%, perimeter-length ratio 20%,
+    room-count 10%. Inlined here so the operator has no cross-package
+    dependency on the /tools directory when the add-on is installed.
+    """
+    pw = predicted.get("walls", []) or []
+    gw = ground_truth.get("walls", []) or []
+
+    def bbox(walls):
+        if not walls:
+            return (0.0, 0.0, 0.0, 0.0)
+        xs, ys = [], []
+        for w in walls:
+            xs.extend([w["start"][0], w["end"][0]])
+            ys.extend([w["start"][1], w["end"][1]])
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    def iou(a, b):
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        aa = max(0.0, (a[2] - a[0])) * max(0.0, (a[3] - a[1]))
+        ab = max(0.0, (b[2] - b[0])) * max(0.0, (b[3] - b[1]))
+        u = aa + ab - inter
+        return inter / u if u > 0 else 0.0
+
+    def length(w):
+        dx = w["end"][0] - w["start"][0]
+        dy = w["end"][1] - w["start"][1]
+        return (dx * dx + dy * dy) ** 0.5
+
+    bbox_iou = iou(bbox(pw), bbox(gw))
+    count_s = 1.0 - min(1.0, abs(len(pw) - len(gw)) / max(1, len(gw)))
+    pl = sum(length(w) for w in pw)
+    gl = sum(length(w) for w in gw) or 1e-6
+    length_s = 1.0 - min(1.0, abs(pl - gl) / gl)
+    pr = len(predicted.get("rooms", []) or [])
+    gr = len(ground_truth.get("rooms", []) or []) or 1
+    room_s = 1.0 - min(1.0, abs(pr - gr) / gr)
+
+    return 0.5 * bbox_iou + 0.2 * count_s + 0.2 * length_s + 0.1 * room_s
+
+
 class FP3D_OT_ExportModel(bpy.types.Operator):
     bl_idname = "fp3d.export_model"
     bl_label = "Export Model"
