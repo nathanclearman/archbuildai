@@ -254,6 +254,29 @@ class FP3D_OT_AdjustWallHeight(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class FP3D_OT_ReloadAddon(bpy.types.Operator):
+    """Disable and re-enable this add-on to pick up edited source files.
+
+    Saves the round-trip through Edit -> Preferences -> Add-ons every time
+    you pull new code.
+    """
+
+    bl_idname = "fp3d.reload_addon"
+    bl_label = "Reload FloorPlan3D"
+    bl_description = "Disable and re-enable the FloorPlan3D add-on (pulls in edited source)"
+
+    def execute(self, context):
+        module_name = __package__  # "blender_addon" at install time
+        try:
+            bpy.ops.preferences.addon_disable(module=module_name)
+            bpy.ops.preferences.addon_enable(module=module_name)
+        except Exception as e:
+            self.report({'ERROR'}, f"Reload failed: {e}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Reloaded {module_name}")
+        return {'FINISHED'}
+
+
 class FP3D_OT_RunVisionAccuracyTest(bpy.types.Operator):
     """Run the Claude Vision accuracy loop on the currently-loaded image.
 

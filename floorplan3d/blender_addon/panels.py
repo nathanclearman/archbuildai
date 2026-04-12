@@ -30,6 +30,24 @@ class FP3D_PT_MainPanel(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator("fp3d.generate_sample", icon='MESH_CUBE', text="Generate Sample")
 
+        # Vision accuracy test — surfaced on the main panel for one-click use.
+        test_row = layout.row(align=True)
+        test_row.scale_y = 1.2
+        test_row.enabled = bool(scene.fp3d_claude_api_key) and bool(scene.fp3d_image_path)
+        test_row.operator("fp3d.run_vision_accuracy_test", icon='VIEWZOOM')
+
+        if not scene.fp3d_claude_api_key or not scene.fp3d_image_path:
+            hint = layout.row()
+            hint.scale_y = 0.8
+            hint.label(
+                text="(Add API key + image in Claude Vision panel)",
+                icon='INFO',
+            )
+
+        reload_row = layout.row(align=True)
+        reload_row.scale_y = 0.9
+        reload_row.operator("fp3d.reload_addon", icon='FILE_REFRESH', text="Reload Add-on")
+
         if scene.fp3d_status and scene.fp3d_status != "Ready":
             box = layout.box()
             status = scene.fp3d_status

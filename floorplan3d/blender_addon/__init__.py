@@ -19,6 +19,7 @@ classes = [
     operators.FP3D_OT_ExportModel,
     operators.FP3D_OT_LoadFloorPlan,
     operators.FP3D_OT_RunVisionAccuracyTest,
+    operators.FP3D_OT_ReloadAddon,
     panels.FP3D_PT_MainPanel,
     panels.FP3D_PT_AdjustPanel,
     panels.FP3D_PT_ExportPanel,
