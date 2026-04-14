@@ -131,7 +131,11 @@ def ranch_open_concept(rng: random.Random) -> Plan:
         laundry_h = great_h * 0.3
         pow_h = great_h - mud_h - laundry_h
 
-    rooms.append(Room("garage", (0, 0, garage_w, garage_h)))
+    # Garage connects to the mudroom on its east wall — the standard US
+    # attached-garage access path into the house. Without this door the
+    # garage was sealed in every sample.
+    rooms.append(Room("garage", (0, 0, garage_w, garage_h),
+                      doors=[("mudroom", 0.5, 0.9)]))
     rooms.append(Room("mudroom", (garage_w, 0, mud_w, mud_h)))
     rooms.append(Room("laundry_room", (garage_w, mud_h, mud_w, laundry_h)))
     rooms.append(Room("powder_room",
@@ -175,7 +179,11 @@ def ranch_open_concept(rng: random.Random) -> Plan:
     # that used to sit under the 60%-tall walk-in.
     rooms.append(Room("walk_in_closet", (x, y0, wic_w, bed_wing_h)))
 
-    plan = Plan(rooms=rooms, footprint=(w, h), exterior_door=("great_room", "S"))
+    # Front door on great_room's N edge (y=0) — which actually IS the
+    # footprint exterior. The previous ("great_room", "S") pointed at the
+    # great_room's south edge (y=great_h), which is interior (the bedroom
+    # wing is below it), so the door rendered on the en-suite instead.
+    plan = Plan(rooms=rooms, footprint=(w, h), exterior_door=("great_room", "N"))
     return plan
 
 
@@ -286,27 +294,14 @@ TEMPLATES: list[Callable[[random.Random], Plan]] = [
 
 def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
     """Convert a template-produced Plan into a canonical floor plan dict."""
-    walls: list[dict] = []
-    seen: dict[tuple, int] = {}
-
-    def add_wall(a, b, thickness=0.15) -> int:
-        key = tuple(sorted([tuple(round(c, 3) for c in a), tuple(round(c, 3) for c in b)]))
-        if key in seen:
-            return seen[key]
-        idx = len(walls)
-        walls.append({"start": list(a), "end": list(b), "thickness": thickness})
-        seen[key] = idx
-        return idx
-
-    # 1. One wall per room edge; shared edges deduplicate via `seen`.
-    for r in plan.rooms:
-        x, y, w, h = r.rect
-        add_wall([x, y], [x + w, y])
-        add_wall([x + w, y], [x + w, y + h])
-        add_wall([x + w, y + h], [x, y + h])
-        add_wall([x, y + h], [x, y])
+    walls = _build_walls(plan)
 
     # 2. Doors: declared room-to-room connections.
+    # Each door is snapped onto the actual wall segment it belongs to: the
+    # wall graph is now subdivided at T-junctions, so the nearest wall may
+    # be shorter than the shared edge. We pick the longest wall segment
+    # that lies on the shared edge and clamp the door so it fits entirely
+    # within that segment (avoids door_width overhangs past wall endpoints).
     doors: list[dict] = []
     for r in plan.rooms:
         for (other_label, t, width) in r.doors:
@@ -316,9 +311,12 @@ def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
             pos = _shared_edge_point(r.rect, other.rect, t)
             if pos is None:
                 continue
-            wall_idx = _nearest_wall(pos, walls)
+            snapped = _snap_door_to_wall(pos, width, walls)
+            if snapped is None:
+                continue
+            wall_idx, (px, py) = snapped
             doors.append({
-                "position": [round(pos[0], 2), round(pos[1], 2)],
+                "position": [round(px, 2), round(py, 2)],
                 "width": round(width, 2),
                 "type": "hinged",
                 "wall_index": wall_idx,
@@ -330,13 +328,16 @@ def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
         room = _find_room(plan, label)
         if room is not None:
             pos = _exterior_edge_midpoint(room.rect, side, plan.footprint)
-            wall_idx = _nearest_wall(pos, walls)
-            doors.append({
-                "position": [round(pos[0], 2), round(pos[1], 2)],
-                "width": 1.0,
-                "type": "hinged",
-                "wall_index": wall_idx,
-            })
+            ext_width = 1.0
+            snapped = _snap_door_to_wall(pos, ext_width, walls)
+            if snapped is not None:
+                wall_idx, (px, py) = snapped
+                doors.append({
+                    "position": [round(px, 2), round(py, 2)],
+                    "width": ext_width,
+                    "type": "hinged",
+                    "wall_index": wall_idx,
+                })
 
     # 4. Windows on exterior walls, roughly one per exterior room edge.
     windows: list[dict] = []
@@ -353,10 +354,14 @@ def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
             if rng.random() > 0.55:
                 continue
             cx, cy = _edge_midpoint(r.rect, side)
-            wall_idx = _nearest_wall((cx, cy), walls)
+            win_width = round(rng.uniform(0.9, 1.6), 2)
+            snapped = _snap_door_to_wall((cx, cy), win_width, walls)
+            if snapped is None:
+                continue
+            wall_idx, (wx, wy) = snapped
             windows.append({
-                "position": [round(cx, 2), round(cy, 2)],
-                "width": round(rng.uniform(0.9, 1.6), 2),
+                "position": [round(wx, 2), round(wy, 2)],
+                "width": win_width,
                 "wall_index": wall_idx,
             })
 
@@ -381,6 +386,85 @@ def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
         rooms=rooms_out,
         scale={"pixels_per_meter": 40},
     ).to_dict()
+
+
+def _build_walls(plan: Plan, thickness: float = 0.15, coord_precision: int = 3) -> list[dict]:
+    """Generate a non-overlapping wall graph from the room rectangles.
+
+    Every rectangle edge is treated as a 1-D interval on its line (horizontal
+    or vertical). Intervals on the same line are unioned, then split at every
+    other rectangle's corner that lies inside the union. The output is the
+    minimal set of wall segments such that no two walls are collinear and
+    overlapping.
+
+    The naive "one wall per room edge with endpoint-pair dedup" approach
+    produced 2-3x overcounts wherever one room's edge spanned two adjacent
+    rooms on the other side (a T-junction) — each partial edge plus the
+    full spanning edge all landed in the wall list as independent entries,
+    teaching downstream models to emit redundant walls.
+    """
+    # Collect {line_coord: [(start, end), ...]} per horizontal / vertical line.
+    h_segments: dict[float, list[tuple[float, float]]] = {}
+    v_segments: dict[float, list[tuple[float, float]]] = {}
+    # Split points on each line (corners of every rectangle).
+    h_splits: dict[float, set[float]] = {}
+    v_splits: dict[float, set[float]] = {}
+
+    def _round(c: float) -> float:
+        return round(c, coord_precision)
+
+    for r in plan.rooms:
+        x, y, w, h = r.rect
+        x0, x1 = _round(x), _round(x + w)
+        y0, y1 = _round(y), _round(y + h)
+
+        h_segments.setdefault(y0, []).append((x0, x1))
+        h_segments.setdefault(y1, []).append((x0, x1))
+        v_segments.setdefault(x0, []).append((y0, y1))
+        v_segments.setdefault(x1, []).append((y0, y1))
+
+        for yy in (y0, y1):
+            h_splits.setdefault(yy, set()).update({x0, x1})
+        for xx in (x0, x1):
+            v_splits.setdefault(xx, set()).update({y0, y1})
+
+    def _union_1d(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        if not intervals:
+            return []
+        segs = sorted((min(a, b), max(a, b)) for a, b in intervals)
+        merged: list[list[float]] = [list(segs[0])]
+        for s, e in segs[1:]:
+            if s <= merged[-1][1] + 1e-6:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        return [(a, b) for a, b in merged]
+
+    walls: list[dict] = []
+
+    for y, segs in h_segments.items():
+        splits = sorted(h_splits.get(y, set()))
+        for s, e in _union_1d(segs):
+            pts = [s] + [p for p in splits if s + 1e-6 < p < e - 1e-6] + [e]
+            for i in range(len(pts) - 1):
+                walls.append({
+                    "start": [pts[i], y],
+                    "end": [pts[i + 1], y],
+                    "thickness": thickness,
+                })
+
+    for x, segs in v_segments.items():
+        splits = sorted(v_splits.get(x, set()))
+        for s, e in _union_1d(segs):
+            pts = [s] + [p for p in splits if s + 1e-6 < p < e - 1e-6] + [e]
+            for i in range(len(pts) - 1):
+                walls.append({
+                    "start": [x, pts[i]],
+                    "end": [x, pts[i + 1]],
+                    "thickness": thickness,
+                })
+
+    return walls
 
 
 def _find_room(plan: Plan, label: str, after: Room | None = None) -> Room | None:
@@ -447,13 +531,65 @@ def _edge_is_exterior(rect, side, fw, fh, tol=0.02):
 
 
 def _exterior_edge_midpoint(rect, side, footprint):
-    x, y, w, h = rect
-    fw, fh = footprint
-    if side == "N": return (x + w / 2, 0)
-    if side == "S": return (x + w / 2, fh)
-    if side == "W": return (0, y + h / 2)
-    if side == "E": return (fw, y + h / 2)
+    # Use the room's OWN edge midpoint. The old implementation assumed every
+    # exterior-door room touched the footprint on the given side and wrote
+    # the door at the footprint boundary — so when a template pointed at a
+    # room whose edge was actually interior (e.g. ranch great_room, "S"),
+    # the door landed on whatever room did touch the footprint south edge
+    # (in the ranch case, the master en-suite). Using the room's own edge
+    # keeps the door on that room's wall, or reveals the template bug
+    # when the room's edge isn't at the footprint.
     return _edge_midpoint(rect, side)
+
+
+def _snap_door_to_wall(point, door_width, walls, tol=0.02):
+    """Find the best wall segment to host a door and clamp the door to fit.
+
+    Picks the longest wall segment whose line contains `point` and is at
+    least `door_width` long. Returns (wall_index, (px, py)) with the door
+    position clamped so the door extends only within that segment, or
+    None if no wall can host it.
+    """
+    px, py = point
+    best: tuple[int, tuple[float, float], float] | None = None  # (idx, pos, length)
+
+    for i, w in enumerate(walls):
+        sx, sy = w["start"]
+        ex, ey = w["end"]
+        is_horizontal = abs(sy - ey) < tol
+        is_vertical = abs(sx - ex) < tol
+        if is_horizontal:
+            # Point must lie on this line within tol and within x-range
+            if abs(py - sy) > tol:
+                continue
+            xlo, xhi = (sx, ex) if sx <= ex else (ex, sx)
+            if px < xlo - tol or px > xhi + tol:
+                continue
+            wall_len = xhi - xlo
+            if wall_len < door_width - tol:
+                continue
+            # Clamp so the door fits
+            half = door_width / 2
+            new_x = max(xlo + half, min(xhi - half, px))
+            if best is None or wall_len > best[2]:
+                best = (i, (new_x, sy), wall_len)
+        elif is_vertical:
+            if abs(px - sx) > tol:
+                continue
+            ylo, yhi = (sy, ey) if sy <= ey else (ey, sy)
+            if py < ylo - tol or py > yhi + tol:
+                continue
+            wall_len = yhi - ylo
+            if wall_len < door_width - tol:
+                continue
+            half = door_width / 2
+            new_y = max(ylo + half, min(yhi - half, py))
+            if best is None or wall_len > best[2]:
+                best = (i, (sx, new_y), wall_len)
+
+    if best is None:
+        return None
+    return best[0], best[1]
 
 
 def _nearest_wall(point, walls):
