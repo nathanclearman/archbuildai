@@ -894,7 +894,8 @@ def _snap_door_to_wall(point, door_width, walls, tol=0.02):
 
 # ---------- rendering ----------
 
-# Rough per-label fill color, to vaguely resemble MLS-style colored plans.
+# Rough per-label fill color for the default MLS-pastel style. Style
+# presets below can override the whole palette for a different look.
 ROOM_COLORS = {
     "great_room": (245, 240, 225),
     "living_room": (245, 240, 225),
@@ -919,10 +920,114 @@ ROOM_COLORS = {
 }
 
 
-def render(plan_dict: dict, cfg: SynthConfig):
+def _recolor(base: dict, hue_shift: int, sat_mul: float = 1.0,
+             lightness_adj: int = 0) -> dict:
+    """Produce a new palette by shifting the HSV hue of `base`. Keeps
+    each room's relative color relationship but moves the whole palette
+    into a different hue family, which lets us reuse ROOM_COLORS for
+    warm-tone, grayscale, and blueprint variants without hand-tuning
+    every label."""
+    import colorsys
+    out = {}
+    for label, (r, g, b) in base.items():
+        h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+        h = (h + hue_shift / 360.0) % 1.0
+        s = max(0.0, min(1.0, s * sat_mul))
+        v = max(0.0, min(1.0, v + lightness_adj / 255.0))
+        r2, g2, b2 = colorsys.hsv_to_rgb(h, s, v)
+        out[label] = (int(r2 * 255), int(g2 * 255), int(b2 * 255))
+    return out
+
+
+def _mono(value: int) -> dict:
+    """Return a palette where every room fills with the same near-white
+    color. Used for architect-style mono renders."""
+    c = (value, value, value)
+    return {label: c for label in ROOM_COLORS}
+
+
+STYLES: dict = {
+    "mls_pastel": {
+        "palette": ROOM_COLORS,
+        "wall": (25, 25, 25),
+        "wall_scale": 1.0,
+        "bg": (255, 255, 255),
+        "arc": (55, 55, 55),
+        "window_a": (55, 90, 140),
+        "window_b": (120, 160, 200),
+        "text": (60, 60, 60),
+    },
+    "architect_mono": {
+        "palette": _mono(252),
+        "wall": (10, 10, 10),
+        "wall_scale": 1.4,
+        "bg": (253, 252, 247),
+        "arc": (25, 25, 25),
+        "window_a": (40, 40, 40),
+        "window_b": (150, 150, 150),
+        "text": (20, 20, 20),
+    },
+    "warm_tones": {
+        "palette": _recolor(ROOM_COLORS, hue_shift=-15, sat_mul=1.25,
+                            lightness_adj=-4),
+        "wall": (45, 30, 20),
+        "wall_scale": 1.1,
+        "bg": (252, 248, 240),
+        "arc": (70, 50, 40),
+        "window_a": (90, 100, 130),
+        "window_b": (160, 170, 195),
+        "text": (70, 50, 35),
+    },
+    "grayscale": {
+        "palette": _recolor(ROOM_COLORS, hue_shift=0, sat_mul=0.0,
+                            lightness_adj=-6),
+        "wall": (15, 15, 15),
+        "wall_scale": 0.9,
+        "bg": (255, 255, 255),
+        "arc": (40, 40, 40),
+        "window_a": (60, 60, 60),
+        "window_b": (150, 150, 150),
+        "text": (30, 30, 30),
+    },
+    "blueprint": {
+        "palette": {label: (30, 75, 140) for label in ROOM_COLORS},
+        "wall": (235, 240, 255),
+        "wall_scale": 1.2,
+        "bg": (30, 75, 140),
+        "arc": (235, 240, 255),
+        "window_a": (215, 230, 250),
+        "window_b": (255, 255, 255),
+        "text": (235, 240, 255),
+    },
+    "marketing_bold": {
+        "palette": _recolor(ROOM_COLORS, hue_shift=0, sat_mul=2.0,
+                            lightness_adj=-8),
+        "wall": (35, 35, 35),
+        "wall_scale": 1.0,
+        "bg": (255, 255, 255),
+        "arc": (60, 60, 60),
+        "window_a": (40, 110, 180),
+        "window_b": (110, 170, 220),
+        "text": (50, 50, 50),
+    },
+}
+
+DEFAULT_STYLE = STYLES["mls_pastel"]
+
+
+def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None):
     from PIL import Image, ImageDraw, ImageFont
     size = cfg.image_size
     ppm = cfg.pixels_per_meter
+    style = style or DEFAULT_STYLE
+    palette = style["palette"]
+    wall_color = style["wall"]
+    bg_color = style["bg"]
+    arc_color = style["arc"]
+    window_a = style["window_a"]
+    window_b = style["window_b"]
+    text_color = style["text"]
+    wall_scale = style.get("wall_scale", 1.0)
 
     # Compute footprint from rooms so centering is accurate.
     xs = [p[0] for r in plan_dict["rooms"] for p in r["polygon"]]
@@ -932,21 +1037,21 @@ def render(plan_dict: dict, cfg: SynthConfig):
     off_x = (size - fw * ppm) / 2
     off_y = (size - fh * ppm) / 2
 
-    img = Image.new("RGB", (size, size), "white")
+    img = Image.new("RGB", (size, size), bg_color)
     draw = ImageDraw.Draw(img)
 
     def to_px(p):
         return (off_x + p[0] * ppm, off_y + p[1] * ppm)
 
-    # Fill rooms.
+    # Fill rooms using the current style's palette.
     for r in plan_dict["rooms"]:
-        color = ROOM_COLORS.get(r["label"], (245, 245, 245))
+        color = palette.get(r["label"], palette.get("great_room", (245, 245, 245)))
         draw.polygon([to_px(p) for p in r["polygon"]], fill=color)
 
-    # Draw walls on top.
-    wall_px = max(3, int(cfg.wall_thickness_m * ppm * 0.9))
+    # Draw walls on top, using the style's wall color + thickness scale.
+    wall_px = max(3, int(cfg.wall_thickness_m * ppm * 0.9 * wall_scale))
     for w in plan_dict["walls"]:
-        draw.line([to_px(w["start"]), to_px(w["end"])], fill=(25, 25, 25), width=wall_px)
+        draw.line([to_px(w["start"]), to_px(w["end"])], fill=wall_color, width=wall_px)
 
     # Doors and windows: gap lines rendered ALONG their wall's direction.
     # The old code always drew a horizontal gap, so openings on vertical
@@ -1034,9 +1139,9 @@ def render(plan_dict: dict, cfg: SynthConfig):
             ang = start_ang + (i / steps) * delta
             arc_pts.append((hinge_px[0] + r_px * math.cos(ang),
                             hinge_px[1] + r_px * math.sin(ang)))
-        draw.line(arc_pts, fill=(55, 55, 55), width=1)
+        draw.line(arc_pts, fill=arc_color, width=1)
         # Door leaf from the hinge to the opened free-end position.
-        draw.line([hinge_px, to_px(free_open_m)], fill=(55, 55, 55), width=2)
+        draw.line([hinge_px, to_px(free_open_m)], fill=arc_color, width=2)
 
     walls = plan_dict["walls"]
     for d in plan_dict["doors"]:
@@ -1044,11 +1149,11 @@ def render(plan_dict: dict, cfg: SynthConfig):
         wdx, wdy = _wall_dir(wall)
         cx, cy = to_px(d["position"])
         half = d["width"] * ppm / 2
-        # Erase the wall at the door opening with a white gap; the arc +
-        # leaf are drawn on top.
+        # Erase the wall at the door opening with the BG color so the
+        # wall disappears under styles with non-white backgrounds too.
         draw.line([(cx - wdx * half, cy - wdy * half),
                    (cx + wdx * half, cy + wdy * half)],
-                  fill=(255, 255, 255), width=door_px)
+                  fill=bg_color, width=door_px)
         _render_door_arc(d, wall)
 
     for win in plan_dict["windows"]:
@@ -1060,7 +1165,7 @@ def render(plan_dict: dict, cfg: SynthConfig):
         # Erase the wall at the window opening.
         draw.line([(cx - wdx * half, cy - wdy * half),
                    (cx + wdx * half, cy + wdy * half)],
-                  fill=(255, 255, 255), width=door_px)
+                  fill=bg_color, width=door_px)
         # Two thin parallel lines flanking the wall axis — the classic
         # floor-plan window glyph. Offset is about one wall-thickness.
         offset = max(2.0, (wall_px - 1) / 2)
@@ -1069,11 +1174,11 @@ def render(plan_dict: dict, cfg: SynthConfig):
             oy = perp_y * offset * s
             draw.line([(cx - wdx * half + ox, cy - wdy * half + oy),
                        (cx + wdx * half + ox, cy + wdy * half + oy)],
-                      fill=(55, 90, 140), width=1)
+                      fill=window_a, width=1)
         # Thin centerline between the two parallel lines for a sash look.
         draw.line([(cx - wdx * half, cy - wdy * half),
                    (cx + wdx * half, cy + wdy * half)],
-                  fill=(120, 160, 200), width=1)
+                  fill=window_b, width=1)
 
     # Room labels. Each label is wrapped and sized to fit inside its room
     # rectangle — the old single-line draw clipped multi-word labels
@@ -1091,6 +1196,7 @@ def render(plan_dict: dict, cfg: SynthConfig):
             _draw_label_fitted(
                 draw, to_px((cx, cy)), label,
                 room_w_px=room_w_px, room_h_px=room_h_px,
+                fill=text_color,
             )
 
     return img
@@ -1156,7 +1262,8 @@ def _measure(draw, font, text: str):
 
 def _draw_label_fitted(draw, centroid_px, text: str,
                        room_w_px: float, room_h_px: float,
-                       margin_px: int = 6) -> None:
+                       margin_px: int = 6,
+                       fill: tuple = (60, 60, 60)) -> None:
     """Draw `text` at `centroid_px` wrapped and shrunk to fit the room box."""
     max_w = max(room_w_px - 2 * margin_px, 20)
     max_h = max(room_h_px - 2 * margin_px, 12)
@@ -1179,13 +1286,10 @@ def _draw_label_fitted(draw, centroid_px, text: str,
                 top_y = cy - total_h / 2 + line_h / 2
                 for i, ln in enumerate(lines):
                     draw.text((cx, top_y + i * (line_h + line_gap)), ln,
-                              fill=(60, 60, 60), font=font, anchor="mm")
+                              fill=fill, font=font, anchor="mm")
                 return
 
-    # Nothing fit cleanly — draw the text at the smallest tried size. The
-    # label may still overflow the room on truly tiny rooms, but picking
-    # the smallest-size wrap keeps the tail characters visible instead of
-    # mid-word-clipped.
+    # Nothing fit cleanly — draw the text at the smallest tried size.
     font = _get_font(7)
     lines = _wrap_words(words, min(len(words), 3))
     cx, cy = centroid_px
@@ -1194,7 +1298,7 @@ def _draw_label_fitted(draw, centroid_px, text: str,
     top_y = cy - total_h / 2 + line_h / 2
     for i, ln in enumerate(lines):
         draw.text((cx, top_y + i * (line_h + line_gap)), ln,
-                  fill=(60, 60, 60), font=font, anchor="mm")
+                  fill=fill, font=font, anchor="mm")
 
 
 # ---------- public API ----------
@@ -1309,7 +1413,11 @@ def generate_one(seed: int, cfg: SynthConfig | None = None,
         flip_x = rng.random() < 0.5
         if rot_k or flip_x:
             plan_dict = _apply_augmentation(plan_dict, rot_k, flip_x)
-    img = render(plan_dict, cfg)
+        style_name = rng.choice(list(STYLES.keys()))
+        style = STYLES[style_name]
+    else:
+        style = DEFAULT_STYLE
+    img = render(plan_dict, cfg, style=style)
     return img, plan_dict
 
 
