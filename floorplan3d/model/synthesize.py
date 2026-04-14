@@ -284,9 +284,256 @@ def colonial_compartmentalized(rng: random.Random) -> Plan:
     return Plan(rooms=rooms, footprint=(w, h), exterior_door=("foyer", "N"))
 
 
+def split_bedroom_ranch(rng: random.Random) -> Plan:
+    """Wide single-floor ranch with the master suite and secondary bedrooms
+    on opposite ends of the house, a vertical hallway bridging the
+    secondary wing to the central great room, and an attached garage
+    directly above the master suite.
+
+    Layout (y south; columns left-to-right: sec_wing | hall | great_room | mbr_col):
+      +------+---+------------------+--------+
+      | bed2 |   |                  | garage |
+      +------+   |                  |        |
+      | bath |hall|  great_room     +--------+
+      +------+   |                  | master |
+      | bed3 |   |                  +--+-----+
+      |      |   |                  |en| wic |
+      +------+---+------------------+--+-----+
+
+    The master column stacks: garage (top) / master_bedroom (middle) /
+    en_suite + walk_in_closet (bottom). The great_room is a single big
+    open rectangle (kitchen + dining + living merged) with openings to
+    the garage and hall on its sides.
+    """
+    w = rng.uniform(19, 23)
+    h = rng.uniform(12, 14)
+
+    sec_w = rng.uniform(4.2, 5.0)
+    hall_w = rng.uniform(1.2, 1.6)
+    mbr_col_w = rng.uniform(5.2, 6.2)
+    great_w = w - sec_w - hall_w - mbr_col_w
+    if great_w < 5.0:
+        deficit = 5.0 - great_w
+        mbr_col_w = max(4.8, mbr_col_w - deficit * 0.6)
+        sec_w = max(4.0, sec_w - deficit * 0.4)
+        great_w = w - sec_w - hall_w - mbr_col_w
+
+    # Secondary wing stacked: bed | bath | bed
+    sec_bed2_h = rng.uniform(3.8, 4.5)
+    sec_bath_h = rng.uniform(2.5, 3.0)
+    sec_bed3_h = h - sec_bed2_h - sec_bath_h
+    if sec_bed3_h < 3.2:
+        scale = (h - 3.2) / (sec_bed2_h + sec_bath_h)
+        sec_bed2_h *= scale
+        sec_bath_h *= scale
+        sec_bed3_h = 3.2
+
+    # Master column sub-heights: garage top, master middle, en-suite+wic bottom
+    garage_h = rng.uniform(5.8, 6.4)
+    ens_h = min(rng.uniform(2.2, 2.6), (h - garage_h) * 0.45)
+    mbr_h = h - garage_h - ens_h
+
+    ens_w = rng.uniform(2.2, 2.6)
+    wic_w = mbr_col_w - ens_w
+
+    rooms: list[Room] = []
+
+    # Secondary bedroom wing (left column)
+    rooms.append(Room("bedroom", (0, 0, sec_w, sec_bed2_h),
+                      doors=[("hallway", 0.5, 0.9)]))
+    rooms.append(Room("bathroom", (0, sec_bed2_h, sec_w, sec_bath_h),
+                      doors=[("hallway", 0.5, 0.8)]))
+    rooms.append(Room("bedroom", (0, sec_bed2_h + sec_bath_h, sec_w, sec_bed3_h),
+                      doors=[("hallway", 0.5, 0.9)]))
+
+    # Vertical hallway (full height)
+    rooms.append(Room("hallway", (sec_w, 0, hall_w, h),
+                      doors=[("great_room", 0.5, 1.2)]))
+
+    # Great room (merged kitchen + dining + living)
+    rooms.append(Room("great_room", (sec_w + hall_w, 0, great_w, h)))
+
+    # Master column (right): garage / master / en-suite + wic
+    mbr_x = sec_w + hall_w + great_w
+    rooms.append(Room("garage", (mbr_x, 0, mbr_col_w, garage_h),
+                      doors=[("great_room", 0.5, 0.9)]))
+    rooms.append(Room("master_bedroom", (mbr_x, garage_h, mbr_col_w, mbr_h),
+                      doors=[("great_room", 0.5, 0.9),
+                             ("en_suite", 0.3, 0.8),
+                             ("walk_in_closet", 0.7, 0.7)]))
+    rooms.append(Room("en_suite", (mbr_x, garage_h + mbr_h, ens_w, ens_h)))
+    rooms.append(Room("walk_in_closet", (mbr_x + ens_w, garage_h + mbr_h, wic_w, ens_h)))
+
+    return Plan(rooms=rooms, footprint=(w, h), exterior_door=("great_room", "N"))
+
+
+def l_shape_ranch(rng: random.Random) -> Plan:
+    """Single-floor L-shape ranch. The footprint's NW corner is a cut-out
+    (exterior), so the house outline has a concave corner. Bedroom wing
+    sits in the top-right (north of the cut-out), the main living band
+    spans the full width at the bottom.
+
+    Layout (y south; * marks exterior cut-out):
+      +--------+---+---+----+
+      |  *     |bed|bth|bed |   (wing at top right, above the cut-out)
+      +--------+---+---+----+
+      | foyer  |   hallway   |
+      +--------+-------------+
+      |kit|din| living |mbr  |
+      +---+---+--------+-----+
+      |            |ens| wic |
+      +---+---+--------+-----+
+    """
+    w = rng.uniform(14, 17)
+    h = rng.uniform(12, 14)
+
+    cut_w = rng.uniform(4.5, 5.5)
+    cut_h = rng.uniform(3.6, 4.5)
+
+    wing_w = w - cut_w
+    wing_h = cut_h
+
+    # Wing columns: bed | bath | bed (three equal-ish sub-columns)
+    wing_bath_w = rng.uniform(2.2, 2.5)
+    wing_bed_each = (wing_w - wing_bath_w) / 2
+    if wing_bed_each < 2.8:
+        wing_bath_w = max(1.8, wing_w - 5.6)
+        wing_bed_each = (wing_w - wing_bath_w) / 2
+
+    # Below-cut strip heights: hallway sub-strip + bottom band
+    hall_h = rng.uniform(1.3, 1.6)
+    bot_y = cut_h + hall_h
+    bot_h = h - bot_y
+    if bot_h < 4.5:
+        hall_h = max(1.2, h - cut_h - 4.5)
+        bot_y = cut_h + hall_h
+        bot_h = h - bot_y
+
+    # Bottom columns: kitchen | dining | living | master
+    kit_w = rng.uniform(3.2, 3.8)
+    din_w = rng.uniform(2.6, 3.2)
+    mbr_w = rng.uniform(4.2, 5.2)
+    liv_w = w - kit_w - din_w - mbr_w
+    if liv_w < 3.0:
+        deficit = 3.0 - liv_w
+        mbr_w = max(4.0, mbr_w - deficit * 0.5)
+        kit_w = max(3.0, kit_w - deficit * 0.5)
+        liv_w = w - kit_w - din_w - mbr_w
+
+    ens_w = rng.uniform(1.8, 2.2)
+    ens_h = min(rng.uniform(2.0, 2.4), bot_h * 0.4)
+    mbr_h_local = bot_h - ens_h
+    wic_w_local = mbr_w - ens_w
+
+    rooms: list[Room] = []
+
+    # Wing rooms (top-right, north of the cut-out)
+    rooms.append(Room("bedroom", (cut_w, 0, wing_bed_each, wing_h),
+                      doors=[("hallway", 0.2, 0.9)]))
+    rooms.append(Room("bathroom", (cut_w + wing_bed_each, 0, wing_bath_w, wing_h),
+                      doors=[("hallway", 0.5, 0.8)]))
+    rooms.append(Room("bedroom", (cut_w + wing_bed_each + wing_bath_w, 0, wing_bed_each, wing_h),
+                      doors=[("hallway", 0.8, 0.9)]))
+
+    # Hallway strip + foyer together span the full width at y=cut_h
+    rooms.append(Room("foyer", (0, cut_h, cut_w, hall_h),
+                      doors=[("hallway", 0.5, 1.0), ("kitchen", 0.5, 1.0)]))
+    rooms.append(Room("hallway", (cut_w, cut_h, w - cut_w, hall_h)))
+
+    # Bottom band: kitchen | dining | living | master column
+    rooms.append(Room("kitchen", (0, bot_y, kit_w, bot_h),
+                      doors=[("dining_room", 0.5, 1.2)]))
+    # Dining's shared edge with the hallway is the sliver formed by the
+    # kit_w / cut_w offset — can fall below a usable door width, so no
+    # direct dining <-> hallway door is declared. Access is via kitchen
+    # and living_room instead.
+    rooms.append(Room("dining_room", (kit_w, bot_y, din_w, bot_h),
+                      doors=[("living_room", 0.5, 1.2)]))
+    rooms.append(Room("living_room", (kit_w + din_w, bot_y, liv_w, bot_h),
+                      doors=[("hallway", 0.5, 1.2)]))
+
+    mbr_x = kit_w + din_w + liv_w
+    rooms.append(Room("master_bedroom", (mbr_x, bot_y, mbr_w, mbr_h_local),
+                      doors=[("living_room", 0.9, 0.9),
+                             ("en_suite", 0.3, 0.8),
+                             ("walk_in_closet", 0.7, 0.7)]))
+    rooms.append(Room("en_suite", (mbr_x, bot_y + mbr_h_local, ens_w, ens_h)))
+    rooms.append(Room("walk_in_closet", (mbr_x + ens_w, bot_y + mbr_h_local, wic_w_local, ens_h)))
+
+    # Exterior door on the foyer's N edge — that edge borders the cut-out
+    # (exterior), which is the L's concave corner. The shape makes it
+    # read as a porch under the wing's south overhang.
+    return Plan(rooms=rooms, footprint=(w, h), exterior_door=("foyer", "N"))
+
+
+def narrow_townhouse(rng: random.Random) -> Plan:
+    """Deep narrow single-story house (urban shotgun / rowhouse ground
+    plan). One primary column of rooms with a double-loaded corridor
+    on the east side that everything opens onto. Five public/private
+    rooms stacked — sum-of-minimum heights fits inside h without
+    requiring the negative-height salvage path the earlier version had.
+
+    Layout (y south):
+      +----------+---+
+      |  foyer   | h |
+      +----------+ a |
+      | living   | l |
+      +----------+ l |
+      | kitchen  | w |
+      +----------+ a |
+      | bathroom | y |
+      +----------+   |
+      | bedroom  |   |
+      +----------+---+
+    """
+    w = rng.uniform(6.8, 8.5)
+    h = rng.uniform(14, 17)
+
+    hall_w = rng.uniform(1.2, 1.5)
+    rooms_w = w - hall_w
+
+    # Heights sampled so their sum fits h. We sample relative weights and
+    # scale them to exactly hit h, which keeps proportions natural across
+    # the h range without risking negative heights.
+    raw = [
+        rng.uniform(1.8, 2.3),   # foyer
+        rng.uniform(3.8, 4.8),   # living_room
+        rng.uniform(3.0, 3.8),   # kitchen
+        rng.uniform(2.0, 2.6),   # bathroom
+        rng.uniform(3.0, 3.8),   # bedroom
+    ]
+    scale = h / sum(raw)
+    foyer_h, living_h, kitchen_h, bath_h, bedroom_h = (v * scale for v in raw)
+
+    rooms: list[Room] = []
+    y = 0.0
+    rooms.append(Room("foyer", (0, y, rooms_w, foyer_h),
+                      doors=[("hallway", 0.5, 0.9)]))
+    y += foyer_h
+    rooms.append(Room("living_room", (0, y, rooms_w, living_h),
+                      doors=[("hallway", 0.5, 1.2)]))
+    y += living_h
+    rooms.append(Room("kitchen", (0, y, rooms_w, kitchen_h),
+                      doors=[("hallway", 0.5, 1.0)]))
+    y += kitchen_h
+    rooms.append(Room("bathroom", (0, y, rooms_w, bath_h),
+                      doors=[("hallway", 0.5, 0.8)]))
+    y += bath_h
+    rooms.append(Room("bedroom", (0, y, rooms_w, bedroom_h),
+                      doors=[("hallway", 0.5, 0.9)]))
+
+    # East hallway spans the full depth
+    rooms.append(Room("hallway", (rooms_w, 0, hall_w, h)))
+
+    return Plan(rooms=rooms, footprint=(w, h), exterior_door=("foyer", "N"))
+
+
 TEMPLATES: list[Callable[[random.Random], Plan]] = [
     ranch_open_concept,
     colonial_compartmentalized,
+    split_bedroom_ranch,
+    l_shape_ranch,
+    narrow_townhouse,
 ]
 
 
