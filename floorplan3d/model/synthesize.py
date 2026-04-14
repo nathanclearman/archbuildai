@@ -546,21 +546,126 @@ def render(plan_dict: dict, cfg: SynthConfig):
         half = win["width"] * ppm / 2
         draw.line([(cx - half, cy), (cx + half, cy)], fill=(150, 185, 220), width=door_px)
 
-    # Room labels.
+    # Room labels. Each label is wrapped and sized to fit inside its room
+    # rectangle — the old single-line draw clipped multi-word labels
+    # (e.g. "Master Bedroom", "Walk In Closet") on narrow rooms, which
+    # taught the downstream VLM to emit truncated strings.
     if cfg.draw_labels:
-        try:
-            font = ImageFont.load_default()
-        except Exception:
-            font = None
         for r in plan_dict["rooms"]:
             xs2 = [p[0] for p in r["polygon"]]
             ys2 = [p[1] for p in r["polygon"]]
             cx = sum(xs2) / len(xs2)
             cy = sum(ys2) / len(ys2)
             label = r["label"].replace("_", " ").title()
-            draw.text(to_px((cx, cy)), label, fill=(60, 60, 60), font=font, anchor="mm")
+            room_w_px = (max(xs2) - min(xs2)) * ppm
+            room_h_px = (max(ys2) - min(ys2)) * ppm
+            _draw_label_fitted(
+                draw, to_px((cx, cy)), label,
+                room_w_px=room_w_px, room_h_px=room_h_px,
+            )
 
     return img
+
+
+# ---------- label fitting ----------
+
+_FONT_CANDIDATES = (
+    "DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "Arial.ttf",
+)
+_FONT_CACHE: dict[int, object] = {}
+
+
+def _get_font(size: int):
+    """Return a scalable font at the requested pixel size, cached."""
+    from PIL import ImageFont
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+    font = None
+    for name in _FONT_CANDIDATES:
+        try:
+            font = ImageFont.truetype(name, size)
+            break
+        except (OSError, IOError):
+            continue
+    if font is None:
+        # Last resort — PIL's bundled default. Size may be ignored on old
+        # Pillow, but labels still render without clipping on small rooms
+        # because the fitter will pick the layout that fits.
+        try:
+            font = ImageFont.load_default(size=size)
+        except TypeError:
+            font = ImageFont.load_default()
+    _FONT_CACHE[size] = font
+    return font
+
+
+def _wrap_words(words: list[str], n_lines: int) -> list[str]:
+    """Balanced greedy wrap of `words` into exactly `n_lines` lines."""
+    if n_lines <= 1 or len(words) <= 1:
+        return [" ".join(words)]
+    n_lines = min(n_lines, len(words))
+    lines = []
+    start = 0
+    remaining = len(words)
+    for i in range(n_lines):
+        count = max(1, round(remaining / (n_lines - i)))
+        lines.append(" ".join(words[start:start + count]))
+        start += count
+        remaining -= count
+    return lines
+
+
+def _measure(draw, font, text: str):
+    """Return (width, height, y_offset) for a single-line string."""
+    x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=font, anchor="lt")
+    return x1 - x0, y1 - y0, y0
+
+
+def _draw_label_fitted(draw, centroid_px, text: str,
+                       room_w_px: float, room_h_px: float,
+                       margin_px: int = 6) -> None:
+    """Draw `text` at `centroid_px` wrapped and shrunk to fit the room box."""
+    max_w = max(room_w_px - 2 * margin_px, 20)
+    max_h = max(room_h_px - 2 * margin_px, 12)
+    words = text.split()
+    line_gap = 2
+
+    # Try font sizes from large to small. For each size, try 1-, 2-, 3-line
+    # wraps and pick the first that fits horizontally and vertically.
+    for font_size in (18, 15, 13, 11, 9, 8, 7):
+        font = _get_font(font_size)
+        for n_lines in range(1, min(len(words), 3) + 1):
+            lines = _wrap_words(words, n_lines)
+            widths, heights = zip(*((_measure(draw, font, ln)[0],
+                                     _measure(draw, font, ln)[1]) for ln in lines))
+            line_h = max(heights)
+            total_w = max(widths)
+            total_h = line_h * len(lines) + line_gap * (len(lines) - 1)
+            if total_w <= max_w and total_h <= max_h:
+                cx, cy = centroid_px
+                top_y = cy - total_h / 2 + line_h / 2
+                for i, ln in enumerate(lines):
+                    draw.text((cx, top_y + i * (line_h + line_gap)), ln,
+                              fill=(60, 60, 60), font=font, anchor="mm")
+                return
+
+    # Nothing fit cleanly — draw the text at the smallest tried size. The
+    # label may still overflow the room on truly tiny rooms, but picking
+    # the smallest-size wrap keeps the tail characters visible instead of
+    # mid-word-clipped.
+    font = _get_font(7)
+    lines = _wrap_words(words, min(len(words), 3))
+    cx, cy = centroid_px
+    _, line_h, _ = _measure(draw, font, lines[0])
+    total_h = line_h * len(lines) + line_gap * (len(lines) - 1)
+    top_y = cy - total_h / 2 + line_h / 2
+    for i, ln in enumerate(lines):
+        draw.text((cx, top_y + i * (line_h + line_gap)), ln,
+                  fill=(60, 60, 60), font=font, anchor="mm")
 
 
 # ---------- public API ----------
