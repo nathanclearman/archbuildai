@@ -961,24 +961,119 @@ def render(plan_dict: dict, cfg: SynthConfig):
             return (1.0, 0.0)
         return ((ex - sx) / length, (ey - sy) / length)
 
+    def _pick_swing_side(door_pos_m, wall, rooms):
+        """Return a (dx, dy) unit vector perpendicular to the wall pointing
+        into the room the door swings into. Interior side when unambiguous,
+        smaller-room side for interior doors between two rooms, caller
+        fallback if the point sits outside every room."""
+        wdx, wdy = _wall_dir(wall)
+        perp_a = (-wdy, wdx)
+        perp_b = (wdy, -wdx)
+        px_m, py_m = door_pos_m
+        eps = 0.3
+
+        def _room_areas_at(pt):
+            x_, y_ = pt
+            out = []
+            for r in rooms:
+                xs_ = [p[0] for p in r["polygon"]]
+                ys_ = [p[1] for p in r["polygon"]]
+                if min(xs_) <= x_ <= max(xs_) and min(ys_) <= y_ <= max(ys_):
+                    out.append((max(xs_) - min(xs_)) * (max(ys_) - min(ys_)))
+            return out
+
+        a_areas = _room_areas_at((px_m + perp_a[0] * eps, py_m + perp_a[1] * eps))
+        b_areas = _room_areas_at((px_m + perp_b[0] * eps, py_m + perp_b[1] * eps))
+        if a_areas and not b_areas:
+            return perp_a
+        if b_areas and not a_areas:
+            return perp_b
+        if a_areas and b_areas:
+            # Both sides interior: door swings into the smaller room (the
+            # one that would be awkward to swing out of).
+            return perp_a if min(a_areas) <= min(b_areas) else perp_b
+        return perp_a
+
+    def _render_door_arc(door, wall):
+        """Draw the door as a quarter-arc + leaf line instead of a flat
+        gap bar. PIL screen-y increases downward, same as world-y, so
+        angles computed on world-space vectors map directly to the
+        draw.arc / atan2 convention."""
+        import math
+
+        wdx, wdy = _wall_dir(wall)
+        swing_x, swing_y = _pick_swing_side(door["position"], wall, plan_dict["rooms"])
+        width_m = door["width"]
+        half_m = width_m / 2
+        px_m, py_m = door["position"]
+
+        # Hinge end of the opening: alternate by wall_index for variety.
+        sign = 1 if (door["wall_index"] % 2) == 0 else -1
+        hinge_m = (px_m + wdx * half_m * sign, py_m + wdy * half_m * sign)
+        free_m = (px_m - wdx * half_m * sign, py_m - wdy * half_m * sign)
+        free_open_m = (hinge_m[0] + swing_x * width_m,
+                       hinge_m[1] + swing_y * width_m)
+        hinge_px = to_px(hinge_m)
+
+        r_px = width_m * ppm
+        start_ang = math.atan2(-wdy * sign, -wdx * sign)   # hinge -> closed free-end
+        end_ang = math.atan2(swing_y, swing_x)             # hinge -> open free-end
+
+        # Take the shortest 90-ish-degree path.
+        delta = end_ang - start_ang
+        while delta > math.pi:
+            delta -= 2 * math.pi
+        while delta < -math.pi:
+            delta += 2 * math.pi
+
+        # Sample the arc as a polyline (PIL's arc angle conventions are
+        # annoying to reason about; trig we already trust).
+        steps = 14
+        arc_pts = []
+        for i in range(steps + 1):
+            ang = start_ang + (i / steps) * delta
+            arc_pts.append((hinge_px[0] + r_px * math.cos(ang),
+                            hinge_px[1] + r_px * math.sin(ang)))
+        draw.line(arc_pts, fill=(55, 55, 55), width=1)
+        # Door leaf from the hinge to the opened free-end position.
+        draw.line([hinge_px, to_px(free_open_m)], fill=(55, 55, 55), width=2)
+
     walls = plan_dict["walls"]
     for d in plan_dict["doors"]:
         wall = walls[d["wall_index"]]
-        dx, dy = _wall_dir(wall)
+        wdx, wdy = _wall_dir(wall)
         cx, cy = to_px(d["position"])
         half = d["width"] * ppm / 2
-        draw.line([(cx - dx * half, cy - dy * half),
-                   (cx + dx * half, cy + dy * half)],
-                  fill=(230, 225, 215), width=door_px)
+        # Erase the wall at the door opening with a white gap; the arc +
+        # leaf are drawn on top.
+        draw.line([(cx - wdx * half, cy - wdy * half),
+                   (cx + wdx * half, cy + wdy * half)],
+                  fill=(255, 255, 255), width=door_px)
+        _render_door_arc(d, wall)
 
     for win in plan_dict["windows"]:
         wall = walls[win["wall_index"]]
-        dx, dy = _wall_dir(wall)
+        wdx, wdy = _wall_dir(wall)
+        perp_x, perp_y = -wdy, wdx
         cx, cy = to_px(win["position"])
         half = win["width"] * ppm / 2
-        draw.line([(cx - dx * half, cy - dy * half),
-                   (cx + dx * half, cy + dy * half)],
-                  fill=(150, 185, 220), width=door_px)
+        # Erase the wall at the window opening.
+        draw.line([(cx - wdx * half, cy - wdy * half),
+                   (cx + wdx * half, cy + wdy * half)],
+                  fill=(255, 255, 255), width=door_px)
+        # Two thin parallel lines flanking the wall axis — the classic
+        # floor-plan window glyph. Offset is about one wall-thickness.
+        offset = max(2.0, (wall_px - 1) / 2)
+        for s in (-1.0, 1.0):
+            ox = perp_x * offset * s
+            oy = perp_y * offset * s
+            draw.line([(cx - wdx * half + ox, cy - wdy * half + oy),
+                       (cx + wdx * half + ox, cy + wdy * half + oy)],
+                      fill=(55, 90, 140), width=1)
+        # Thin centerline between the two parallel lines for a sash look.
+        draw.line([(cx - wdx * half, cy - wdy * half),
+                   (cx + wdx * half, cy + wdy * half)],
+                  fill=(120, 160, 200), width=1)
 
     # Room labels. Each label is wrapped and sized to fit inside its room
     # rectangle — the old single-line draw clipped multi-word labels
