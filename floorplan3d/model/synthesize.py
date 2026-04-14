@@ -1135,295 +1135,296 @@ FIXTURE_LAYOUT: dict[str, list[tuple[str, str, float, float]]] = {
 }
 
 
+# Anchor placement table: each entry is (x_frac, y_frac, axis_align).
+#   x_frac/y_frac in [0, 1]: 0 = pinned to room min-edge, 1 = max-edge,
+#                            0.5 = centered.
+#   axis_align=True:  the fixture's `along_m` dimension stays on x;
+#                     used for corners and N/S wall centers.
+#   axis_align=False: the fixture rotates so `along_m` runs on y;
+#                     used for W/E wall centers (so a tub running
+#                     along an east wall is drawn standing up, not flat).
+_FIXTURE_ANCHORS: dict[str, tuple[float, float, bool]] = {
+    "NW": (0.0, 0.0, True),
+    "NE": (1.0, 0.0, True),
+    "SW": (0.0, 1.0, True),
+    "SE": (1.0, 1.0, True),
+    "N":  (0.5, 0.0, True),
+    "S":  (0.5, 1.0, True),
+    "W":  (0.0, 0.5, False),
+    "E":  (1.0, 0.5, False),
+}
+
+
 def _fixture_rect(anchor: str, ax: float, ay: float, rw: float, rh: float,
                   along_m: float, depth_m: float,
                   inset: float = 0.05) -> tuple[float, float, float, float] | None:
-    """Return (x, y, w, h) of a fixture's bounding rect given its anchor code
-    and the room's origin + dimensions. `along_m` x `depth_m` is axis-aligned
-    by default; wall anchors rotate to make `along_m` parallel to the wall.
-    Returns None if the fixture would not fit inside the room."""
-    if anchor == "NW":
-        fw, fh = along_m, depth_m
-        x = ax + inset
-        y = ay + inset
-    elif anchor == "NE":
-        fw, fh = along_m, depth_m
-        x = ax + rw - along_m - inset
-        y = ay + inset
-    elif anchor == "SW":
-        fw, fh = along_m, depth_m
-        x = ax + inset
-        y = ay + rh - depth_m - inset
-    elif anchor == "SE":
-        fw, fh = along_m, depth_m
-        x = ax + rw - along_m - inset
-        y = ay + rh - depth_m - inset
-    elif anchor == "N":
-        fw, fh = along_m, depth_m
-        x = ax + (rw - along_m) / 2
-        y = ay + inset
-    elif anchor == "S":
-        fw, fh = along_m, depth_m
-        x = ax + (rw - along_m) / 2
-        y = ay + rh - depth_m - inset
-    elif anchor == "W":
-        fw, fh = depth_m, along_m
-        x = ax + inset
-        y = ay + (rh - along_m) / 2
-    elif anchor == "E":
-        fw, fh = depth_m, along_m
-        x = ax + rw - depth_m - inset
-        y = ay + (rh - along_m) / 2
-    else:
+    """Return (x, y, w, h) of a fixture's bounding rect given its anchor and
+    the room origin + dimensions. Returns None if the fixture would not fit."""
+    entry = _FIXTURE_ANCHORS.get(anchor)
+    if entry is None:
         return None
-    # Drop the fixture if the room is too small to hold it.
-    if fw > rw - 2 * inset or fh > rh - 2 * inset:
+    x_frac, y_frac, axis_align = entry
+    fw_, fh_ = (along_m, depth_m) if axis_align else (depth_m, along_m)
+    if fw_ > rw - 2 * inset or fh_ > rh - 2 * inset:
         return None
-    return (x, y, fw, fh)
+    return (
+        ax + inset + x_frac * (rw - fw_ - 2 * inset),
+        ay + inset + y_frac * (rh - fh_ - 2 * inset),
+        fw_,
+        fh_,
+    )
 
 
-def _draw_fixture_glyph(draw, kind: str, rect_px: tuple[float, float, float, float],
-                        ink: tuple, fill: tuple) -> None:
-    """Draw a single fixture glyph inside its rect. These are intentionally
-    schematic — thin lines on the room fill — matching how fixtures appear
-    on real MLS / architect floor plans."""
-    x, y, w, h = rect_px
+# Fixture glyph drawers. Each takes (draw, x, y, w, h, ink, fill) and paints
+# the fixture inside its bounding rect. Replaces the old 6-branch dispatcher
+# in _draw_fixture_glyph.
+def _glyph_toilet(draw, x, y, w, h, ink, fill):
     x1, y1 = x + w, y + h
-    lw = 1
-
-    if kind == "toilet":
-        # Tank along the shorter top edge, seat (oval) below.
-        tank_h = h * 0.28
-        draw.rectangle([x, y, x1, y + tank_h], outline=ink, fill=fill, width=lw)
-        seat_pad = w * 0.08
-        draw.ellipse([x + seat_pad, y + tank_h, x1 - seat_pad, y1],
-                     outline=ink, fill=fill, width=lw)
-    elif kind == "sink":
-        # Outer rect + inner oval basin.
-        draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=lw)
-        pad_w, pad_h = w * 0.15, h * 0.18
-        draw.ellipse([x + pad_w, y + pad_h, x1 - pad_w, y1 - pad_h],
-                     outline=ink, width=lw)
-    elif kind == "tub":
-        # Outer rect, rounded inner rect for the basin.
-        draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=lw)
-        pad = min(w, h) * 0.15
-        try:
-            draw.rounded_rectangle([x + pad, y + pad, x1 - pad, y1 - pad],
-                                   radius=min(w, h) * 0.2, outline=ink, width=lw)
-        except AttributeError:
-            # Pillow < 8.2
-            draw.rectangle([x + pad, y + pad, x1 - pad, y1 - pad],
-                           outline=ink, width=lw)
-    elif kind == "stove":
-        # Square with four circular burners.
-        draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=lw)
-        r = min(w, h) * 0.15
-        for cx_frac in (0.3, 0.7):
-            for cy_frac in (0.3, 0.7):
-                cx = x + w * cx_frac
-                cy = y + h * cy_frac
-                draw.ellipse([cx - r, cy - r, cx + r, cy + r],
-                             outline=ink, width=lw)
-    elif kind == "fridge":
-        # Rectangle divided by a horizontal line (freezer / fridge split).
-        draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=lw)
-        split_y = y + h * 0.33
-        draw.line([(x, split_y), (x1, split_y)], fill=ink, width=lw)
-    elif kind == "kitchen_sink":
-        # Rectangle with two basin rectangles.
-        draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=lw)
-        pad = min(w, h) * 0.12
-        mid = x + w / 2
-        draw.rectangle([x + pad, y + pad, mid - pad / 2, y1 - pad],
-                       outline=ink, width=lw)
-        draw.rectangle([mid + pad / 2, y + pad, x1 - pad, y1 - pad],
-                       outline=ink, width=lw)
+    tank_h = h * 0.28
+    draw.rectangle([x, y, x1, y + tank_h], outline=ink, fill=fill, width=1)
+    seat_pad = w * 0.08
+    draw.ellipse([x + seat_pad, y + tank_h, x1 - seat_pad, y1],
+                 outline=ink, fill=fill, width=1)
 
 
-def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None):
-    from PIL import Image, ImageDraw, ImageFont
-    size = cfg.image_size
-    ppm = cfg.pixels_per_meter
-    style = style or DEFAULT_STYLE
-    palette = style["palette"]
-    wall_color = style["wall"]
-    bg_color = style["bg"]
-    arc_color = style["arc"]
-    window_a = style["window_a"]
-    window_b = style["window_b"]
-    text_color = style["text"]
-    wall_scale = style.get("wall_scale", 1.0)
+def _glyph_sink(draw, x, y, w, h, ink, fill):
+    x1, y1 = x + w, y + h
+    draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=1)
+    pad_w, pad_h = w * 0.15, h * 0.18
+    draw.ellipse([x + pad_w, y + pad_h, x1 - pad_w, y1 - pad_h],
+                 outline=ink, width=1)
 
-    # Compute footprint from rooms so centering is accurate.
+
+def _glyph_tub(draw, x, y, w, h, ink, fill):
+    x1, y1 = x + w, y + h
+    draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=1)
+    pad = min(w, h) * 0.15
+    try:
+        draw.rounded_rectangle([x + pad, y + pad, x1 - pad, y1 - pad],
+                               radius=min(w, h) * 0.2, outline=ink, width=1)
+    except AttributeError:
+        # Pillow < 8.2: no rounded_rectangle.
+        draw.rectangle([x + pad, y + pad, x1 - pad, y1 - pad],
+                       outline=ink, width=1)
+
+
+def _glyph_stove(draw, x, y, w, h, ink, fill):
+    x1, y1 = x + w, y + h
+    draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=1)
+    r = min(w, h) * 0.15
+    for cx_frac in (0.3, 0.7):
+        for cy_frac in (0.3, 0.7):
+            cx = x + w * cx_frac
+            cy = y + h * cy_frac
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                         outline=ink, width=1)
+
+
+def _glyph_fridge(draw, x, y, w, h, ink, fill):
+    x1, y1 = x + w, y + h
+    draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=1)
+    split_y = y + h * 0.33
+    draw.line([(x, split_y), (x1, split_y)], fill=ink, width=1)
+
+
+def _glyph_kitchen_sink(draw, x, y, w, h, ink, fill):
+    x1, y1 = x + w, y + h
+    draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=1)
+    pad = min(w, h) * 0.12
+    mid = x + w / 2
+    draw.rectangle([x + pad, y + pad, mid - pad / 2, y1 - pad],
+                   outline=ink, width=1)
+    draw.rectangle([mid + pad / 2, y + pad, x1 - pad, y1 - pad],
+                   outline=ink, width=1)
+
+
+FIXTURE_DRAWERS: dict[str, Callable] = {
+    "toilet": _glyph_toilet,
+    "sink": _glyph_sink,
+    "tub": _glyph_tub,
+    "stove": _glyph_stove,
+    "fridge": _glyph_fridge,
+    "kitchen_sink": _glyph_kitchen_sink,
+}
+
+
+def _compute_extents(plan_dict: dict) -> tuple[float, float]:
+    """Footprint width and height in meters, derived from room polygon
+    extremes. Centralized so render() and other consumers agree."""
     xs = [p[0] for r in plan_dict["rooms"] for p in r["polygon"]]
     ys = [p[1] for r in plan_dict["rooms"] for p in r["polygon"]]
-    fw = max(xs) - min(xs)
-    fh = max(ys) - min(ys)
-    off_x = (size - fw * ppm) / 2
-    off_y = (size - fh * ppm) / 2
+    return max(xs) - min(xs), max(ys) - min(ys)
 
-    img = Image.new("RGB", (size, size), bg_color)
-    draw = ImageDraw.Draw(img)
 
+def _to_px_factory(off_x: float, off_y: float, ppm: float):
+    """Return a meters-to-pixel converter closing over a centering offset.
+
+    Encapsulating the closure lets the per-pass renderers stay pure
+    functions of (draw, plan_dict, style, to_px) instead of needing to
+    know about cfg or image dims."""
     def to_px(p):
         return (off_x + p[0] * ppm, off_y + p[1] * ppm)
+    return to_px
 
-    # Fill rooms using the current style's palette.
+
+def _render_rooms(draw, plan_dict, palette, to_px) -> None:
     for r in plan_dict["rooms"]:
         color = palette.get(r["label"], DEFAULT_ROOM_COLOR)
         draw.polygon([to_px(p) for p in r["polygon"]], fill=color)
 
-    # Fixtures (toilet, sink, tub, stove, fridge, kitchen sink) drawn on top
-    # of the room fill but UNDER walls + door arcs + labels. Opt-out via
-    # cfg.draw_fixtures=False; the cfg flag used to exist and read nothing.
-    if cfg.draw_fixtures:
-        fixture_ink = style.get("fixture_ink", wall_color)
-        for r in plan_dict["rooms"]:
-            spec = FIXTURE_LAYOUT.get(r["label"])
-            if not spec:
+
+def _render_fixtures(draw, plan_dict, palette, ink, to_px) -> None:
+    for r in plan_dict["rooms"]:
+        spec = FIXTURE_LAYOUT.get(r["label"])
+        if not spec:
+            continue
+        xs = [p[0] for p in r["polygon"]]
+        ys = [p[1] for p in r["polygon"]]
+        rx, ry = min(xs), min(ys)
+        rw, rh = max(xs) - rx, max(ys) - ry
+        fill = palette.get(r["label"], DEFAULT_ROOM_COLOR)
+        for kind, anchor, along_m, depth_m in spec:
+            rect_m = _fixture_rect(anchor, rx, ry, rw, rh, along_m, depth_m)
+            if rect_m is None:
                 continue
-            xs2 = [p[0] for p in r["polygon"]]
-            ys2 = [p[1] for p in r["polygon"]]
-            rx, ry = min(xs2), min(ys2)
-            rw, rh = max(xs2) - rx, max(ys2) - ry
-            room_fill = palette.get(r["label"], DEFAULT_ROOM_COLOR)
-            for kind, anchor, along_m, depth_m in spec:
-                rect_m = _fixture_rect(anchor, rx, ry, rw, rh, along_m, depth_m)
-                if rect_m is None:
-                    continue
-                fx, fy, fw_, fh_ = rect_m
-                rect_px = (
-                    to_px((fx, fy))[0], to_px((fx, fy))[1],
-                    to_px((fx + fw_, fy + fh_))[0], to_px((fx + fw_, fy + fh_))[1],
-                )
-                rect_px_xywh = (
-                    rect_px[0], rect_px[1],
-                    rect_px[2] - rect_px[0], rect_px[3] - rect_px[1],
-                )
-                _draw_fixture_glyph(draw, kind, rect_px_xywh,
-                                    ink=fixture_ink, fill=room_fill)
+            drawer = FIXTURE_DRAWERS.get(kind)
+            if drawer is None:
+                continue
+            fx, fy, fw_, fh_ = rect_m
+            tl = to_px((fx, fy))
+            br = to_px((fx + fw_, fy + fh_))
+            drawer(draw, tl[0], tl[1], br[0] - tl[0], br[1] - tl[1], ink, fill)
 
-    # Draw walls on top, using the style's wall color + thickness scale.
-    wall_px = max(3, int(cfg.wall_thickness_m * ppm * 0.9 * wall_scale))
-    for w in plan_dict["walls"]:
-        draw.line([to_px(w["start"]), to_px(w["end"])], fill=wall_color, width=wall_px)
 
-    # Doors and windows: gap lines rendered ALONG their wall's direction.
-    # The old code always drew a horizontal gap, so openings on vertical
-    # walls showed as bars crossing the wall instead of gaps in it.
-    door_px = max(4, wall_px + 1)
+def _render_walls(draw, walls, color, width_px, to_px) -> None:
+    for w in walls:
+        draw.line([to_px(w["start"]), to_px(w["end"])], fill=color, width=width_px)
 
-    def _wall_dir(wall):
-        sx, sy = wall["start"]
-        ex, ey = wall["end"]
-        length = ((ex - sx) ** 2 + (ey - sy) ** 2) ** 0.5
-        if length < 1e-6:
-            return (1.0, 0.0)
-        return ((ex - sx) / length, (ey - sy) / length)
 
-    def _render_door_arc(door, wall):
-        """Draw the door as a quarter-arc + leaf line. Swing direction is
-        read from `door["swing_into"]` (set at plan_to_schema time); the
-        old render-time inference scanned every room's polygon per door."""
-        wdx, wdy = _wall_dir(wall)
-        swing = door.get("swing_into")
-        if swing is None:
-            # Augmented-but-pre-swing legacy data path; fall back to a
-            # consistent perpendicular so rendering still works.
-            swing_x, swing_y = -wdy, wdx
-        else:
-            swing_x, swing_y = swing[0], swing[1]
-        width_m = door["width"]
-        half_m = width_m / 2
-        px_m, py_m = door["position"]
+def _render_door(draw, door, walls, *, bg, arc_color, gap_px, ppm, to_px) -> None:
+    """Erase the wall at the opening then draw the swing arc + door leaf."""
+    wall = walls[door["wall_index"]]
+    wdx, wdy = _wall_unit_vector(wall)
+    cx, cy = to_px(door["position"])
+    half_px = door["width"] * ppm / 2
+    # Erase the wall in the bg color so the gap reads cleanly even on
+    # styles with non-white backgrounds (e.g. blueprint).
+    draw.line([(cx - wdx * half_px, cy - wdy * half_px),
+               (cx + wdx * half_px, cy + wdy * half_px)],
+              fill=bg, width=gap_px)
 
-        # Hinge end of the opening: alternate by wall_index for variety.
-        sign = 1 if (door["wall_index"] % 2) == 0 else -1
-        hinge_m = (px_m + wdx * half_m * sign, py_m + wdy * half_m * sign)
-        free_m = (px_m - wdx * half_m * sign, py_m - wdy * half_m * sign)
-        free_open_m = (hinge_m[0] + swing_x * width_m,
-                       hinge_m[1] + swing_y * width_m)
-        hinge_px = to_px(hinge_m)
+    swing = door.get("swing_into") or (-wdy, wdx)
+    swing_x, swing_y = swing[0], swing[1]
+    width_m = door["width"]
+    half_m = width_m / 2
+    sign = 1 if (door["wall_index"] % 2) == 0 else -1
+    px_m, py_m = door["position"]
+    hinge_m = (px_m + wdx * half_m * sign, py_m + wdy * half_m * sign)
+    free_open_m = (hinge_m[0] + swing_x * width_m,
+                   hinge_m[1] + swing_y * width_m)
+    hinge_px = to_px(hinge_m)
+    r_px = width_m * ppm
 
-        r_px = width_m * ppm
-        start_ang = math.atan2(-wdy * sign, -wdx * sign)   # hinge -> closed free-end
-        end_ang = math.atan2(swing_y, swing_x)             # hinge -> open free-end
+    # Trig directly: PIL angle conventions for draw.arc are awkward, but
+    # angles in (world == screen, since y increases downward in both)
+    # let us sample a polyline cheaply.
+    start_ang = math.atan2(-wdy * sign, -wdx * sign)
+    end_ang = math.atan2(swing_y, swing_x)
+    delta = end_ang - start_ang
+    while delta > math.pi:
+        delta -= 2 * math.pi
+    while delta < -math.pi:
+        delta += 2 * math.pi
 
-        # Take the shortest 90-ish-degree path.
-        delta = end_ang - start_ang
-        while delta > math.pi:
-            delta -= 2 * math.pi
-        while delta < -math.pi:
-            delta += 2 * math.pi
+    arc_pts = [
+        (hinge_px[0] + r_px * math.cos(start_ang + (i / ARC_POLYLINE_STEPS) * delta),
+         hinge_px[1] + r_px * math.sin(start_ang + (i / ARC_POLYLINE_STEPS) * delta))
+        for i in range(ARC_POLYLINE_STEPS + 1)
+    ]
+    draw.line(arc_pts, fill=arc_color, width=1)
+    draw.line([hinge_px, to_px(free_open_m)], fill=arc_color, width=2)
 
-        # Sample the arc as a polyline (PIL's arc angle conventions are
-        # annoying to reason about; trig we already trust).
-        steps = 14
-        arc_pts = []
-        for i in range(steps + 1):
-            ang = start_ang + (i / steps) * delta
-            arc_pts.append((hinge_px[0] + r_px * math.cos(ang),
-                            hinge_px[1] + r_px * math.sin(ang)))
-        draw.line(arc_pts, fill=arc_color, width=1)
-        # Door leaf from the hinge to the opened free-end position.
-        draw.line([hinge_px, to_px(free_open_m)], fill=arc_color, width=2)
 
+def _render_window(draw, window, walls, *, bg, color_a, color_b,
+                   gap_px, wall_px, ppm, to_px) -> None:
+    wall = walls[window["wall_index"]]
+    wdx, wdy = _wall_unit_vector(wall)
+    perp_x, perp_y = -wdy, wdx
+    cx, cy = to_px(window["position"])
+    half_px = window["width"] * ppm / 2
+
+    # Endpoint pair shared by the gap-erase + the centerline + the
+    # parallels — compute once instead of recomputing 5 times like
+    # the old version did.
+    end_a = (cx - wdx * half_px, cy - wdy * half_px)
+    end_b = (cx + wdx * half_px, cy + wdy * half_px)
+
+    draw.line([end_a, end_b], fill=bg, width=gap_px)
+
+    offset = max(2.0, (wall_px - 1) / 2)
+    for s in (-1.0, 1.0):
+        ox, oy = perp_x * offset * s, perp_y * offset * s
+        draw.line([(end_a[0] + ox, end_a[1] + oy),
+                   (end_b[0] + ox, end_b[1] + oy)],
+                  fill=color_a, width=1)
+    draw.line([end_a, end_b], fill=color_b, width=1)
+
+
+def _render_labels(draw, plan_dict, text_color, ppm, to_px) -> None:
+    for r in plan_dict["rooms"]:
+        xs = [p[0] for p in r["polygon"]]
+        ys = [p[1] for p in r["polygon"]]
+        cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
+        label = r["label"].replace("_", " ").title()
+        _draw_label_fitted(
+            draw, to_px((cx, cy)), label,
+            room_w_px=(max(xs) - min(xs)) * ppm,
+            room_h_px=(max(ys) - min(ys)) * ppm,
+            fill=text_color,
+        )
+
+
+def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None):
+    """Render the floor plan to a PIL Image. Pure orchestration —
+    each layer (rooms, fixtures, walls, openings, labels) is delegated
+    to a `_render_*` helper that takes only what it needs."""
+    style = style or DEFAULT_STYLE
+    size = cfg.image_size
+    ppm = cfg.pixels_per_meter
+
+    fw, fh = _compute_extents(plan_dict)
+    off_x = (size - fw * ppm) / 2
+    off_y = (size - fh * ppm) / 2
+    to_px = _to_px_factory(off_x, off_y, ppm)
+
+    img = Image.new("RGB", (size, size), style["bg"])
+    draw = ImageDraw.Draw(img)
     walls = plan_dict["walls"]
+
+    _render_rooms(draw, plan_dict, style["palette"], to_px)
+
+    if cfg.draw_fixtures:
+        _render_fixtures(draw, plan_dict, style["palette"],
+                         style.get("fixture_ink", style["wall"]), to_px)
+
+    wall_px = max(3, int(cfg.wall_thickness_m * ppm * 0.9 * style.get("wall_scale", 1.0)))
+    gap_px = max(4, wall_px + DOOR_GAP_PADDING_PX)
+
+    _render_walls(draw, walls, style["wall"], wall_px, to_px)
+
     for d in plan_dict["doors"]:
-        wall = walls[d["wall_index"]]
-        wdx, wdy = _wall_dir(wall)
-        cx, cy = to_px(d["position"])
-        half = d["width"] * ppm / 2
-        # Erase the wall at the door opening with the BG color so the
-        # wall disappears under styles with non-white backgrounds too.
-        draw.line([(cx - wdx * half, cy - wdy * half),
-                   (cx + wdx * half, cy + wdy * half)],
-                  fill=bg_color, width=door_px)
-        _render_door_arc(d, wall)
+        _render_door(draw, d, walls,
+                     bg=style["bg"], arc_color=style["arc"],
+                     gap_px=gap_px, ppm=ppm, to_px=to_px)
 
-    for win in plan_dict["windows"]:
-        wall = walls[win["wall_index"]]
-        wdx, wdy = _wall_dir(wall)
-        perp_x, perp_y = -wdy, wdx
-        cx, cy = to_px(win["position"])
-        half = win["width"] * ppm / 2
-        # Erase the wall at the window opening.
-        draw.line([(cx - wdx * half, cy - wdy * half),
-                   (cx + wdx * half, cy + wdy * half)],
-                  fill=bg_color, width=door_px)
-        # Two thin parallel lines flanking the wall axis — the classic
-        # floor-plan window glyph. Offset is about one wall-thickness.
-        offset = max(2.0, (wall_px - 1) / 2)
-        for s in (-1.0, 1.0):
-            ox = perp_x * offset * s
-            oy = perp_y * offset * s
-            draw.line([(cx - wdx * half + ox, cy - wdy * half + oy),
-                       (cx + wdx * half + ox, cy + wdy * half + oy)],
-                      fill=window_a, width=1)
-        # Thin centerline between the two parallel lines for a sash look.
-        draw.line([(cx - wdx * half, cy - wdy * half),
-                   (cx + wdx * half, cy + wdy * half)],
-                  fill=window_b, width=1)
+    for w in plan_dict["windows"]:
+        _render_window(draw, w, walls,
+                       bg=style["bg"], color_a=style["window_a"],
+                       color_b=style["window_b"],
+                       gap_px=gap_px, wall_px=wall_px, ppm=ppm, to_px=to_px)
 
-    # Room labels. Each label is wrapped and sized to fit inside its room
-    # rectangle — the old single-line draw clipped multi-word labels
-    # (e.g. "Master Bedroom", "Walk In Closet") on narrow rooms, which
-    # taught the downstream VLM to emit truncated strings.
     if cfg.draw_labels:
-        for r in plan_dict["rooms"]:
-            xs2 = [p[0] for p in r["polygon"]]
-            ys2 = [p[1] for p in r["polygon"]]
-            cx = sum(xs2) / len(xs2)
-            cy = sum(ys2) / len(ys2)
-            label = r["label"].replace("_", " ").title()
-            room_w_px = (max(xs2) - min(xs2)) * ppm
-            room_h_px = (max(ys2) - min(ys2)) * ppm
-            _draw_label_fitted(
-                draw, to_px((cx, cy)), label,
-                room_w_px=room_w_px, room_h_px=room_h_px,
-                fill=text_color,
-            )
+        _render_labels(draw, plan_dict, style["text"], ppm, to_px)
 
     return img
 
