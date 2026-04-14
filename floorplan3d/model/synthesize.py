@@ -19,12 +19,31 @@ conforms to schema.py. No ML dependencies — pure numpy + Pillow.
 from __future__ import annotations
 
 import argparse
+import colorsys
+import math
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from PIL import Image, ImageDraw, ImageFont
+
 from schema import FloorPlan, serialize  # type: ignore
+
+
+# Tunables that used to live as scattered magic numbers in render() and the
+# wall builder. Promoting them to named constants both documents the value
+# and makes it discoverable when tuning.
+DEFAULT_ROOM_COLOR: tuple[int, int, int] = (245, 245, 245)
+WALL_DEDUP_EPS_M: float = 0.05      # collapse sub-walls shorter than this
+WALL_COORD_PRECISION: int = 3
+ARC_POLYLINE_STEPS: int = 14        # quarter-arc rendered as N+1 points
+SWING_PROBE_M: float = 0.30         # offset used to detect "interior side"
+DOOR_GAP_PADDING_PX: int = 1        # extra px on the door gap vs wall_px
+LABEL_LINE_GAP_PX: int = 2
+LABEL_FONT_LADDER: tuple[int, ...] = (18, 15, 13, 11, 9, 8, 7)
+LABEL_MIN_FONT_PX: int = 7
+LABEL_MARGIN_PX: int = 6
 
 
 # US room vocabulary used throughout the project. Keep this list in sync
@@ -722,21 +741,27 @@ def _build_walls(plan: Plan, thickness: float = 0.15, coord_precision: int = 3) 
         return [(a, b) for a, b in merged]
 
     def _subdivide(s: float, e: float, splits: list[float],
-                   eps: float = 0.05) -> list[float]:
-        """Return a monotonically-increasing list of cut points from s to e
-        with no two adjacent values within `eps`. The eps filter drops
-        sub-segments shorter than 5 cm — narrower than any wall thickness
-        and always an artefact of near-coincident rectangle corners
-        rather than a real wall."""
+                   eps: float = WALL_DEDUP_EPS_M) -> list[float]:
+        """Return cut points from `s` to `e` with no two values within `eps`.
+
+        The eps filter drops sub-segments shorter than 5 cm — narrower
+        than any wall thickness and always an artefact of near-coincident
+        rectangle corners rather than a real wall.
+
+        Endpoint handling: `raw` starts as `[s, ...inner_splits..., e]`.
+        After the merge loop, `out[-1]` may be a split that absorbed `e`
+        (if the last inner split was within eps of `e`). In that case we
+        snap the final element back to `e` so the wall always terminates
+        exactly at the union endpoint and downstream code can rely on
+        `walls[i]["end"]` matching the parent rect's corner."""
         raw = [s] + [p for p in splits if s + eps < p < e - eps] + [e]
         raw.sort()
         out = [raw[0]]
         for p in raw[1:]:
             if p - out[-1] > eps:
                 out.append(p)
-        if out[-1] < e - eps / 2:
-            out.append(e)
-        elif out[-1] != e:
+        # Always snap the last point exactly to `e`.
+        if out[-1] != e:
             out[-1] = e
         return out
 
@@ -927,7 +952,6 @@ def _recolor(base: dict, hue_shift: int, sat_mul: float = 1.0,
     into a different hue family, which lets us reuse ROOM_COLORS for
     warm-tone, grayscale, and blueprint variants without hand-tuning
     every label."""
-    import colorsys
     out = {}
     for label, (r, g, b) in base.items():
         h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
@@ -948,7 +972,9 @@ def _mono(value: int) -> dict:
 
 STYLES: dict = {
     "mls_pastel": {
-        "palette": ROOM_COLORS,
+        # dict() so callers mutating STYLES["mls_pastel"]["palette"] do not
+        # also mutate ROOM_COLORS.
+        "palette": dict(ROOM_COLORS),
         "wall": (25, 25, 25),
         "wall_scale": 1.0,
         "bg": (255, 255, 255),
@@ -1180,7 +1206,7 @@ def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None):
 
     # Fill rooms using the current style's palette.
     for r in plan_dict["rooms"]:
-        color = palette.get(r["label"], palette.get("great_room", (245, 245, 245)))
+        color = palette.get(r["label"], DEFAULT_ROOM_COLOR)
         draw.polygon([to_px(p) for p in r["polygon"]], fill=color)
 
     # Fixtures (toilet, sink, tub, stove, fridge, kitchen sink) drawn on top
@@ -1196,7 +1222,7 @@ def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None):
             ys2 = [p[1] for p in r["polygon"]]
             rx, ry = min(xs2), min(ys2)
             rw, rh = max(xs2) - rx, max(ys2) - ry
-            room_fill = palette.get(r["label"], palette.get("great_room", (245, 245, 245)))
+            room_fill = palette.get(r["label"], DEFAULT_ROOM_COLOR)
             for kind, anchor, along_m, depth_m in spec:
                 rect_m = _fixture_rect(anchor, rx, ry, rw, rh, along_m, depth_m)
                 if rect_m is None:
@@ -1469,38 +1495,33 @@ def _draw_label_fitted(draw, centroid_px, text: str,
 # ---------- public API ----------
 
 def _apply_augmentation(plan_dict: dict, rot_k: int, flip_x: bool) -> dict:
-    """Rotate (rot_k * 90 deg CCW) and optionally horizontally flip the
-    plan, remapping every coordinate so the image and JSON stay in sync.
+    """Rotate by `rot_k * 90` degrees and optionally horizontally mirror
+    the plan, remapping every coordinate so the image and the JSON stay
+    in lock-step.
 
-    This runs AFTER plan_to_schema and BEFORE render(), so the image and
-    the JSON target string always describe the same plan in the same
-    orientation. Augmenting at this stage means each of the 5 templates
-    can appear in 8 distinct orientations (4 rotations x 2 flips),
-    forcing the VLM to learn orientation-invariant features rather than
-    memorising "garage is always west"."""
-    fw = max(p[0] for r in plan_dict["rooms"] for p in r["polygon"])
-    fh = max(p[1] for r in plan_dict["rooms"] for p in r["polygon"])
+    Coordinate convention: world y increases southward, same as PIL's
+    screen-y. The rotation `(x, y) -> (y, w - x)` is mathematically a
+    clockwise quarter-turn but renders as a *counter-clockwise* rotation
+    in screen space (because the y axis is flipped relative to standard
+    math). We keep the screen-CCW visual semantics — that's what callers
+    care about — and document the math here so future readers don't
+    chase the sign discrepancy.
 
-    def _tx(x: float, y: float) -> tuple[float, float]:
-        # rotate CCW by rot_k * 90 deg around the origin, then flip x.
-        for _ in range(rot_k % 4):
-            x, y = y, fw - x
-            fw_local = fh  # bookkeeping only
-            # swap fw/fh for subsequent iterations
-            fh_local = fw
-            fw, fh = fw_local, fh_local
-        if flip_x:
-            x = fw - x
-        return x, y
+    Areas are preserved by rotation + reflection, so we copy them
+    through unchanged. Rounding is intentionally NOT applied here:
+    `schema.serialize` is the single canonical source of precision and
+    rounding twice (here + there) creates two places to drift from."""
+    rot = rot_k % 4
+    if rot == 0 and not flip_x:
+        # Caller is responsible for short-circuiting; assert as a guard.
+        return plan_dict
 
-    # The loop above mutates fw/fh per iteration; compute the final
-    # footprint once more from the rotated corners.
-    # Simpler: redo via explicit formulas.
-    def _transform_point(x: float, y: float) -> tuple[float, float]:
-        # Compose: rotate_k then flip_x around the CURRENT footprint.
-        rot = rot_k % 4
+    w0 = max(p[0] for r in plan_dict["rooms"] for p in r["polygon"])
+    h0 = max(p[1] for r in plan_dict["rooms"] for p in r["polygon"])
+
+    def transform(x: float, y: float) -> tuple[float, float]:
         bx, by = x, y
-        w, h = fw_orig, fh_orig
+        w, h = w0, h0
         for _ in range(rot):
             bx, by = by, w - bx
             w, h = h, w
@@ -1508,55 +1529,43 @@ def _apply_augmentation(plan_dict: dict, rot_k: int, flip_x: bool) -> dict:
             bx = w - bx
         return bx, by
 
-    fw_orig, fh_orig = fw, fh
-
-    # Final footprint after rotation (flip doesn't change dims)
-    if rot_k % 2 == 1:
-        new_fw, new_fh = fh_orig, fw_orig
-    else:
-        new_fw, new_fh = fw_orig, fh_orig
-
-    out = {"scale": dict(plan_dict.get("scale", {"pixels_per_meter": 40}))}
-
-    out["walls"] = []
-    for w_ in plan_dict["walls"]:
-        s = _transform_point(*w_["start"])
-        e = _transform_point(*w_["end"])
-        out["walls"].append({
-            "start": [round(s[0], 3), round(s[1], 3)],
-            "end": [round(e[0], 3), round(e[1], 3)],
-            "thickness": w_.get("thickness", 0.15),
-        })
-
-    out["doors"] = []
-    for d in plan_dict["doors"]:
-        px, py = _transform_point(*d["position"])
-        out["doors"].append({
-            "position": [round(px, 2), round(py, 2)],
-            "width": d["width"],
-            "type": d.get("type", "hinged"),
-            "wall_index": d["wall_index"],
-        })
-
-    out["windows"] = []
-    for wn in plan_dict["windows"]:
-        px, py = _transform_point(*wn["position"])
-        out["windows"].append({
-            "position": [round(px, 2), round(py, 2)],
-            "width": wn["width"],
-            "wall_index": wn["wall_index"],
-        })
-
-    out["rooms"] = []
-    for r in plan_dict["rooms"]:
-        poly = [_transform_point(*p) for p in r["polygon"]]
-        out["rooms"].append({
-            "label": r["label"],
-            "polygon": [[round(x, 3), round(y, 3)] for x, y in poly],
-            "area": r.get("area", 0.0),
-        })
-
-    return out
+    return {
+        "scale": dict(plan_dict.get("scale", {"pixels_per_meter": 40})),
+        "walls": [
+            {
+                "start": list(transform(*w_["start"])),
+                "end": list(transform(*w_["end"])),
+                "thickness": w_.get("thickness", 0.15),
+            }
+            for w_ in plan_dict["walls"]
+        ],
+        "doors": [
+            {
+                "position": list(transform(*d["position"])),
+                "width": d["width"],
+                "type": d.get("type", "hinged"),
+                "wall_index": d["wall_index"],
+                **({"swing_into": d["swing_into"]} if "swing_into" in d else {}),
+            }
+            for d in plan_dict["doors"]
+        ],
+        "windows": [
+            {
+                "position": list(transform(*wn["position"])),
+                "width": wn["width"],
+                "wall_index": wn["wall_index"],
+            }
+            for wn in plan_dict["windows"]
+        ],
+        "rooms": [
+            {
+                "label": r["label"],
+                "polygon": [list(transform(*p)) for p in r["polygon"]],
+                "area": r.get("area", 0.0),
+            }
+            for r in plan_dict["rooms"]
+        ],
+    }
 
 
 def generate_one(seed: int, cfg: SynthConfig | None = None,
