@@ -227,7 +227,7 @@ def colonial_compartmentalized(rng: random.Random) -> Plan:
                                        family_w, middle_h),
                       doors=[("living_room", 0.5, 1.2), ("hallway", 0.5, 1.0)]))
 
-    # --- back band: bedroom wing (untouched — bug #3 tracked separately) ---
+    # --- back band: master suite | hallway | bath over bedroom | bed2 ---
     y0 = front_h + middle_h
     back_h = h - y0
     mbr_w = rng.uniform(4.2, 5.0)
@@ -238,10 +238,23 @@ def colonial_compartmentalized(rng: random.Random) -> Plan:
         hall_w = 1.2
         bed2_w = w - mbr_w - bath_w - hall_w
 
-    rooms.append(Room("master_bedroom", (0, y0, mbr_w, back_h),
-                      doors=[("en_suite", 0.8, 0.8), ("hallway", 0.95, 0.9)]))
-    rooms.append(Room("en_suite", (mbr_w - rng.uniform(1.8, 2.2), y0 + back_h - rng.uniform(2.0, 2.4),
-                                    rng.uniform(1.8, 2.2), rng.uniform(2.0, 2.4))))
+    # Master column tiles cleanly: master_bedroom on top, en-suite and
+    # walk-in closet share the bottom sub-row. The old code planted an
+    # en_suite rectangle inside the master_bedroom rectangle — both
+    # polygons then claimed the same floor area, teaching the model
+    # that overlapping labels are legal.
+    ens_w = rng.uniform(1.8, 2.2)
+    ens_h = min(rng.uniform(2.0, 2.4), back_h * 0.55)
+    mbr_h = back_h - ens_h
+    wic_w = mbr_w - ens_w
+
+    rooms.append(Room("master_bedroom", (0, y0, mbr_w, mbr_h),
+                      doors=[("en_suite", 0.3, 0.8),
+                             ("walk_in_closet", 0.7, 0.7),
+                             ("hallway", 0.95, 0.9)]))
+    rooms.append(Room("en_suite", (0, y0 + mbr_h, ens_w, ens_h)))
+    rooms.append(Room("walk_in_closet", (ens_w, y0 + mbr_h, wic_w, ens_h)))
+
     rooms.append(Room("hallway", (mbr_w, y0, hall_w, back_h)))
     rooms.append(Room("bathroom", (mbr_w + hall_w, y0, bath_w, back_h * 0.5)))
     rooms.append(Room("bedroom", (mbr_w + hall_w, y0 + back_h * 0.5, bath_w, back_h * 0.5)))
