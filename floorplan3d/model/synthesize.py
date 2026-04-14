@@ -119,19 +119,25 @@ def ranch_open_concept(rng: random.Random) -> Plan:
 
     rooms: list[Room] = []
 
-    # --- top half: garage | mudroom+laundry | great_room ---
-    rooms.append(Room("garage", (0, 0, garage_w, garage_h)))
-    rooms.append(Room("mudroom", (garage_w, 0, mud_w, garage_h * 0.5)))
-    rooms.append(Room("laundry_room", (garage_w, garage_h * 0.5, mud_w, garage_h * 0.5)))
-    rooms.append(Room("great_room", (garage_w + mud_w, 0, great_w - mud_w, great_h)))
+    # --- top half: garage | (mudroom / laundry / powder_room stacked) | great_room ---
+    # Powder room lives inside the service column so its polygon does not
+    # overlap the great_room rectangle. The mud/laundry/powder stack tiles
+    # the full great_h height exactly.
+    mud_h = rng.uniform(1.8, 2.4)
+    laundry_h = rng.uniform(1.6, 2.2)
+    pow_h = great_h - mud_h - laundry_h
+    if pow_h < 1.5:
+        mud_h = great_h * 0.4
+        laundry_h = great_h * 0.3
+        pow_h = great_h - mud_h - laundry_h
 
-    # Powder room carved from great_room's south-west corner.
-    # (The great_room polygon still covers this area — that overlap is
-    # tracked separately and intentionally untouched here.)
-    pow_x = garage_w + mud_w
-    pow_w = rng.uniform(1.4, 1.8)
-    pow_h = rng.uniform(1.8, 2.2)
-    rooms.append(Room("powder_room", (pow_x, great_h - pow_h, pow_w, pow_h)))
+    rooms.append(Room("garage", (0, 0, garage_w, garage_h)))
+    rooms.append(Room("mudroom", (garage_w, 0, mud_w, mud_h)))
+    rooms.append(Room("laundry_room", (garage_w, mud_h, mud_w, laundry_h)))
+    rooms.append(Room("powder_room",
+                      (garage_w, mud_h + laundry_h, mud_w, pow_h),
+                      doors=[("great_room", 0.5, 0.8)]))
+    rooms.append(Room("great_room", (garage_w + mud_w, 0, great_w - mud_w, great_h)))
 
     # --- bedroom wing: one full-height row, left to right ---
     y0 = great_h
@@ -183,16 +189,23 @@ def colonial_compartmentalized(rng: random.Random) -> Plan:
       back band (back_h):     master  | hallway | bathroom/bed | bed2
     """
     w = rng.uniform(12, 15)
-    h = rng.uniform(10, 12)
+    # h bumped: the previous (10, 12) range let middle_h shrink to ~1 m in
+    # the worst case, squeezing laundry_h below the 0.8 m shared-edge
+    # threshold used by plan_to_schema.
+    h = rng.uniform(11, 12)
 
     foyer_w = rng.uniform(1.8, 2.4)
     dining_w = rng.uniform(3.5, 4.2)
     living_w = w - foyer_w - dining_w
 
-    # --- front band: dining | foyer | living (all full front_h) ---
-    # Foyer extends the full band height so there is no void below it;
-    # the original foyer_h < front_h left a slot that wasn't assigned.
+    # --- band heights: front + middle + back = h, each with a viable min ---
+    # Middle and back both need >= 3 m so the laundry column and bathroom
+    # stack keep real shared-edge width.
     front_h = rng.uniform(3.8, 4.5)
+    middle_h = rng.uniform(3.0, min(4.5, h - front_h - 3.5))
+    back_h = h - front_h - middle_h
+
+    # --- front band: dining | foyer | living (all full front_h) ---
     rooms: list[Room] = []
     rooms.append(Room("dining_room", (0, 0, dining_w, front_h)))
     rooms.append(Room("foyer", (dining_w, 0, foyer_w, front_h),
@@ -200,10 +213,7 @@ def colonial_compartmentalized(rng: random.Random) -> Plan:
     rooms.append(Room("living_room", (dining_w + foyer_w, 0, living_w, front_h)))
 
     # --- middle band: kitchen | (pantry over laundry) | family_room ---
-    # This row must tile the full width. The old code placed only kitchen +
-    # a small pantry and left the strip right of the pantry (and the slot
-    # below it) unassigned, producing the kitchen-row void.
-    middle_h = h - front_h - rng.uniform(3.8, 4.5)
+    # Full-width tiling; no voids right of or below the pantry.
     kitchen_w = rng.uniform(3.8, 4.5)
     pantry_w = rng.uniform(1.4, 1.8)
     family_w = w - kitchen_w - pantry_w
@@ -212,9 +222,9 @@ def colonial_compartmentalized(rng: random.Random) -> Plan:
         kitchen_w = max(3.0, kitchen_w - deficit)
         family_w = w - kitchen_w - pantry_w
 
-    # Pantry takes the top of the middle column; laundry fills below so the
-    # column tiles completely. Clamp pantry_h so both sub-rooms stay usable.
-    pantry_h = min(rng.uniform(1.4, 1.8), middle_h * 0.55)
+    # Clamp pantry_h so laundry_h stays >= 1.2 m for a robust shared edge
+    # with the kitchen (shared-edge threshold inside plan_to_schema is 0.8).
+    pantry_h = min(rng.uniform(1.4, 1.8), middle_h - 1.2)
     laundry_h = middle_h - pantry_h
 
     rooms.append(Room("kitchen", (0, front_h, kitchen_w, middle_h),
@@ -223,13 +233,16 @@ def colonial_compartmentalized(rng: random.Random) -> Plan:
     rooms.append(Room("laundry_room", (kitchen_w, front_h + pantry_h,
                                        pantry_w, laundry_h),
                       doors=[("kitchen", 0.5, 0.8)]))
+    # Note: family_room <-> hallway is NOT declared as a door here. Their
+    # shared edge width depends on w, mbr_w, hall_w, kitchen_w, and pantry_w,
+    # and can drop below the 0.8 m threshold. Connectivity is still provided
+    # via family_room <-> living_room <-> foyer and master <-> hallway.
     rooms.append(Room("family_room", (kitchen_w + pantry_w, front_h,
                                        family_w, middle_h),
-                      doors=[("living_room", 0.5, 1.2), ("hallway", 0.5, 1.0)]))
+                      doors=[("living_room", 0.5, 1.2)]))
 
     # --- back band: master suite | hallway | bath over bedroom | bed2 ---
     y0 = front_h + middle_h
-    back_h = h - y0
     mbr_w = rng.uniform(4.2, 5.0)
     bed2_w = rng.uniform(3.2, 3.8)
     bath_w = rng.uniform(2.2, 2.6)
