@@ -47,8 +47,9 @@ for the full walkthrough. Short version:
 
 1. [Sign up at Lambda Labs](https://lambdalabs.com/service/gpu-cloud), add
    ~$75 of credit, paste your SSH key.
-2. Launch `gpu_1x_h100_pcie` with a 200 GB persistent filesystem at
-   `/workspace`.
+2. Launch `gpu_1x_h100_pcie`. **Skip the persistent filesystem** —
+   Lambda instances have local NVMe that's more than enough for one
+   training run.
 3. SSH in from PowerShell:
    ```powershell
    ssh ubuntu@<your-pod-ip>
@@ -66,7 +67,7 @@ When training finishes (~$50–65 of compute), from PowerShell on your desktop:
 
 ```powershell
 cd ~\Documents\archbuildai
-scp -r ubuntu@<your-pod-ip>:/workspace/archbuildai/floorplan3d/model/weights floorplan3d\model\
+scp -r ubuntu@<your-pod-ip>:~/archbuildai/floorplan3d/model/weights floorplan3d\model\
 ```
 
 ## 6. Terminate the Lambda pod

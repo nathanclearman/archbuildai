@@ -27,9 +27,12 @@ in one command. **Expected total cost: $50–$70** for a single training run.
    - **Region:** any (cost is flat across regions at time of writing)
    - **Instance type:** `gpu_1x_h100_pcie` (1× H100 80GB, ~$2.49/hr) — or
      `gpu_1x_h100_sxm5` if PCIe is sold out
-   - **Filesystem:** attach a new persistent filesystem of 200 GB and mount
-     it at `/workspace` — this lets you stop the pod without losing the
-     dataset or checkpoints
+   - **Filesystem:** **skip this for a one-shot run.** Lambda instances
+     include several hundred GB of local NVMe, which is plenty for the
+     ~20 GB this project needs. Only attach a persistent filesystem if
+     you plan to stop/restart the pod across sessions — otherwise you'll
+     pay $40/mo for storage you don't need. The bootstrap script
+     auto-detects and falls back to `$HOME` if `/workspace` isn't mounted.
    - **SSH key:** pick the one you set up in step 1
 3. Click **Launch**. The pod will be ready in 1–3 minutes. Copy the public
    IP from the dashboard.
@@ -82,7 +85,7 @@ When training finishes, from PowerShell on your desktop:
 
 ```powershell
 cd C:\path\to\archbuildai
-scp -r ubuntu@<your-pod-ip>:/workspace/archbuildai/floorplan3d/model/weights floorplan3d\model\
+scp -r ubuntu@<your-pod-ip>:~/archbuildai/floorplan3d/model/weights floorplan3d\model\
 ```
 
 Then commit and push the weights from your local repo (or store them

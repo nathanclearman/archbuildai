@@ -17,7 +17,15 @@ set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/nathanclearman/archbuildai.git}"
 BRANCH="${BRANCH:-claude/debug-detection-issues-IiUC7}"
-WORKDIR="${WORKDIR:-/workspace}"
+# Use /workspace if a persistent filesystem is mounted there; otherwise
+# fall back to the user's home directory on the instance's local NVMe.
+if [ -z "${WORKDIR:-}" ]; then
+    if [ -d /workspace ] && [ -w /workspace ]; then
+        WORKDIR=/workspace
+    else
+        WORKDIR="$HOME"
+    fi
+fi
 SYNTH_COUNT="${SYNTH_COUNT:-10000}"
 EPOCHS="${EPOCHS:-2}"
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}"
