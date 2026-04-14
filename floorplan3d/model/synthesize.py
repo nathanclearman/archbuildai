@@ -559,7 +559,15 @@ TEMPLATES: list[Callable[[random.Random], Plan]] = [
 # ---------- walls + openings from rooms ----------
 
 def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
-    """Convert a template-produced Plan into a canonical floor plan dict."""
+    """Convert a template-produced Plan into a canonical floor plan dict.
+
+    Each door records `swing_into` — a unit (dx, dy) vector pointing
+    into the room the door swings into. We know which two rooms a door
+    connects at generation time (the declaration is `(other_label, t,
+    width)`), so we can compute swing direction once with full
+    information instead of inferring it from polygon containment at
+    render time. Exterior doors swing into the room they belong to.
+    """
     walls = _build_walls(plan)
 
     # 2. Doors: declared room-to-room connections.
@@ -581,11 +589,13 @@ def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
             if snapped is None:
                 continue
             wall_idx, (px, py) = snapped
+            into = _pick_swing_target(r, other)
             doors.append({
-                "position": [round(px, 2), round(py, 2)],
-                "width": round(width, 2),
+                "position": [px, py],
+                "width": width,
                 "type": "hinged",
                 "wall_index": wall_idx,
+                "swing_into": _swing_vector_into_room((px, py), walls[wall_idx], into.rect),
             })
 
     # 3. Exterior door on front of house.
@@ -599,10 +609,11 @@ def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
             if snapped is not None:
                 wall_idx, (px, py) = snapped
                 doors.append({
-                    "position": [round(px, 2), round(py, 2)],
+                    "position": [px, py],
                     "width": ext_width,
                     "type": "hinged",
                     "wall_index": wall_idx,
+                    "swing_into": _swing_vector_into_room((px, py), walls[wall_idx], room.rect),
                 })
 
     # 4. Windows on exterior walls. Previously one window per exterior edge,
@@ -790,6 +801,60 @@ def _build_walls(plan: Plan, thickness: float = 0.15, coord_precision: int = 3) 
                 })
 
     return walls
+
+
+CIRCULATION_LABELS = {"hallway", "foyer", "mudroom"}
+
+
+def _rect_area(rect: tuple[float, float, float, float]) -> float:
+    return rect[2] * rect[3]
+
+
+def _pick_swing_target(r: "Room", other: "Room") -> "Room":
+    """Pick which of two adjacent rooms a door swings INTO.
+
+    Convention follows real US plans: doors between a circulation space
+    (hallway / foyer / mudroom) and any other room swing into the other
+    room. Between two non-circulation rooms (e.g. master <-> en-suite),
+    the door swings into the smaller one."""
+    r_circ = r.label in CIRCULATION_LABELS
+    o_circ = other.label in CIRCULATION_LABELS
+    if r_circ and not o_circ:
+        return other
+    if o_circ and not r_circ:
+        return r
+    return other if _rect_area(other.rect) <= _rect_area(r.rect) else r
+
+
+def _wall_unit_vector(wall: dict) -> tuple[float, float]:
+    sx, sy = wall["start"]
+    ex, ey = wall["end"]
+    length = ((ex - sx) ** 2 + (ey - sy) ** 2) ** 0.5
+    if length < 1e-6:
+        return (1.0, 0.0)
+    return ((ex - sx) / length, (ey - sy) / length)
+
+
+def _swing_vector_into_room(door_pos: tuple[float, float], wall: dict,
+                            target_rect: tuple[float, float, float, float]
+                            ) -> list[float]:
+    """Return a unit perpendicular to the wall that points into `target_rect`.
+
+    Each wall has two perpendicular directions; we pick the one whose
+    short probe lands inside the target rectangle. Used at generation
+    time so render() never needs to do polygon-containment scans for
+    door swings."""
+    wdx, wdy = _wall_unit_vector(wall)
+    perp_a = (-wdy, wdx)
+    perp_b = (wdy, -wdx)
+    rx, ry, rw, rh = target_rect
+    px, py = door_pos
+    for perp in (perp_a, perp_b):
+        tx = px + perp[0] * SWING_PROBE_M
+        ty = py + perp[1] * SWING_PROBE_M
+        if rx <= tx <= rx + rw and ry <= ty <= ry + rh:
+            return [perp[0], perp[1]]
+    return [perp_a[0], perp_a[1]]
 
 
 def _find_room(plan: Plan, label: str, after: Room | None = None) -> Room | None:
@@ -1257,48 +1322,18 @@ def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None):
             return (1.0, 0.0)
         return ((ex - sx) / length, (ey - sy) / length)
 
-    def _pick_swing_side(door_pos_m, wall, rooms):
-        """Return a (dx, dy) unit vector perpendicular to the wall pointing
-        into the room the door swings into. Interior side when unambiguous,
-        smaller-room side for interior doors between two rooms, caller
-        fallback if the point sits outside every room."""
-        wdx, wdy = _wall_dir(wall)
-        perp_a = (-wdy, wdx)
-        perp_b = (wdy, -wdx)
-        px_m, py_m = door_pos_m
-        eps = 0.3
-
-        def _room_areas_at(pt):
-            x_, y_ = pt
-            out = []
-            for r in rooms:
-                xs_ = [p[0] for p in r["polygon"]]
-                ys_ = [p[1] for p in r["polygon"]]
-                if min(xs_) <= x_ <= max(xs_) and min(ys_) <= y_ <= max(ys_):
-                    out.append((max(xs_) - min(xs_)) * (max(ys_) - min(ys_)))
-            return out
-
-        a_areas = _room_areas_at((px_m + perp_a[0] * eps, py_m + perp_a[1] * eps))
-        b_areas = _room_areas_at((px_m + perp_b[0] * eps, py_m + perp_b[1] * eps))
-        if a_areas and not b_areas:
-            return perp_a
-        if b_areas and not a_areas:
-            return perp_b
-        if a_areas and b_areas:
-            # Both sides interior: door swings into the smaller room (the
-            # one that would be awkward to swing out of).
-            return perp_a if min(a_areas) <= min(b_areas) else perp_b
-        return perp_a
-
     def _render_door_arc(door, wall):
-        """Draw the door as a quarter-arc + leaf line instead of a flat
-        gap bar. PIL screen-y increases downward, same as world-y, so
-        angles computed on world-space vectors map directly to the
-        draw.arc / atan2 convention."""
-        import math
-
+        """Draw the door as a quarter-arc + leaf line. Swing direction is
+        read from `door["swing_into"]` (set at plan_to_schema time); the
+        old render-time inference scanned every room's polygon per door."""
         wdx, wdy = _wall_dir(wall)
-        swing_x, swing_y = _pick_swing_side(door["position"], wall, plan_dict["rooms"])
+        swing = door.get("swing_into")
+        if swing is None:
+            # Augmented-but-pre-swing legacy data path; fall back to a
+            # consistent perpendicular so rendering still works.
+            swing_x, swing_y = -wdy, wdx
+        else:
+            swing_x, swing_y = swing[0], swing[1]
         width_m = door["width"]
         half_m = width_m / 2
         px_m, py_m = door["position"]
@@ -1529,6 +1564,16 @@ def _apply_augmentation(plan_dict: dict, rot_k: int, flip_x: bool) -> dict:
             bx = w - bx
         return bx, by
 
+    def rotate_vector(dx: float, dy: float) -> tuple[float, float]:
+        """Direction-vector rotation: same per-step formula as `transform`
+        but WITHOUT the `w - bx` translation. Then x-flip negates dx."""
+        vx, vy = dx, dy
+        for _ in range(rot):
+            vx, vy = vy, -vx
+        if flip_x:
+            vx = -vx
+        return vx, vy
+
     return {
         "scale": dict(plan_dict.get("scale", {"pixels_per_meter": 40})),
         "walls": [
@@ -1545,7 +1590,8 @@ def _apply_augmentation(plan_dict: dict, rot_k: int, flip_x: bool) -> dict:
                 "width": d["width"],
                 "type": d.get("type", "hinged"),
                 "wall_index": d["wall_index"],
-                **({"swing_into": d["swing_into"]} if "swing_into" in d else {}),
+                **({"swing_into": list(rotate_vector(*d["swing_into"]))}
+                   if "swing_into" in d else {}),
             }
             for d in plan_dict["doors"]
         ],
