@@ -1015,6 +1015,141 @@ STYLES: dict = {
 DEFAULT_STYLE = STYLES["mls_pastel"]
 
 
+# Per-room fixture layouts. Each entry is (kind, anchor, along_m, depth_m):
+#   anchor in {NW,NE,SW,SE} — corner codes; fixture extends from that corner
+#            toward the room's interior
+#   anchor in {N,S,E,W}    — wall centers; fixture centered on that wall
+#   along_m  — long dimension (parallel to the anchor's wall)
+#   depth_m  — short dimension (perpendicular, into the room)
+FIXTURE_LAYOUT: dict[str, list[tuple[str, str, float, float]]] = {
+    "bathroom": [
+        ("tub", "S", 1.7, 0.75),
+        ("toilet", "NW", 0.45, 0.7),
+        ("sink", "NE", 0.55, 0.4),
+    ],
+    "powder_room": [
+        ("toilet", "NW", 0.45, 0.7),
+        ("sink", "NE", 0.55, 0.4),
+    ],
+    "en_suite": [
+        ("tub", "S", 1.7, 0.75),
+        ("toilet", "NW", 0.45, 0.7),
+        ("sink", "NE", 0.55, 0.4),
+    ],
+    "kitchen": [
+        ("stove", "N", 0.6, 0.6),
+        ("fridge", "NW", 0.7, 0.7),
+        ("kitchen_sink", "NE", 0.7, 0.5),
+    ],
+}
+
+
+def _fixture_rect(anchor: str, ax: float, ay: float, rw: float, rh: float,
+                  along_m: float, depth_m: float,
+                  inset: float = 0.05) -> tuple[float, float, float, float] | None:
+    """Return (x, y, w, h) of a fixture's bounding rect given its anchor code
+    and the room's origin + dimensions. `along_m` x `depth_m` is axis-aligned
+    by default; wall anchors rotate to make `along_m` parallel to the wall.
+    Returns None if the fixture would not fit inside the room."""
+    if anchor == "NW":
+        fw, fh = along_m, depth_m
+        x = ax + inset
+        y = ay + inset
+    elif anchor == "NE":
+        fw, fh = along_m, depth_m
+        x = ax + rw - along_m - inset
+        y = ay + inset
+    elif anchor == "SW":
+        fw, fh = along_m, depth_m
+        x = ax + inset
+        y = ay + rh - depth_m - inset
+    elif anchor == "SE":
+        fw, fh = along_m, depth_m
+        x = ax + rw - along_m - inset
+        y = ay + rh - depth_m - inset
+    elif anchor == "N":
+        fw, fh = along_m, depth_m
+        x = ax + (rw - along_m) / 2
+        y = ay + inset
+    elif anchor == "S":
+        fw, fh = along_m, depth_m
+        x = ax + (rw - along_m) / 2
+        y = ay + rh - depth_m - inset
+    elif anchor == "W":
+        fw, fh = depth_m, along_m
+        x = ax + inset
+        y = ay + (rh - along_m) / 2
+    elif anchor == "E":
+        fw, fh = depth_m, along_m
+        x = ax + rw - depth_m - inset
+        y = ay + (rh - along_m) / 2
+    else:
+        return None
+    # Drop the fixture if the room is too small to hold it.
+    if fw > rw - 2 * inset or fh > rh - 2 * inset:
+        return None
+    return (x, y, fw, fh)
+
+
+def _draw_fixture_glyph(draw, kind: str, rect_px: tuple[float, float, float, float],
+                        ink: tuple, fill: tuple) -> None:
+    """Draw a single fixture glyph inside its rect. These are intentionally
+    schematic — thin lines on the room fill — matching how fixtures appear
+    on real MLS / architect floor plans."""
+    x, y, w, h = rect_px
+    x1, y1 = x + w, y + h
+    lw = 1
+
+    if kind == "toilet":
+        # Tank along the shorter top edge, seat (oval) below.
+        tank_h = h * 0.28
+        draw.rectangle([x, y, x1, y + tank_h], outline=ink, fill=fill, width=lw)
+        seat_pad = w * 0.08
+        draw.ellipse([x + seat_pad, y + tank_h, x1 - seat_pad, y1],
+                     outline=ink, fill=fill, width=lw)
+    elif kind == "sink":
+        # Outer rect + inner oval basin.
+        draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=lw)
+        pad_w, pad_h = w * 0.15, h * 0.18
+        draw.ellipse([x + pad_w, y + pad_h, x1 - pad_w, y1 - pad_h],
+                     outline=ink, width=lw)
+    elif kind == "tub":
+        # Outer rect, rounded inner rect for the basin.
+        draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=lw)
+        pad = min(w, h) * 0.15
+        try:
+            draw.rounded_rectangle([x + pad, y + pad, x1 - pad, y1 - pad],
+                                   radius=min(w, h) * 0.2, outline=ink, width=lw)
+        except AttributeError:
+            # Pillow < 8.2
+            draw.rectangle([x + pad, y + pad, x1 - pad, y1 - pad],
+                           outline=ink, width=lw)
+    elif kind == "stove":
+        # Square with four circular burners.
+        draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=lw)
+        r = min(w, h) * 0.15
+        for cx_frac in (0.3, 0.7):
+            for cy_frac in (0.3, 0.7):
+                cx = x + w * cx_frac
+                cy = y + h * cy_frac
+                draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                             outline=ink, width=lw)
+    elif kind == "fridge":
+        # Rectangle divided by a horizontal line (freezer / fridge split).
+        draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=lw)
+        split_y = y + h * 0.33
+        draw.line([(x, split_y), (x1, split_y)], fill=ink, width=lw)
+    elif kind == "kitchen_sink":
+        # Rectangle with two basin rectangles.
+        draw.rectangle([x, y, x1, y1], outline=ink, fill=fill, width=lw)
+        pad = min(w, h) * 0.12
+        mid = x + w / 2
+        draw.rectangle([x + pad, y + pad, mid - pad / 2, y1 - pad],
+                       outline=ink, width=lw)
+        draw.rectangle([mid + pad / 2, y + pad, x1 - pad, y1 - pad],
+                       outline=ink, width=lw)
+
+
 def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None):
     from PIL import Image, ImageDraw, ImageFont
     size = cfg.image_size
@@ -1047,6 +1182,36 @@ def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None):
     for r in plan_dict["rooms"]:
         color = palette.get(r["label"], palette.get("great_room", (245, 245, 245)))
         draw.polygon([to_px(p) for p in r["polygon"]], fill=color)
+
+    # Fixtures (toilet, sink, tub, stove, fridge, kitchen sink) drawn on top
+    # of the room fill but UNDER walls + door arcs + labels. Opt-out via
+    # cfg.draw_fixtures=False; the cfg flag used to exist and read nothing.
+    if cfg.draw_fixtures:
+        fixture_ink = style.get("fixture_ink", wall_color)
+        for r in plan_dict["rooms"]:
+            spec = FIXTURE_LAYOUT.get(r["label"])
+            if not spec:
+                continue
+            xs2 = [p[0] for p in r["polygon"]]
+            ys2 = [p[1] for p in r["polygon"]]
+            rx, ry = min(xs2), min(ys2)
+            rw, rh = max(xs2) - rx, max(ys2) - ry
+            room_fill = palette.get(r["label"], palette.get("great_room", (245, 245, 245)))
+            for kind, anchor, along_m, depth_m in spec:
+                rect_m = _fixture_rect(anchor, rx, ry, rw, rh, along_m, depth_m)
+                if rect_m is None:
+                    continue
+                fx, fy, fw_, fh_ = rect_m
+                rect_px = (
+                    to_px((fx, fy))[0], to_px((fx, fy))[1],
+                    to_px((fx + fw_, fy + fh_))[0], to_px((fx + fw_, fy + fh_))[1],
+                )
+                rect_px_xywh = (
+                    rect_px[0], rect_px[1],
+                    rect_px[2] - rect_px[0], rect_px[3] - rect_px[1],
+                )
+                _draw_fixture_glyph(draw, kind, rect_px_xywh,
+                                    ink=fixture_ink, fill=room_fill)
 
     # Draw walls on top, using the style's wall color + thickness scale.
     wall_px = max(3, int(cfg.wall_thickness_m * ppm * 0.9 * wall_scale))
