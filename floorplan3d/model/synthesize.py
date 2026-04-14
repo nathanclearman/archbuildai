@@ -645,27 +645,6 @@ def _snap_door_to_wall(point, door_width, walls, tol=0.02):
     return best[0], best[1]
 
 
-def _nearest_wall(point, walls):
-    if not walls:
-        return -1
-    px, py = point
-    best_i, best_d = 0, float("inf")
-    for i, w in enumerate(walls):
-        sx, sy = w["start"]
-        ex, ey = w["end"]
-        dx, dy = ex - sx, ey - sy
-        l2 = dx * dx + dy * dy
-        if l2 < 1e-9:
-            d = (px - sx) ** 2 + (py - sy) ** 2
-        else:
-            t = max(0.0, min(1.0, ((px - sx) * dx + (py - sy) * dy) / l2))
-            cx, cy = sx + t * dx, sy + t * dy
-            d = (px - cx) ** 2 + (py - cy) ** 2
-        if d < best_d:
-            best_d, best_i = d, i
-    return best_i
-
-
 # ---------- rendering ----------
 
 # Rough per-label fill color, to vaguely resemble MLS-style colored plans.
