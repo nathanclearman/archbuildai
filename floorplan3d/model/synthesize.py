@@ -474,12 +474,31 @@ def _build_walls(plan: Plan, thickness: float = 0.15, coord_precision: int = 3) 
                 merged.append([s, e])
         return [(a, b) for a, b in merged]
 
+    def _subdivide(s: float, e: float, splits: list[float],
+                   eps: float = 0.05) -> list[float]:
+        """Return a monotonically-increasing list of cut points from s to e
+        with no two adjacent values within `eps`. The eps filter drops
+        sub-segments shorter than 5 cm — narrower than any wall thickness
+        and always an artefact of near-coincident rectangle corners
+        rather than a real wall."""
+        raw = [s] + [p for p in splits if s + eps < p < e - eps] + [e]
+        raw.sort()
+        out = [raw[0]]
+        for p in raw[1:]:
+            if p - out[-1] > eps:
+                out.append(p)
+        if out[-1] < e - eps / 2:
+            out.append(e)
+        elif out[-1] != e:
+            out[-1] = e
+        return out
+
     walls: list[dict] = []
 
     for y, segs in h_segments.items():
         splits = sorted(h_splits.get(y, set()))
         for s, e in _union_1d(segs):
-            pts = [s] + [p for p in splits if s + 1e-6 < p < e - 1e-6] + [e]
+            pts = _subdivide(s, e, splits)
             for i in range(len(pts) - 1):
                 walls.append({
                     "start": [pts[i], y],
@@ -490,7 +509,7 @@ def _build_walls(plan: Plan, thickness: float = 0.15, coord_precision: int = 3) 
     for x, segs in v_segments.items():
         splits = sorted(v_splits.get(x, set()))
         for s, e in _union_1d(segs):
-            pts = [s] + [p for p in splits if s + 1e-6 < p < e - 1e-6] + [e]
+            pts = _subdivide(s, e, splits)
             for i in range(len(pts) - 1):
                 walls.append({
                     "start": [x, pts[i]],
