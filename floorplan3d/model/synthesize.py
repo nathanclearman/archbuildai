@@ -554,14 +554,12 @@ def two_story_colonial(rng: random.Random) -> Plan:
     very different label distribution from the existing single-floor
     colonial.
 
-    Layout (y south):
-      +--------+------+------+--------+
-      | dining | foyer       | living |   front_h: front
-      +--------+--+------+----+--------+
-      | kitchen   |stair|  family_room |   mid_h:   middle
-      +-----------+-----+----+---------+
-      | mudroom   |       study        |   back_h:  back
-      +-----------+--------------------+
+    Band layout (y south; column widths per band are independent, so
+    this diagram is schematic rather than to-scale):
+
+      front_h:  [ dining_room | foyer      | living_room  ]
+      mid_h:    [ kitchen     | stairs     | family_room  ]
+      back_h:   [ mudroom     | study                     ]
     """
     w = rng.uniform(12, 14)
     h = rng.uniform(11, 13)
@@ -619,9 +617,15 @@ def two_story_colonial(rng: random.Random) -> Plan:
 
 def studio_apartment(rng: random.Random) -> Plan:
     """Compact studio: one open `main_room` + a bathroom carved out of
-    the NE corner. The main room is rendered as TWO rectangles with the
-    same label so the L-shape tiles cleanly without overlapping the
-    bathroom polygon. Smallest template in the pool — 2 rooms, ~50 m²."""
+    the NE corner. Smallest template in the pool at ~50 m² and two
+    logical rooms (main_room + bathroom).
+
+    Implementation note: the main_room is emitted as TWO same-label
+    Room records so the L-shape tiles cleanly without overlapping the
+    bathroom polygon. `_filter_internal_walls` drops the artifactual
+    wall between the two main_room rectangles before the JSON is
+    serialized, so the downstream schema still reads as one continuous
+    room."""
     w = rng.uniform(6.5, 8.5)
     h = rng.uniform(7, 9)
 
@@ -1012,46 +1016,66 @@ def _filter_internal_walls(walls: list[dict], plan: Plan,
                            tol: float = 0.01) -> list[dict]:
     """Drop walls whose two adjacent rectangles share a label.
 
-    Used to clean up L-shaped rooms that are tiled by two same-label
-    rectangles (e.g. studio_apartment's main_room). Only filters when
-    BOTH neighbours are present and identically labelled — exterior
-    walls (one neighbour) and interior walls between distinct rooms
-    are preserved."""
+    Used to clean up L-shaped rooms tiled by two same-label rectangles
+    (e.g. studio_apartment's main_room). Only filters when BOTH
+    neighbours are present and identically labelled — exterior walls
+    (one neighbour) and interior walls between distinct rooms are
+    preserved. Relies on axis-aligned rectangles; a wall that is
+    neither horizontal nor vertical is kept as-is."""
+
+    def _neighbours(wall: dict) -> tuple[str | None, str | None]:
+        """Return (side_a_label, side_b_label) for the two rectangles
+        touching `wall`. Either may be None when the wall is on the
+        footprint's exterior."""
+        sx, sy = wall["start"]
+        ex, ey = wall["end"]
+        horizontal = abs(sy - ey) < tol
+        vertical = abs(sx - ex) < tol
+        if not (horizontal or vertical):
+            return (None, None)
+
+        # Unpack so the axis-specific logic becomes a single branch.
+        if horizontal:
+            line_coord = sy
+            lo, hi = (sx, ex) if sx <= ex else (ex, sx)
+            def _probe(r: Room):
+                rx, ry, rw, rh = r.rect
+                # Rectangle must fully span the wall interval.
+                if not (rx <= lo + tol and rx + rw >= hi - tol):
+                    return None
+                if abs(ry + rh - line_coord) < tol:
+                    return "a"  # rect is north of the wall (ends on it)
+                if abs(ry - line_coord) < tol:
+                    return "b"  # rect is south of the wall (starts on it)
+                return None
+        else:  # vertical
+            line_coord = sx
+            lo, hi = (sy, ey) if sy <= ey else (ey, sy)
+            def _probe(r: Room):
+                rx, ry, rw, rh = r.rect
+                if not (ry <= lo + tol and ry + rh >= hi - tol):
+                    return None
+                if abs(rx + rw - line_coord) < tol:
+                    return "a"  # west side of the wall
+                if abs(rx - line_coord) < tol:
+                    return "b"  # east side
+                return None
+
+        side_a = side_b = None
+        for r in plan.rooms:
+            side = _probe(r)
+            if side == "a":
+                side_a = r.label
+            elif side == "b":
+                side_b = r.label
+        return side_a, side_b
+
     out = []
     for w in walls:
-        sx, sy = w["start"]
-        ex, ey = w["end"]
-        keep = True
-        if abs(sy - ey) < tol:  # horizontal wall at y = sy
-            y = sy
-            x_lo, x_hi = (sx, ex) if sx <= ex else (ex, sx)
-            north_label = south_label = None
-            for r in plan.rooms:
-                rx, ry, rw, rh = r.rect
-                if not (rx <= x_lo + 1e-3 and rx + rw >= x_hi - 1e-3):
-                    continue
-                if abs(ry + rh - y) < tol:
-                    north_label = r.label
-                elif abs(ry - y) < tol:
-                    south_label = r.label
-            if north_label and south_label and north_label == south_label:
-                keep = False
-        elif abs(sx - ex) < tol:  # vertical wall at x = sx
-            x = sx
-            y_lo, y_hi = (sy, ey) if sy <= ey else (ey, sy)
-            west_label = east_label = None
-            for r in plan.rooms:
-                rx, ry, rw, rh = r.rect
-                if not (ry <= y_lo + 1e-3 and ry + rh >= y_hi - 1e-3):
-                    continue
-                if abs(rx + rw - x) < tol:
-                    west_label = r.label
-                elif abs(rx - x) < tol:
-                    east_label = r.label
-            if west_label and east_label and west_label == east_label:
-                keep = False
-        if keep:
-            out.append(w)
+        label_a, label_b = _neighbours(w)
+        if label_a and label_b and label_a == label_b:
+            continue  # internal — drop
+        out.append(w)
     return out
 
 
@@ -1589,11 +1613,15 @@ def _render_door(draw, door, walls, *, bg, arc_color, gap_px, ppm, to_px) -> Non
     while delta < -math.pi:
         delta += 2 * math.pi
 
-    arc_pts = [
-        (hinge_px[0] + r_px * math.cos(start_ang + (i / ARC_POLYLINE_STEPS) * delta),
-         hinge_px[1] + r_px * math.sin(start_ang + (i / ARC_POLYLINE_STEPS) * delta))
-        for i in range(ARC_POLYLINE_STEPS + 1)
-    ]
+    # Sample the arc as a polyline. Each point computes the angle once
+    # (the old version recomputed `start_ang + (i/N) * delta` for both
+    # cos and sin — two trig identities per step for no reason).
+    step = delta / ARC_POLYLINE_STEPS
+    arc_pts = []
+    for i in range(ARC_POLYLINE_STEPS + 1):
+        ang = start_ang + i * step
+        arc_pts.append((hinge_px[0] + r_px * math.cos(ang),
+                        hinge_px[1] + r_px * math.sin(ang)))
     draw.line(arc_pts, fill=arc_color, width=1)
     draw.line([hinge_px, to_px(free_open_m)], fill=arc_color, width=2)
 
@@ -1734,51 +1762,52 @@ def _wrap_words(words: list[str], n_lines: int) -> list[str]:
     return lines
 
 
-def _measure(draw, font, text: str):
-    """Return (width, height, y_offset) for a single-line string."""
+def _measure(draw, font, text: str) -> tuple[int, int]:
+    """Return (width, height) in pixels for a single-line string."""
     x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=font, anchor="lt")
-    return x1 - x0, y1 - y0, y0
+    return x1 - x0, y1 - y0
 
 
 def _draw_label_fitted(draw, centroid_px, text: str,
                        room_w_px: float, room_h_px: float,
-                       margin_px: int = 6,
+                       margin_px: int = LABEL_MARGIN_PX,
                        fill: tuple = (60, 60, 60)) -> None:
     """Draw `text` at `centroid_px` wrapped and shrunk to fit the room box."""
     max_w = max(room_w_px - 2 * margin_px, 20)
     max_h = max(room_h_px - 2 * margin_px, 12)
     words = text.split()
-    line_gap = 2
+    line_gap = LABEL_LINE_GAP_PX
+
+    def _draw_lines(lines: list[str], font) -> None:
+        line_h = max(_measure(draw, font, ln)[1] for ln in lines)
+        total_h = line_h * len(lines) + line_gap * (len(lines) - 1)
+        cx, cy = centroid_px
+        top_y = cy - total_h / 2 + line_h / 2
+        for i, ln in enumerate(lines):
+            draw.text((cx, top_y + i * (line_h + line_gap)), ln,
+                      fill=fill, font=font, anchor="mm")
 
     # Try font sizes from large to small. For each size, try 1-, 2-, 3-line
     # wraps and pick the first that fits horizontally and vertically.
-    for font_size in (18, 15, 13, 11, 9, 8, 7):
+    for font_size in LABEL_FONT_LADDER:
         font = _get_font(font_size)
         for n_lines in range(1, min(len(words), 3) + 1):
             lines = _wrap_words(words, n_lines)
-            widths, heights = zip(*((_measure(draw, font, ln)[0],
-                                     _measure(draw, font, ln)[1]) for ln in lines))
-            line_h = max(heights)
-            total_w = max(widths)
+            # Measure each line exactly once; the old version called
+            # _measure twice per line inside a zip() generator.
+            sizes = [_measure(draw, font, ln) for ln in lines]
+            total_w = max(w for w, _ in sizes)
+            line_h = max(h for _, h in sizes)
             total_h = line_h * len(lines) + line_gap * (len(lines) - 1)
             if total_w <= max_w and total_h <= max_h:
-                cx, cy = centroid_px
-                top_y = cy - total_h / 2 + line_h / 2
-                for i, ln in enumerate(lines):
-                    draw.text((cx, top_y + i * (line_h + line_gap)), ln,
-                              fill=fill, font=font, anchor="mm")
+                _draw_lines(lines, font)
                 return
 
-    # Nothing fit cleanly — draw the text at the smallest tried size.
-    font = _get_font(7)
-    lines = _wrap_words(words, min(len(words), 3))
-    cx, cy = centroid_px
-    _, line_h, _ = _measure(draw, font, lines[0])
-    total_h = line_h * len(lines) + line_gap * (len(lines) - 1)
-    top_y = cy - total_h / 2 + line_h / 2
-    for i, ln in enumerate(lines):
-        draw.text((cx, top_y + i * (line_h + line_gap)), ln,
-                  fill=fill, font=font, anchor="mm")
+    # Nothing fit cleanly — draw at the smallest tried size and accept
+    # some overflow. Picking a wrapped layout still keeps tail characters
+    # visible instead of mid-word-clipped.
+    font = _get_font(LABEL_MIN_FONT_PX)
+    _draw_lines(_wrap_words(words, min(len(words), 3)), font)
 
 
 # ---------- public API ----------
