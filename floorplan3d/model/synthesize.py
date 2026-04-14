@@ -1199,12 +1199,116 @@ def _draw_label_fitted(draw, centroid_px, text: str,
 
 # ---------- public API ----------
 
-def generate_one(seed: int, cfg: SynthConfig | None = None):
+def _apply_augmentation(plan_dict: dict, rot_k: int, flip_x: bool) -> dict:
+    """Rotate (rot_k * 90 deg CCW) and optionally horizontally flip the
+    plan, remapping every coordinate so the image and JSON stay in sync.
+
+    This runs AFTER plan_to_schema and BEFORE render(), so the image and
+    the JSON target string always describe the same plan in the same
+    orientation. Augmenting at this stage means each of the 5 templates
+    can appear in 8 distinct orientations (4 rotations x 2 flips),
+    forcing the VLM to learn orientation-invariant features rather than
+    memorising "garage is always west"."""
+    fw = max(p[0] for r in plan_dict["rooms"] for p in r["polygon"])
+    fh = max(p[1] for r in plan_dict["rooms"] for p in r["polygon"])
+
+    def _tx(x: float, y: float) -> tuple[float, float]:
+        # rotate CCW by rot_k * 90 deg around the origin, then flip x.
+        for _ in range(rot_k % 4):
+            x, y = y, fw - x
+            fw_local = fh  # bookkeeping only
+            # swap fw/fh for subsequent iterations
+            fh_local = fw
+            fw, fh = fw_local, fh_local
+        if flip_x:
+            x = fw - x
+        return x, y
+
+    # The loop above mutates fw/fh per iteration; compute the final
+    # footprint once more from the rotated corners.
+    # Simpler: redo via explicit formulas.
+    def _transform_point(x: float, y: float) -> tuple[float, float]:
+        # Compose: rotate_k then flip_x around the CURRENT footprint.
+        rot = rot_k % 4
+        bx, by = x, y
+        w, h = fw_orig, fh_orig
+        for _ in range(rot):
+            bx, by = by, w - bx
+            w, h = h, w
+        if flip_x:
+            bx = w - bx
+        return bx, by
+
+    fw_orig, fh_orig = fw, fh
+
+    # Final footprint after rotation (flip doesn't change dims)
+    if rot_k % 2 == 1:
+        new_fw, new_fh = fh_orig, fw_orig
+    else:
+        new_fw, new_fh = fw_orig, fh_orig
+
+    out = {"scale": dict(plan_dict.get("scale", {"pixels_per_meter": 40}))}
+
+    out["walls"] = []
+    for w_ in plan_dict["walls"]:
+        s = _transform_point(*w_["start"])
+        e = _transform_point(*w_["end"])
+        out["walls"].append({
+            "start": [round(s[0], 3), round(s[1], 3)],
+            "end": [round(e[0], 3), round(e[1], 3)],
+            "thickness": w_.get("thickness", 0.15),
+        })
+
+    out["doors"] = []
+    for d in plan_dict["doors"]:
+        px, py = _transform_point(*d["position"])
+        out["doors"].append({
+            "position": [round(px, 2), round(py, 2)],
+            "width": d["width"],
+            "type": d.get("type", "hinged"),
+            "wall_index": d["wall_index"],
+        })
+
+    out["windows"] = []
+    for wn in plan_dict["windows"]:
+        px, py = _transform_point(*wn["position"])
+        out["windows"].append({
+            "position": [round(px, 2), round(py, 2)],
+            "width": wn["width"],
+            "wall_index": wn["wall_index"],
+        })
+
+    out["rooms"] = []
+    for r in plan_dict["rooms"]:
+        poly = [_transform_point(*p) for p in r["polygon"]]
+        out["rooms"].append({
+            "label": r["label"],
+            "polygon": [[round(x, 3), round(y, 3)] for x, y in poly],
+            "area": r.get("area", 0.0),
+        })
+
+    return out
+
+
+def generate_one(seed: int, cfg: SynthConfig | None = None,
+                 augment: bool = True):
+    """Generate a single (image, plan_dict) pair.
+
+    When augment=True (default), the plan is rotated by 0/90/180/270
+    degrees and optionally horizontally flipped before rendering. The
+    JSON and image stay in sync because the same transform is applied
+    to every coordinate.
+    """
     cfg = cfg or SynthConfig()
     rng = random.Random(seed)
     template = rng.choice(TEMPLATES)
     plan = template(rng)
     plan_dict = plan_to_schema(plan, rng)
+    if augment:
+        rot_k = rng.randrange(4)
+        flip_x = rng.random() < 0.5
+        if rot_k or flip_x:
+            plan_dict = _apply_augmentation(plan_dict, rot_k, flip_x)
     img = render(plan_dict, cfg)
     return img, plan_dict
 
