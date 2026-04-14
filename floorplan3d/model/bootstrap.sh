@@ -41,9 +41,17 @@ echo "base:    $BASE_MODEL"
 echo
 
 # --- 1. System deps -----------------------------------------------------
+# Lambda instances run as the `ubuntu` user; RunPod pods run as root.
+# Detect which and prefix apt-get with sudo only when needed.
+if [ "$(id -u)" -eq 0 ]; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
+
 echo "--- installing system packages"
-apt-get update -qq
-apt-get install -y --no-install-recommends \
+$SUDO apt-get update -qq
+$SUDO apt-get install -y --no-install-recommends \
     git git-lfs wget unzip jq ca-certificates > /dev/null
 git lfs install --skip-smudge > /dev/null
 
