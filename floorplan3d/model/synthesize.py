@@ -175,30 +175,60 @@ def ranch_open_concept(rng: random.Random) -> Plan:
 
 def colonial_compartmentalized(rng: random.Random) -> Plan:
     """Compartmentalized single-floor plan with separate living / dining /
-    kitchen, no merged great room. Closer to traditional US colonial."""
+    kitchen, no merged great room. Closer to traditional US colonial.
+
+    Bands (y increases going south):
+      front band (front_h):   dining | foyer | living    — full band height
+      middle band (middle_h): kitchen | pantry/laundry | family_room — full
+      back band (back_h):     master  | hallway | bathroom/bed | bed2
+    """
     w = rng.uniform(12, 15)
     h = rng.uniform(10, 12)
 
     foyer_w = rng.uniform(1.8, 2.4)
-    foyer_h = rng.uniform(2.5, 3.2)
     dining_w = rng.uniform(3.5, 4.2)
-    kitchen_w = rng.uniform(3.8, 4.5)
     living_w = w - foyer_w - dining_w
 
-    # Front row (top): dining | foyer | living
+    # --- front band: dining | foyer | living (all full front_h) ---
+    # Foyer extends the full band height so there is no void below it;
+    # the original foyer_h < front_h left a slot that wasn't assigned.
     front_h = rng.uniform(3.8, 4.5)
     rooms: list[Room] = []
     rooms.append(Room("dining_room", (0, 0, dining_w, front_h)))
-    rooms.append(Room("foyer", (dining_w, 0, foyer_w, foyer_h)))
+    rooms.append(Room("foyer", (dining_w, 0, foyer_w, front_h),
+                      doors=[("dining_room", 0.5, 1.0), ("living_room", 0.5, 1.0)]))
     rooms.append(Room("living_room", (dining_w + foyer_w, 0, living_w, front_h)))
 
-    # Kitchen behind dining
-    kitchen_h = h - front_h - rng.uniform(3.8, 4.5)
-    rooms.append(Room("kitchen", (0, front_h, kitchen_w, kitchen_h)))
-    rooms.append(Room("pantry", (kitchen_w, front_h, rng.uniform(1.4, 1.8), rng.uniform(1.4, 1.8))))
+    # --- middle band: kitchen | (pantry over laundry) | family_room ---
+    # This row must tile the full width. The old code placed only kitchen +
+    # a small pantry and left the strip right of the pantry (and the slot
+    # below it) unassigned, producing the kitchen-row void.
+    middle_h = h - front_h - rng.uniform(3.8, 4.5)
+    kitchen_w = rng.uniform(3.8, 4.5)
+    pantry_w = rng.uniform(1.4, 1.8)
+    family_w = w - kitchen_w - pantry_w
+    if family_w < 2.5:
+        deficit = 2.5 - family_w
+        kitchen_w = max(3.0, kitchen_w - deficit)
+        family_w = w - kitchen_w - pantry_w
 
-    # Bedroom wing at back
-    y0 = front_h + kitchen_h
+    # Pantry takes the top of the middle column; laundry fills below so the
+    # column tiles completely. Clamp pantry_h so both sub-rooms stay usable.
+    pantry_h = min(rng.uniform(1.4, 1.8), middle_h * 0.55)
+    laundry_h = middle_h - pantry_h
+
+    rooms.append(Room("kitchen", (0, front_h, kitchen_w, middle_h),
+                      doors=[("dining_room", 0.5, 1.0), ("pantry", 0.5, 0.8)]))
+    rooms.append(Room("pantry", (kitchen_w, front_h, pantry_w, pantry_h)))
+    rooms.append(Room("laundry_room", (kitchen_w, front_h + pantry_h,
+                                       pantry_w, laundry_h),
+                      doors=[("kitchen", 0.5, 0.8)]))
+    rooms.append(Room("family_room", (kitchen_w + pantry_w, front_h,
+                                       family_w, middle_h),
+                      doors=[("living_room", 0.5, 1.2), ("hallway", 0.5, 1.0)]))
+
+    # --- back band: bedroom wing (untouched — bug #3 tracked separately) ---
+    y0 = front_h + middle_h
     back_h = h - y0
     mbr_w = rng.uniform(4.2, 5.0)
     bed2_w = rng.uniform(3.2, 3.8)
