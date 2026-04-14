@@ -71,73 +71,103 @@ def ranch_open_concept(rng: random.Random) -> Plan:
     """Single-floor open-concept ranch, ~1800-2400 sqft.
 
     Layout (axes: +x east, +y south):
-      +-----------------------------------------+
-      |   garage  |  mudroom  |     kitchen     |
-      |           +-----------+-----------------+
-      |           |                             |
-      +-----------+  great_room (LR+DR+kitchen) |
-      |   bed2    |                             |
-      +-----+-----+-----+---------+-------------+
-      | bath| bed3| hall|  M.BR   | walk-in-cl  |
-      +-----+-----+-----+---------+------+------+
-                        |  en-suite      |
-                        +----------------+
+      +------------------------------------------------+
+      |   garage   | mud  |        kitchen             |
+      |            +------+----------------------------+
+      |            |                                   |
+      +------------+   great_room (LR + DR + kitchen)  |
+      |  bedroom   |                                   |
+      +------------+------+------+------+---------+----+
+      |  bedroom   | bath | bed3 | hall |  M.BR   | wic|
+      |            |      |      |      +---------+    |
+      |            |      |      |      | en_suite|    |
+      +------------+------+------+------+---------+----+
+
+    Bedroom wing is a single row of full-height columns so every room has
+    a clean rectangular polygon with no voids or overlaps. The vertical
+    hallway bridges the bed3/bath cluster to the master suite; bed2 (over
+    the garage footprint) and bed3 share the bathroom jack-and-jill style
+    — the single-rectangle hallway can only be adjacent to two
+    bedroom-wing neighbours, so this is the most connected arrangement
+    achievable without an L-shaped corridor.
     """
     w = rng.uniform(16, 20)           # overall width (meters)
     h = rng.uniform(11, 14)           # overall height
     garage_w = rng.uniform(5.5, 6.5)
-    garage_h = rng.uniform(6.0, 6.5)
     mud_w = rng.uniform(1.8, 2.6)
     great_w = w - garage_w
     great_h = h * rng.uniform(0.45, 0.55)
+    # Garage shares the top-half height with great_room so the two bands
+    # line up exactly; the earlier independent garage_h could exceed great_h
+    # and spill into the bedroom wing.
+    garage_h = great_h
 
     bed_wing_h = h - great_h
     mbr_w = rng.uniform(4.5, 5.5)
     wic_w = rng.uniform(1.8, 2.5)
-    ens_w = rng.uniform(2.2, 2.8)
     hall_w = rng.uniform(1.2, 1.5)
-    bed2_w = rng.uniform(3.0, 3.8)
     bath_w = rng.uniform(2.0, 2.6)
-    bed3_w = w - garage_w - bath_w - bed2_w - hall_w - mbr_w
+    # bed3_w fills the remaining wing-row width. The bottom row is:
+    #   bed2 (garage_w) | bath | bed3 | hall | master | wic  ==  w
+    bed3_w = w - garage_w - bath_w - hall_w - mbr_w - wic_w
     if bed3_w < 2.5:
-        # fell short; steal from garage
-        garage_w = max(5.0, garage_w - (2.5 - bed3_w))
-        bed3_w = w - garage_w - bath_w - bed2_w - hall_w - mbr_w
+        # Not enough wall budget — trim the master and walk-in to recover.
+        deficit = 2.5 - bed3_w
+        mbr_w = max(4.0, mbr_w - deficit * 0.7)
+        wic_w = max(1.5, wic_w - deficit * 0.3)
+        bed3_w = w - garage_w - bath_w - hall_w - mbr_w - wic_w
 
     rooms: list[Room] = []
 
-    # --- top half: garage | mudroom | great room (kitchen merged) ---
+    # --- top half: garage | mudroom+laundry | great_room ---
     rooms.append(Room("garage", (0, 0, garage_w, garage_h)))
     rooms.append(Room("mudroom", (garage_w, 0, mud_w, garage_h * 0.5)))
     rooms.append(Room("laundry_room", (garage_w, garage_h * 0.5, mud_w, garage_h * 0.5)))
     rooms.append(Room("great_room", (garage_w + mud_w, 0, great_w - mud_w, great_h)))
 
-    # powder room carved from mudroom/great room boundary
+    # Powder room carved from great_room's south-west corner.
+    # (The great_room polygon still covers this area — that overlap is
+    # tracked separately and intentionally untouched here.)
     pow_x = garage_w + mud_w
     pow_w = rng.uniform(1.4, 1.8)
     pow_h = rng.uniform(1.8, 2.2)
     rooms.append(Room("powder_room", (pow_x, great_h - pow_h, pow_w, pow_h)))
 
-    # --- bottom half: bedroom wing ---
+    # --- bedroom wing: one full-height row, left to right ---
     y0 = great_h
-    # leftmost: bedroom 2 over garage footprint, bath next to it
-    rooms.append(Room("bedroom", (0, y0, garage_w * 0.55, bed_wing_h), doors=[("hallway", 0.5, 0.9)]))
-    rooms.append(Room("bedroom", (garage_w * 0.55, y0, garage_w * 0.45, bed_wing_h), doors=[("hallway", 0.5, 0.9)]))
-    # hallway runs east-west through the bedroom wing
-    hall_x = garage_w
-    hall_y = y0 + bed_wing_h * 0.35
-    hall_h = bed_wing_h * 0.3
-    rooms.append(Room("hallway", (hall_x, hall_y, w - hall_x - mbr_w - wic_w, hall_h)))
+    x = 0.0
 
-    # shared bath
-    rooms.append(Room("bathroom", (hall_x, y0, bath_w, hall_y - y0)))
+    # bed2 sits over the garage footprint, full wing height.
+    rooms.append(Room("bedroom", (x, y0, garage_w, bed_wing_h),
+                      doors=[("bathroom", 0.5, 0.9)]))
+    x += garage_w
 
-    # master suite: bedroom + en-suite + walk-in
-    mbr_x = w - mbr_w - wic_w
+    # Shared bathroom, full wing height (jack-and-jill between bed2 and bed3).
+    rooms.append(Room("bathroom", (x, y0, bath_w, bed_wing_h)))
+    x += bath_w
+
+    # Third bedroom, full wing height. Accesses both the bathroom and the hall.
+    rooms.append(Room("bedroom", (x, y0, bed3_w, bed_wing_h),
+                      doors=[("bathroom", 0.5, 0.9), ("hallway", 0.5, 0.9)]))
+    x += bed3_w
+
+    # Vertical hallway, full wing height. Bridges bed3 → master suite.
+    rooms.append(Room("hallway", (x, y0, hall_w, bed_wing_h)))
+    x += hall_w
+
+    # Master suite: master (top 60%) + en-suite (bottom 40%) in the same
+    # column, so their polygons tile the column without overlapping.
+    mbr_x = x
     rooms.append(Room("master_bedroom", (mbr_x, y0, mbr_w, bed_wing_h * 0.6),
-                      doors=[("hallway", 0.9, 0.9), ("en_suite", 0.5, 0.8), ("walk_in_closet", 0.7, 0.7)]))
-    rooms.append(Room("en_suite", (mbr_x, y0 + bed_wing_h * 0.6, mbr_w - ens_w * 0.3, bed_wing_h * 0.4)))
-    rooms.append(Room("walk_in_closet", (w - wic_w, y0, wic_w, bed_wing_h * 0.6)))
+                      doors=[("hallway", 0.5, 0.9),
+                             ("en_suite", 0.5, 0.8),
+                             ("walk_in_closet", 0.7, 0.7)]))
+    rooms.append(Room("en_suite", (mbr_x, y0 + bed_wing_h * 0.6, mbr_w, bed_wing_h * 0.4)))
+    x += mbr_w
+
+    # Walk-in closet, full wing height — avoids the old south-edge void
+    # that used to sit under the 60%-tall walk-in.
+    rooms.append(Room("walk_in_closet", (x, y0, wic_w, bed_wing_h)))
 
     plan = Plan(rooms=rooms, footprint=(w, h), exterior_door=("great_room", "S"))
     return plan
