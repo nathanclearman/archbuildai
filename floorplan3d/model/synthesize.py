@@ -547,12 +547,207 @@ def narrow_townhouse(rng: random.Random) -> Plan:
     return Plan(rooms=rooms, footprint=(w, h), exterior_door=("foyer", "N"))
 
 
+def two_story_colonial(rng: random.Random) -> Plan:
+    """First-floor plan of a two-story colonial. No bedrooms (they live
+    upstairs); a `stairs` cell sits in the middle band where you would
+    physically go up. Front formal rooms + back utility band give a
+    very different label distribution from the existing single-floor
+    colonial.
+
+    Layout (y south):
+      +--------+------+------+--------+
+      | dining | foyer       | living |   front_h: front
+      +--------+--+------+----+--------+
+      | kitchen   |stair|  family_room |   mid_h:   middle
+      +-----------+-----+----+---------+
+      | mudroom   |       study        |   back_h:  back
+      +-----------+--------------------+
+    """
+    w = rng.uniform(12, 14)
+    h = rng.uniform(11, 13)
+
+    front_h = rng.uniform(3.5, 4.0)
+    mid_h = rng.uniform(3.6, 4.2)
+    back_h = h - front_h - mid_h
+    if back_h < 3.0:
+        back_h = 3.0
+        mid_h = h - front_h - back_h
+
+    foyer_w = rng.uniform(2.0, 2.5)
+    dining_w = rng.uniform(3.5, 4.2)
+    living_w = w - foyer_w - dining_w
+
+    stairs_w = rng.uniform(1.4, 1.8)
+    kitchen_w = rng.uniform(3.5, 4.2)
+    family_w = w - kitchen_w - stairs_w
+    if family_w < 3.0:
+        kitchen_w = max(3.0, kitchen_w - (3.0 - family_w))
+        family_w = w - kitchen_w - stairs_w
+
+    mud_w = rng.uniform(2.0, 2.5)
+    study_w = w - mud_w
+
+    rooms: list[Room] = []
+    # Front band
+    rooms.append(Room("dining_room", (0, 0, dining_w, front_h)))
+    # Foyer<->stairs uses a narrower 0.9 m door because the shared edge
+    # (foyer south <-> stairs north) can shrink to ~0.9 m when foyer_w
+    # and kitchen_w pull in opposite directions; a 1.0 m door fails to
+    # snap on a sub-1.0 m wall segment.
+    rooms.append(Room("foyer", (dining_w, 0, foyer_w, front_h),
+                      doors=[("dining_room", 0.5, 1.0),
+                             ("living_room", 0.5, 1.0),
+                             ("stairs", 0.5, 0.9)]))
+    rooms.append(Room("living_room", (dining_w + foyer_w, 0, living_w, front_h)))
+
+    # Middle band
+    rooms.append(Room("kitchen", (0, front_h, kitchen_w, mid_h),
+                      doors=[("dining_room", 0.5, 1.0)]))
+    rooms.append(Room("stairs", (kitchen_w, front_h, stairs_w, mid_h)))
+    rooms.append(Room("family_room", (kitchen_w + stairs_w, front_h, family_w, mid_h),
+                      doors=[("living_room", 0.5, 1.2)]))
+
+    # Back band
+    y_back = front_h + mid_h
+    rooms.append(Room("mudroom", (0, y_back, mud_w, back_h),
+                      doors=[("kitchen", 0.5, 0.9)]))
+    rooms.append(Room("study", (mud_w, y_back, study_w, back_h),
+                      doors=[("family_room", 0.5, 0.9)]))
+
+    return Plan(rooms=rooms, footprint=(w, h), exterior_door=("foyer", "N"))
+
+
+def studio_apartment(rng: random.Random) -> Plan:
+    """Compact studio: one open `main_room` + a bathroom carved out of
+    the NE corner. The main room is rendered as TWO rectangles with the
+    same label so the L-shape tiles cleanly without overlapping the
+    bathroom polygon. Smallest template in the pool — 2 rooms, ~50 m²."""
+    w = rng.uniform(6.5, 8.5)
+    h = rng.uniform(7, 9)
+
+    bath_w = rng.uniform(2.2, 2.6)
+    bath_h = rng.uniform(2.0, 2.4)
+
+    rooms: list[Room] = []
+    # Main room L-shape: tall left column + bottom strip under the bath.
+    rooms.append(Room("main_room", (0, 0, w - bath_w, h),
+                      doors=[("bathroom", 0.5, 0.8)]))
+    rooms.append(Room("main_room", (w - bath_w, bath_h, bath_w, h - bath_h)))
+    rooms.append(Room("bathroom", (w - bath_w, 0, bath_w, bath_h)))
+
+    return Plan(rooms=rooms, footprint=(w, h), exterior_door=("main_room", "S"))
+
+
+def one_bedroom_apartment(rng: random.Random) -> Plan:
+    """Urban one-bedroom apartment, ~60-90 m².
+
+    Layout (y south):
+      +------------+--------+
+      | living     |kitchen |   front: open living + kitchen
+      +------------+--------+
+      | hallway    |bath|cl |   middle: hall, bath, walk-in closet
+      +------------+----+---+
+      |          bedroom    |   back: full-width bedroom
+      +---------------------+
+    """
+    w = rng.uniform(7, 9)
+    h = rng.uniform(8, 11)
+
+    living_h = rng.uniform(3.5, 4.2)
+    bath_h = rng.uniform(2.0, 2.4)
+    bedroom_h = h - living_h - bath_h
+    if bedroom_h < 3.0:
+        bath_h = max(2.0, bath_h - (3.0 - bedroom_h))
+        bedroom_h = h - living_h - bath_h
+
+    kitchen_w = rng.uniform(2.5, 3.2)
+    living_w = w - kitchen_w
+    bath_w = rng.uniform(2.2, 2.6)
+    closet_w = rng.uniform(1.2, 1.5)
+    hallway_w = w - bath_w - closet_w
+    if hallway_w < 1.5:
+        bath_w = max(1.8, bath_w - (1.5 - hallway_w))
+        hallway_w = w - bath_w - closet_w
+
+    rooms: list[Room] = []
+    rooms.append(Room("living_room", (0, 0, living_w, living_h)))
+    rooms.append(Room("kitchen", (living_w, 0, kitchen_w, living_h),
+                      doors=[("living_room", 0.5, 1.2)]))
+
+    rooms.append(Room("hallway", (0, living_h, hallway_w, bath_h),
+                      doors=[("living_room", 0.5, 1.0)]))
+    rooms.append(Room("bathroom", (hallway_w, living_h, bath_w, bath_h),
+                      doors=[("hallway", 0.5, 0.8)]))
+    rooms.append(Room("closet", (hallway_w + bath_w, living_h, closet_w, bath_h)))
+
+    rooms.append(Room("bedroom", (0, living_h + bath_h, w, bedroom_h),
+                      doors=[("hallway", 0.5, 0.9), ("closet", 0.5, 0.7)]))
+
+    return Plan(rooms=rooms, footprint=(w, h), exterior_door=("living_room", "N"))
+
+
+def cape_cod_cottage(rng: random.Random) -> Plan:
+    """Small two-bedroom cottage, ~80-110 m². No master suite — both
+    bedrooms share one bathroom. Front living + kitchen, back two
+    bedrooms with the bath between them.
+
+    Layout (y south):
+      +------------+--------+
+      | living     |kitchen |   front
+      +-----+------+--------+
+      | bed | bath |  bed   |   back
+      +-----+------+--------+
+    """
+    w = rng.uniform(9, 11)
+    h = rng.uniform(9, 11)
+
+    front_h = rng.uniform(4.0, 4.8)
+    back_h = h - front_h
+    if back_h < 4.0:
+        front_h = h - 4.0
+        back_h = 4.0
+
+    kitchen_w = rng.uniform(3.5, 4.2)
+    living_w = w - kitchen_w
+
+    bath_w = rng.uniform(2.0, 2.4)
+    bed1_w = rng.uniform(3.0, 3.5)
+    bed2_w = w - bed1_w - bath_w
+    if bed2_w < 3.0:
+        bed1_w = max(2.8, bed1_w - (3.0 - bed2_w))
+        bed2_w = w - bed1_w - bath_w
+
+    rooms: list[Room] = []
+    rooms.append(Room("living_room", (0, 0, living_w, front_h)))
+    rooms.append(Room("kitchen", (living_w, 0, kitchen_w, front_h),
+                      doors=[("living_room", 0.5, 1.2)]))
+
+    # bed2 sits east of the bathroom; in a small cottage its overlap with
+    # living_room can be a sub-door-width sliver (cape cod is ~10 m wide
+    # and bed1+bath spans 5-6 m of the south band, leaving bed2 mostly
+    # under kitchen). Route bed2 to bathroom (jack-and-jill access)
+    # rather than to living_room — guaranteed adjacent on the west wall.
+    y_back = front_h
+    rooms.append(Room("bedroom", (0, y_back, bed1_w, back_h),
+                      doors=[("living_room", 0.5, 0.9)]))
+    rooms.append(Room("bathroom", (bed1_w, y_back, bath_w, back_h),
+                      doors=[("living_room", 0.5, 0.8)]))
+    rooms.append(Room("bedroom", (bed1_w + bath_w, y_back, bed2_w, back_h),
+                      doors=[("bathroom", 0.5, 0.8)]))
+
+    return Plan(rooms=rooms, footprint=(w, h), exterior_door=("living_room", "N"))
+
+
 TEMPLATES: list[Callable[[random.Random], Plan]] = [
     ranch_open_concept,
     colonial_compartmentalized,
     split_bedroom_ranch,
     l_shape_ranch,
     narrow_townhouse,
+    two_story_colonial,
+    studio_apartment,
+    one_bedroom_apartment,
+    cape_cod_cottage,
 ]
 
 
@@ -569,6 +764,13 @@ def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
     render time. Exterior doors swing into the room they belong to.
     """
     walls = _build_walls(plan)
+    # Templates that need an L-shaped room (e.g. studio_apartment's
+    # main_room) tile it with two same-label rectangles. _build_walls
+    # treats them as independent rooms and emits a wall on their shared
+    # edge; that wall is artifactual — there's no real wall between
+    # two parts of the same room. Drop it before downstream code
+    # references the wall list.
+    walls = _filter_internal_walls(walls, plan)
 
     # 2. Doors: declared room-to-room connections.
     # Each door is snapped onto the actual wall segment it belongs to: the
@@ -806,6 +1008,53 @@ def _build_walls(plan: Plan, thickness: float = 0.15, coord_precision: int = 3) 
 CIRCULATION_LABELS = {"hallway", "foyer", "mudroom"}
 
 
+def _filter_internal_walls(walls: list[dict], plan: Plan,
+                           tol: float = 0.01) -> list[dict]:
+    """Drop walls whose two adjacent rectangles share a label.
+
+    Used to clean up L-shaped rooms that are tiled by two same-label
+    rectangles (e.g. studio_apartment's main_room). Only filters when
+    BOTH neighbours are present and identically labelled — exterior
+    walls (one neighbour) and interior walls between distinct rooms
+    are preserved."""
+    out = []
+    for w in walls:
+        sx, sy = w["start"]
+        ex, ey = w["end"]
+        keep = True
+        if abs(sy - ey) < tol:  # horizontal wall at y = sy
+            y = sy
+            x_lo, x_hi = (sx, ex) if sx <= ex else (ex, sx)
+            north_label = south_label = None
+            for r in plan.rooms:
+                rx, ry, rw, rh = r.rect
+                if not (rx <= x_lo + 1e-3 and rx + rw >= x_hi - 1e-3):
+                    continue
+                if abs(ry + rh - y) < tol:
+                    north_label = r.label
+                elif abs(ry - y) < tol:
+                    south_label = r.label
+            if north_label and south_label and north_label == south_label:
+                keep = False
+        elif abs(sx - ex) < tol:  # vertical wall at x = sx
+            x = sx
+            y_lo, y_hi = (sy, ey) if sy <= ey else (ey, sy)
+            west_label = east_label = None
+            for r in plan.rooms:
+                rx, ry, rw, rh = r.rect
+                if not (ry <= y_lo + 1e-3 and ry + rh >= y_hi - 1e-3):
+                    continue
+                if abs(rx + rw - x) < tol:
+                    west_label = r.label
+                elif abs(rx - x) < tol:
+                    east_label = r.label
+            if west_label and east_label and west_label == east_label:
+                keep = False
+        if keep:
+            out.append(w)
+    return out
+
+
 def _rect_area(rect: tuple[float, float, float, float]) -> float:
     return rect[2] * rect[3]
 
@@ -1007,6 +1256,10 @@ ROOM_COLORS = {
     "garage": (225, 225, 225),
     "office": (238, 238, 230),
     "den": (238, 238, 230),
+    # New labels introduced by the apartment / cottage / two-story templates.
+    "main_room": (243, 238, 222),     # studio open space, warm cream
+    "study": (235, 232, 220),         # like office, slightly warmer
+    "stairs": (220, 220, 220),        # structural void, neutral gray
 }
 
 

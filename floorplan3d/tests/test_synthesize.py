@@ -28,6 +28,7 @@ from synthesize import (  # type: ignore
     TEMPLATES,
     _apply_augmentation,
     _build_walls,
+    _filter_internal_walls,
     _fixture_rect,
     _pick_swing_target,
     _snap_door_to_wall,
@@ -94,6 +95,47 @@ class BuildWallsTest(unittest.TestCase):
         self.assertEqual(len(at_y3), 2)
         spans = sorted([(w["start"][0], w["end"][0]) for w in at_y3])
         self.assertEqual(spans, [(0, 2), (2, 6)])
+
+
+# ---------- _filter_internal_walls ----------
+
+class FilterInternalWallsTest(unittest.TestCase):
+    def test_drops_wall_between_same_label_rects(self):
+        # Two "main_room" rectangles stacked vertically: shared edge at
+        # y=3 is internal and should be filtered out.
+        plan = Plan(rooms=[
+            Room("main_room", (0, 0, 4, 3)),
+            Room("main_room", (0, 3, 4, 2)),
+        ], footprint=(4, 5))
+        walls = _build_walls(plan)
+        filtered = _filter_internal_walls(walls, plan)
+        # Internal wall at y=3 should be gone.
+        for w in filtered:
+            sx, sy = w["start"]
+            ex, ey = w["end"]
+            self.assertFalse(
+                abs(sy - 3) < 0.01 and abs(ey - 3) < 0.01 and 0 < sx < 4 and 0 < ex < 4,
+                f"internal wall not filtered: {w}",
+            )
+
+    def test_keeps_wall_between_distinct_labels(self):
+        # Same geometry but distinct labels — wall must stay.
+        plan = Plan(rooms=[
+            Room("kitchen", (0, 0, 4, 3)),
+            Room("dining_room", (0, 3, 4, 2)),
+        ], footprint=(4, 5))
+        walls = _build_walls(plan)
+        filtered = _filter_internal_walls(walls, plan)
+        on_y3 = [w for w in filtered
+                 if abs(w["start"][1] - 3) < 0.01 and abs(w["end"][1] - 3) < 0.01]
+        self.assertTrue(on_y3, "shared edge between distinct rooms should survive")
+
+    def test_keeps_exterior_walls(self):
+        # Exterior walls have only one neighbour; they must always be kept.
+        plan = Plan(rooms=[Room("main_room", (0, 0, 4, 4))], footprint=(4, 4))
+        walls = _build_walls(plan)
+        filtered = _filter_internal_walls(walls, plan)
+        self.assertEqual(len(filtered), 4, "single room should keep all 4 exterior walls")
 
 
 # ---------- _snap_door_to_wall ----------
