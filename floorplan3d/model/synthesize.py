@@ -339,31 +339,65 @@ def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
                     "wall_index": wall_idx,
                 })
 
-    # 4. Windows on exterior walls, roughly one per exterior room edge.
+    # 4. Windows on exterior walls. Previously one window per exterior edge,
+    # always at edge midpoint — which (a) collided with the exterior door
+    # when both picked the same midpoint and (b) produced sparse
+    # single-window walls on long public rooms. Now windows are spread
+    # along each exterior edge (~one per 3 m), clamped to fit their wall
+    # segment, and skipped where they would overlap an existing door.
     windows: list[dict] = []
     fw, fh = plan.footprint
+    service_rooms = {
+        "closet", "walk_in_closet", "pantry", "bathroom", "powder_room",
+        "en_suite", "hallway", "foyer", "mudroom", "laundry_room", "garage",
+    }
+    door_by_wall: dict[int, list[dict]] = {}
+    for d_ in doors:
+        door_by_wall.setdefault(d_["wall_index"], []).append(d_)
+
+    def _clashes_with_door(wall_idx: int, wx: float, wy: float, width: float) -> bool:
+        for dd in door_by_wall.get(wall_idx, ()):
+            dx_, dy_ = dd["position"]
+            dist = ((dx_ - wx) ** 2 + (dy_ - wy) ** 2) ** 0.5
+            if dist < (dd["width"] + width) / 2 + 0.3:
+                return True
+        return False
+
     for r in plan.rooms:
-        if r.label in {"closet", "walk_in_closet", "pantry", "bathroom", "powder_room", "en_suite", "hallway", "foyer", "mudroom", "laundry_room", "garage"}:
-            # These rooms typically don't get windows, or only small ones —
-            # skip for now to keep windows on visible public rooms.
-            if rng.random() > 0.2:
-                continue
+        service = r.label in service_rooms
+        x, y, w, h = r.rect
         for side in ("N", "S", "E", "W"):
             if not _edge_is_exterior(r.rect, side, fw, fh):
                 continue
-            if rng.random() > 0.55:
-                continue
-            cx, cy = _edge_midpoint(r.rect, side)
-            win_width = round(rng.uniform(0.9, 1.6), 2)
-            snapped = _snap_door_to_wall((cx, cy), win_width, walls)
-            if snapped is None:
-                continue
-            wall_idx, (wx, wy) = snapped
-            windows.append({
-                "position": [round(wx, 2), round(wy, 2)],
-                "width": win_width,
-                "wall_index": wall_idx,
-            })
+            if side == "N":
+                p0, p1 = (x, y), (x + w, y)
+            elif side == "S":
+                p0, p1 = (x, y + h), (x + w, y + h)
+            elif side == "W":
+                p0, p1 = (x, y), (x, y + h)
+            else:
+                p0, p1 = (x + w, y), (x + w, y + h)
+            edge_len = ((p1[0] - p0[0]) ** 2 + (p1[1] - p0[1]) ** 2) ** 0.5
+            n_candidates = max(1, int(edge_len / 3.0))
+            per_window_prob = 0.1 if service else 0.55
+            for k in range(n_candidates):
+                if rng.random() > per_window_prob:
+                    continue
+                t = (k + 0.5) / n_candidates
+                px = p0[0] + t * (p1[0] - p0[0])
+                py = p0[1] + t * (p1[1] - p0[1])
+                win_width = round(rng.uniform(0.9, 1.6), 2)
+                snapped = _snap_door_to_wall((px, py), win_width, walls)
+                if snapped is None:
+                    continue
+                wall_idx, (wx, wy) = snapped
+                if _clashes_with_door(wall_idx, wx, wy, win_width):
+                    continue
+                windows.append({
+                    "position": [round(wx, 2), round(wy, 2)],
+                    "width": win_width,
+                    "wall_index": wall_idx,
+                })
 
     rooms_out = [
         {
@@ -669,18 +703,37 @@ def render(plan_dict: dict, cfg: SynthConfig):
     for w in plan_dict["walls"]:
         draw.line([to_px(w["start"]), to_px(w["end"])], fill=(25, 25, 25), width=wall_px)
 
-    # Doors: short gap rendered as lighter line.
+    # Doors and windows: gap lines rendered ALONG their wall's direction.
+    # The old code always drew a horizontal gap, so openings on vertical
+    # walls showed as bars crossing the wall instead of gaps in it.
     door_px = max(4, wall_px + 1)
+
+    def _wall_dir(wall):
+        sx, sy = wall["start"]
+        ex, ey = wall["end"]
+        length = ((ex - sx) ** 2 + (ey - sy) ** 2) ** 0.5
+        if length < 1e-6:
+            return (1.0, 0.0)
+        return ((ex - sx) / length, (ey - sy) / length)
+
+    walls = plan_dict["walls"]
     for d in plan_dict["doors"]:
+        wall = walls[d["wall_index"]]
+        dx, dy = _wall_dir(wall)
         cx, cy = to_px(d["position"])
         half = d["width"] * ppm / 2
-        draw.line([(cx - half, cy), (cx + half, cy)], fill=(230, 225, 215), width=door_px)
+        draw.line([(cx - dx * half, cy - dy * half),
+                   (cx + dx * half, cy + dy * half)],
+                  fill=(230, 225, 215), width=door_px)
 
-    # Windows: blue-tinted short segments.
     for win in plan_dict["windows"]:
+        wall = walls[win["wall_index"]]
+        dx, dy = _wall_dir(wall)
         cx, cy = to_px(win["position"])
         half = win["width"] * ppm / 2
-        draw.line([(cx - half, cy), (cx + half, cy)], fill=(150, 185, 220), width=door_px)
+        draw.line([(cx - dx * half, cy - dy * half),
+                   (cx + dx * half, cy + dy * half)],
+                  fill=(150, 185, 220), width=door_px)
 
     # Room labels. Each label is wrapped and sized to fit inside its room
     # rectangle — the old single-line draw clipped multi-word labels
