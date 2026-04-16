@@ -2655,7 +2655,7 @@ def _apply_vignette(img: Image.Image, rng: random.Random) -> Image.Image:
     from PIL import ImageChops
     w, h = img.size
     intensity = rng.uniform(0.15, 0.40)
-    n_rings = 48  # more rings → smoother gradient; 48 is inperceptibly
+    n_rings = 48  # more rings → smoother gradient; 48 is imperceptibly
                   # smooth on a 900-px canvas and cheap to build.
 
     mask = Image.new("L", (w, h), 0)
