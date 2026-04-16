@@ -473,10 +473,57 @@ class OverlayTest(unittest.TestCase):
     def test_render_stays_deterministic(self):
         # Render must be pure given its inputs — overlays included.
         a = synthesize.render(self.plan, self.cfg, show_dimensions=True,
-                              title_block="FLOOR PLAN", watermark="DRAFT")
+                              title_block="FLOOR PLAN", watermark="DRAFT",
+                              show_fixture_abbrev=True)
         b = synthesize.render(self.plan, self.cfg, show_dimensions=True,
-                              title_block="FLOOR PLAN", watermark="DRAFT")
+                              title_block="FLOOR PLAN", watermark="DRAFT",
+                              show_fixture_abbrev=True)
         self.assertEqual(a.tobytes(), b.tobytes())
+
+
+# ---------- fixture abbreviations ----------
+
+class FixtureAbbrevTest(unittest.TestCase):
+    def setUp(self):
+        self.cfg = synthesize.SynthConfig(image_size=500)
+        # Seed 5 is a colonial with a real kitchen + bathrooms — every
+        # fixture layout exercised.
+        _, self.plan = synthesize.generate_one(5, self.cfg, augment=False)
+
+    def test_abbrev_overlay_changes_pixels(self):
+        on = synthesize.render(self.plan, self.cfg, show_fixture_abbrev=True)
+        off = synthesize.render(self.plan, self.cfg, show_fixture_abbrev=False)
+        # Abbreviations are drawn on top of glyphs — at least one pixel
+        # inside the room-fill area must differ.
+        self.assertNotEqual(on.tobytes(), off.tobytes())
+
+    def test_abbrev_disabled_by_default(self):
+        # A render without the flag should be byte-identical to one with
+        # show_fixture_abbrev=False — catches any future accidental on-default.
+        a = synthesize.render(self.plan, self.cfg)
+        b = synthesize.render(self.plan, self.cfg, show_fixture_abbrev=False)
+        self.assertEqual(a.tobytes(), b.tobytes())
+
+    def test_every_fixture_has_an_abbreviation(self):
+        # A fixture in FIXTURE_LAYOUT but missing from
+        # FIXTURE_ABBREVIATIONS is a silent bug — the glyph would render
+        # but the label would be suppressed. Keep the two tables in lockstep.
+        declared_kinds = {kind for specs in synthesize.FIXTURE_LAYOUT.values()
+                          for (kind, *_rest) in specs}
+        for kind in declared_kinds:
+            self.assertIn(kind, synthesize.FIXTURE_ABBREVIATIONS,
+                          f"fixture '{kind}' has no abbreviation entry")
+
+    def test_abbrev_skipped_when_rect_is_tiny(self):
+        # Zero-size rect: must not crash and must not draw anything.
+        # Drawing into an image and comparing to a fresh image is the
+        # cleanest way to assert "nothing was drawn".
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", (30, 30), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        synthesize._draw_fixture_abbrev(draw, 5, 5, 0, 0, "REF", ink=(0, 0, 0))
+        blank = Image.new("RGB", (30, 30), (255, 255, 255))
+        self.assertEqual(img.tobytes(), blank.tobytes())
 
 
 # ---------- bay windows ----------

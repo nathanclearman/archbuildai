@@ -1788,7 +1788,8 @@ def _render_rooms(draw, plan_dict, palette, to_px) -> None:
         draw.polygon([to_px(p) for p in r["polygon"]], fill=color)
 
 
-def _render_fixtures(draw, plan_dict, palette, ink, to_px) -> None:
+def _render_fixtures(draw, plan_dict, palette, ink, to_px, *,
+                     show_abbrev: bool = False) -> None:
     for r in plan_dict["rooms"]:
         spec = FIXTURE_LAYOUT.get(r["label"])
         if not spec:
@@ -1809,6 +1810,42 @@ def _render_fixtures(draw, plan_dict, palette, ink, to_px) -> None:
             tl = to_px((fx, fy))
             br = to_px((fx + fw_, fy + fh_))
             drawer(draw, tl[0], tl[1], br[0] - tl[0], br[1] - tl[1], ink, fill)
+            if show_abbrev:
+                abbrev = FIXTURE_ABBREVIATIONS.get(kind)
+                if abbrev:
+                    _draw_fixture_abbrev(draw, tl[0], tl[1], br[0] - tl[0],
+                                         br[1] - tl[1], abbrev, ink)
+
+
+# US architectural convention — short labels that sit on top of each
+# fixture glyph so the model learns to read scaled text as an
+# annotation rather than a wall / door marking.
+FIXTURE_ABBREVIATIONS: dict[str, str] = {
+    "fridge":       "REF",
+    "stove":        "RNG",
+    "kitchen_sink": "SINK",
+    "toilet":       "WC",
+    "tub":          "TUB",
+    "sink":         "LAV",
+}
+
+
+def _draw_fixture_abbrev(draw, x: float, y: float, w: float, h: float,
+                         text: str, ink) -> None:
+    """Center `text` on the fixture's bounding rect. Picks the largest
+    font size in a short ladder that still fits inside the rect with a
+    1-pixel margin; silently skips if the rect is too small for even
+    the minimum size (e.g. a 30 cm sink glyph rendered at 600 px canvas).
+    """
+    max_w = max(0, w - 2)
+    max_h = max(0, h - 2)
+    for font_size in (12, 10, 9, 8, 7):
+        font = _get_font(font_size)
+        tw, th = _measure(draw, font, text)
+        if tw <= max_w and th <= max_h:
+            draw.text((x + w / 2, y + h / 2), text,
+                      fill=ink, font=font, anchor="mm")
+            return
 
 
 def _render_walls(draw, walls, color, width_px, to_px) -> None:
@@ -1932,17 +1969,18 @@ def _metric_to_ft_in(m: float) -> str:
 
 def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None,
            *, show_dimensions: bool = False, title_block: str | None = None,
-           watermark: str | None = None):
+           watermark: str | None = None, show_fixture_abbrev: bool = False):
     """Render the floor plan to a PIL Image. Pure orchestration —
     each layer (rooms, fixtures, walls, openings, labels) is delegated
     to a `_render_*` helper that takes only what it needs.
 
     `show_dimensions` appends a `W'W" x L'L"` callout under each room
-    label (US MLS convention). `title_block` adds a "FLOOR PLAN" /
-    "MAIN LEVEL" banner in the corner. `watermark` overlays a diagonal
-    semi-transparent string across the whole canvas the way listing
-    exports stamp broker IDs. All three are off by default so the pure
-    render path stays deterministic.
+    label (US MLS convention). `show_fixture_abbrev` overlays short
+    labels (REF, WC, TUB, ...) on the fixture glyphs. `title_block`
+    adds a "FLOOR PLAN" / "MAIN LEVEL" banner in the corner.
+    `watermark` overlays a diagonal semi-transparent string across the
+    whole canvas the way listing exports stamp broker IDs. All four
+    are off by default so the pure render path stays deterministic.
     """
     style = style or DEFAULT_STYLE
     size = cfg.image_size
@@ -1961,7 +1999,8 @@ def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None,
 
     if cfg.draw_fixtures:
         _render_fixtures(draw, plan_dict, style["palette"],
-                         style.get("fixture_ink", style["wall"]), to_px)
+                         style.get("fixture_ink", style["wall"]), to_px,
+                         show_abbrev=show_fixture_abbrev)
 
     wall_px = max(3, int(cfg.wall_thickness_m * ppm * 0.9 * style.get("wall_scale", 1.0)))
     gap_px = max(4, wall_px + DOOR_GAP_PADDING_PX)
@@ -2306,6 +2345,12 @@ P_TITLE_BLOCK: float = 0.35
 P_WATERMARK: float = 0.15
 P_DIMENSIONS: float = 0.6
 
+# Fixture abbreviations (REF, WC, TUB, ...) are drawn on the glyphs
+# themselves. Common on architectural plans and some MLS exports, less
+# common on marketing renders — 0.5 gives the model exposure without
+# every sample looking like a code-review plan.
+P_FIXTURE_ABBREV: float = 0.5
+
 # Bay windows are common but not universal — roughly a third of
 # mid-century and newer US plans have at least one. Picked 0.35 so a
 # meaningful fraction of training samples exercise the angled-wall
@@ -2456,6 +2501,7 @@ def generate_one(seed: int, cfg: SynthConfig | None = None,
     show_dimensions = False
     title_block: str | None = None
     watermark: str | None = None
+    show_fixture_abbrev = False
     if augment:
         rot_k = rng.randrange(4)
         flip_x = rng.random() < 0.5
@@ -2464,6 +2510,7 @@ def generate_one(seed: int, cfg: SynthConfig | None = None,
         style_name = rng.choice(list(STYLES.keys()))
         style = STYLES[style_name]
         show_dimensions = rng.random() < P_DIMENSIONS
+        show_fixture_abbrev = rng.random() < P_FIXTURE_ABBREV
         if rng.random() < P_TITLE_BLOCK:
             title_block = rng.choice(TITLE_BLOCK_CANDIDATES)
         if rng.random() < P_WATERMARK:
@@ -2472,6 +2519,7 @@ def generate_one(seed: int, cfg: SynthConfig | None = None,
         style = DEFAULT_STYLE
     img = render(plan_dict, cfg, style=style,
                  show_dimensions=show_dimensions,
+                 show_fixture_abbrev=show_fixture_abbrev,
                  title_block=title_block, watermark=watermark)
     if augment:
         img = _augment_image(img, rng, bg_color=style["bg"])
