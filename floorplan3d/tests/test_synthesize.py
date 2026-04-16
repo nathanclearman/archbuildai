@@ -526,6 +526,56 @@ class FixtureAbbrevTest(unittest.TestCase):
         self.assertEqual(img.tobytes(), blank.tobytes())
 
 
+# ---------- exterior dimension lines ----------
+
+class DimensionLinesTest(unittest.TestCase):
+    def setUp(self):
+        self.cfg = synthesize.SynthConfig(image_size=500)
+        _, self.plan = synthesize.generate_one(5, self.cfg, augment=False)
+
+    def test_dim_lines_change_margin_pixels(self):
+        # Without dim lines, the canvas margin around the plan is solid
+        # background. Turning them on must paint ink in that margin.
+        on = synthesize.render(self.plan, self.cfg, show_dimension_lines=True)
+        off = synthesize.render(self.plan, self.cfg, show_dimension_lines=False)
+        self.assertNotEqual(on.tobytes(), off.tobytes())
+
+    def test_dim_lines_off_by_default(self):
+        a = synthesize.render(self.plan, self.cfg)
+        b = synthesize.render(self.plan, self.cfg, show_dimension_lines=False)
+        self.assertEqual(a.tobytes(), b.tobytes())
+
+    def test_dim_lines_deterministic(self):
+        a = synthesize.render(self.plan, self.cfg, show_dimension_lines=True)
+        b = synthesize.render(self.plan, self.cfg, show_dimension_lines=True)
+        self.assertEqual(a.tobytes(), b.tobytes())
+
+    def test_dim_lines_skipped_when_margin_too_small(self):
+        # Render at a canvas where the plan fills the whole canvas —
+        # there is no exterior margin to host the dim lines. The
+        # renderer must silently skip them rather than draw into the
+        # plan interior. We test this by constructing a Plan whose
+        # footprint equals the pixel-space canvas at the default ppm.
+        tight_plan = {
+            "walls": [],
+            "doors": [],
+            "windows": [],
+            "rooms": [{
+                "label": "main_room",
+                "polygon": [[0, 0], [22, 0], [22, 22], [0, 22]],
+                "area": 484.0,
+            }],
+            "scale": {"pixels_per_meter": 40},
+        }
+        # 22 m * 40 ppm = 880 px, canvas size 900 leaves only 10 px
+        # margin on each side — less than _DIM_LINE_OFFSET_PX=18.
+        cfg = synthesize.SynthConfig(image_size=900)
+        a = synthesize.render(tight_plan, cfg, show_dimension_lines=True)
+        b = synthesize.render(tight_plan, cfg, show_dimension_lines=False)
+        # Dimension lines skipped on both axes -> images match exactly.
+        self.assertEqual(a.tobytes(), b.tobytes())
+
+
 # ---------- bay windows ----------
 
 class BayWindowGeometryTest(unittest.TestCase):

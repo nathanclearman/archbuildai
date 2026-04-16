@@ -1969,18 +1969,22 @@ def _metric_to_ft_in(m: float) -> str:
 
 def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None,
            *, show_dimensions: bool = False, title_block: str | None = None,
-           watermark: str | None = None, show_fixture_abbrev: bool = False):
+           watermark: str | None = None, show_fixture_abbrev: bool = False,
+           show_dimension_lines: bool = False):
     """Render the floor plan to a PIL Image. Pure orchestration —
     each layer (rooms, fixtures, walls, openings, labels) is delegated
     to a `_render_*` helper that takes only what it needs.
 
     `show_dimensions` appends a `W'W" x L'L"` callout under each room
     label (US MLS convention). `show_fixture_abbrev` overlays short
-    labels (REF, WC, TUB, ...) on the fixture glyphs. `title_block`
-    adds a "FLOOR PLAN" / "MAIN LEVEL" banner in the corner.
-    `watermark` overlays a diagonal semi-transparent string across the
-    whole canvas the way listing exports stamp broker IDs. All four
-    are off by default so the pure render path stays deterministic.
+    labels (REF, WC, TUB, ...) on the fixture glyphs.
+    `show_dimension_lines` draws architectural exterior-dimension lines
+    along the south and west edges of the plan (tick-marked chains with
+    a feet-inches callout). `title_block` adds a "FLOOR PLAN" /
+    "MAIN LEVEL" banner in the corner. `watermark` overlays a diagonal
+    semi-transparent string across the whole canvas the way listing
+    exports stamp broker IDs. All five are off by default so the pure
+    render path stays deterministic.
     """
     style = style or DEFAULT_STYLE
     size = cfg.image_size
@@ -2021,6 +2025,10 @@ def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None,
     if cfg.draw_labels:
         _render_labels(draw, plan_dict, style["text"], ppm, to_px,
                        show_dimensions=show_dimensions)
+
+    if show_dimension_lines:
+        _render_dimension_lines(draw, plan_dict, style["text"],
+                                ppm, off_x, off_y, size)
 
     if title_block:
         _render_title_block(img, title_block, style)
@@ -2308,6 +2316,121 @@ def _render_watermark(img: Image.Image, text: str, style: dict) -> Image.Image:
     return composed.convert("RGB")
 
 
+# ---------- exterior dimension lines ----------
+#
+# Architectural convention: outside the building outline, a horizontal
+# "dimension line" runs parallel to each major wall with short
+# perpendicular extension lines at the wall endpoints, 45-degree tick
+# marks at the dimension line's ends, and a feet-inches callout
+# centered on the line. Common on construction drawings and a sizable
+# fraction of architect-authored MLS exports — absent from our synth
+# until now, so the model never saw the bit of "annotation outside the
+# plan rectangle" pattern.
+#
+# Implementation is pixel-space because the arrangement needs margin
+# from the plan perimeter regardless of unit scale.
+
+_DIM_LINE_OFFSET_PX: int = 18     # distance from plan perimeter to dim line
+_DIM_TICK_LEN_PX: int = 6         # length of the 45-degree end ticks
+_DIM_EXT_OVERSHOOT_PX: int = 4    # how far the extension lines extend past the dim line
+
+
+def _render_dimension_lines(draw, plan_dict: dict, ink,
+                            ppm: float, off_x: float, off_y: float,
+                            canvas_size: int) -> None:
+    """Draw exterior dimension lines along the south and west edges of
+    the plan. Silently skipped on whichever axes don't have room in the
+    canvas margin — better to produce a clean plan than to cram the
+    line on top of the walls.
+    """
+    fw, fh = _compute_extents(plan_dict)
+    # Plan's pixel-space bbox.
+    x_min = off_x
+    y_min = off_y
+    x_max = off_x + fw * ppm
+    y_max = off_y + fh * ppm
+
+    # South line at y = y_max + offset, showing total width.
+    south_y = y_max + _DIM_LINE_OFFSET_PX
+    if south_y + _DIM_TICK_LEN_PX < canvas_size:
+        _draw_dim_line(draw, (x_min, south_y), (x_max, south_y),
+                       _metric_to_ft_in(fw), ink, axis="horizontal",
+                       perp_toward=-1, plan_edge_coord=y_max)
+
+    # West line at x = x_min - offset, showing total height.
+    west_x = x_min - _DIM_LINE_OFFSET_PX
+    if west_x - _DIM_TICK_LEN_PX > 0:
+        _draw_dim_line(draw, (west_x, y_min), (west_x, y_max),
+                       _metric_to_ft_in(fh), ink, axis="vertical",
+                       perp_toward=1, plan_edge_coord=x_min)
+
+
+def _draw_dim_line(draw, start: tuple[float, float], end: tuple[float, float],
+                   label: str, ink, *, axis: str, perp_toward: int,
+                   plan_edge_coord: float) -> None:
+    """Paint one dimension line between `start` and `end` with extension
+    lines back to the plan edge, 45-degree end ticks, and a centered
+    text callout.
+
+    `axis` is "horizontal" (south line) or "vertical" (west line).
+    `perp_toward` is the sign of the direction from the dim line toward
+    the plan edge: -1 means the plan is above / left, +1 means below /
+    right. `plan_edge_coord` is the y (for horizontal) or x (for
+    vertical) of the plan edge the extensions snap back to.
+    """
+    sx, sy = start
+    ex, ey = end
+    # Main dim line.
+    draw.line([start, end], fill=ink, width=1)
+
+    # Extension lines from the plan corners back to the dim line, with
+    # a small overshoot past the dim line (architectural convention).
+    if axis == "horizontal":
+        overshoot_y = sy - perp_toward * _DIM_EXT_OVERSHOOT_PX
+        draw.line([(sx, plan_edge_coord), (sx, overshoot_y)], fill=ink, width=1)
+        draw.line([(ex, plan_edge_coord), (ex, overshoot_y)], fill=ink, width=1)
+        # 45-degree ticks at each end (classic architectural slash marks).
+        t = _DIM_TICK_LEN_PX / 2
+        draw.line([(sx - t, sy + t), (sx + t, sy - t)], fill=ink, width=1)
+        draw.line([(ex - t, ey + t), (ex + t, ey - t)], fill=ink, width=1)
+        # Label centered, offset up from the line.
+        font = _get_font(11)
+        draw.text(((sx + ex) / 2, sy - 3), label,
+                  fill=ink, font=font, anchor="mb")
+    else:  # vertical
+        overshoot_x = sx - perp_toward * _DIM_EXT_OVERSHOOT_PX
+        draw.line([(plan_edge_coord, sy), (overshoot_x, sy)], fill=ink, width=1)
+        draw.line([(plan_edge_coord, ey), (overshoot_x, ey)], fill=ink, width=1)
+        t = _DIM_TICK_LEN_PX / 2
+        draw.line([(sx - t, sy + t), (sx + t, sy - t)], fill=ink, width=1)
+        draw.line([(ex - t, ey + t), (ex + t, ey - t)], fill=ink, width=1)
+        # Label centered, offset toward the plan (the side people read from).
+        font = _get_font(11)
+        # Rotate the text 90° by baking into a small sub-image.
+        _draw_rotated_text(draw, ((sx + ex) / 2, (sy + ey) / 2), label, font, ink)
+
+
+def _draw_rotated_text(draw, anchor_xy: tuple[float, float], text: str,
+                       font, ink) -> None:
+    """Render `text` rotated 90° CCW at `anchor_xy` (center). PIL's
+    Draw.text has no rotation argument, so we render to a small
+    throwaway RGBA image, rotate it, and paste into the host canvas."""
+    # Measure at the target font.
+    tw, th = _measure(draw, font, text)
+    pad = 2
+    label_img = Image.new("RGBA", (tw + 2 * pad, th + 2 * pad), (0, 0, 0, 0))
+    ldraw = ImageDraw.Draw(label_img)
+    ldraw.text((pad, pad), text, fill=(*ink, 255), font=font, anchor="lt")
+    rotated = label_img.rotate(90, resample=Image.BILINEAR, expand=True)
+    rw, rh = rotated.size
+    ax, ay = anchor_xy
+    # Draw.text returns None; we need access to the underlying image to
+    # paste. PIL's ImageDraw has an `._image` attribute on versions we
+    # support, but the stable path is through the draw's `im` alias:
+    host_img = draw._image  # type: ignore[attr-defined]
+    host_img.paste(rotated, (int(ax - rw / 2), int(ay - rh / 2)), rotated)
+
+
 # ---------- photometric augmentation ----------
 #
 # Simulate the photo / scan / print artifacts real MLS listings accumulate
@@ -2350,6 +2473,12 @@ P_DIMENSIONS: float = 0.6
 # common on marketing renders — 0.5 gives the model exposure without
 # every sample looking like a code-review plan.
 P_FIXTURE_ABBREV: float = 0.5
+
+# Exterior dimension lines (the `|← 14'-6" →|` annotations in the plan
+# margin). Architect-authored plans almost always have them; marketing
+# MLS exports usually strip them. 0.3 gets the model comfortable with
+# text floating outside the plan rectangle.
+P_DIMENSION_LINES: float = 0.3
 
 # Bay windows are common but not universal — roughly a third of
 # mid-century and newer US plans have at least one. Picked 0.35 so a
@@ -2502,6 +2631,7 @@ def generate_one(seed: int, cfg: SynthConfig | None = None,
     title_block: str | None = None
     watermark: str | None = None
     show_fixture_abbrev = False
+    show_dimension_lines = False
     if augment:
         rot_k = rng.randrange(4)
         flip_x = rng.random() < 0.5
@@ -2511,6 +2641,7 @@ def generate_one(seed: int, cfg: SynthConfig | None = None,
         style = STYLES[style_name]
         show_dimensions = rng.random() < P_DIMENSIONS
         show_fixture_abbrev = rng.random() < P_FIXTURE_ABBREV
+        show_dimension_lines = rng.random() < P_DIMENSION_LINES
         if rng.random() < P_TITLE_BLOCK:
             title_block = rng.choice(TITLE_BLOCK_CANDIDATES)
         if rng.random() < P_WATERMARK:
@@ -2520,6 +2651,7 @@ def generate_one(seed: int, cfg: SynthConfig | None = None,
     img = render(plan_dict, cfg, style=style,
                  show_dimensions=show_dimensions,
                  show_fixture_abbrev=show_fixture_abbrev,
+                 show_dimension_lines=show_dimension_lines,
                  title_block=title_block, watermark=watermark)
     if augment:
         img = _augment_image(img, rng, bg_color=style["bg"])
