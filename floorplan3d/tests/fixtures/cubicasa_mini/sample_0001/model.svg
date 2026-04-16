@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Minimal CubiCasa5k-style fixture covering the structural variety the real
+corpus uses.
+
+CubiCasa nests most walls / rooms / openings inside a <g transform="..."> so
+coordinates have to be composed with ancestor transforms before being used.
+This fixture exercises both paths: elements at the document root, elements
+under a translate, and one element under a nested translate.
+
+The document is 200x150 px @ 50 px/m → a 4 m x 3 m plate.
+
+Expected room layout (metric):
+  living_room: axis-aligned rect (0.2, 0.2) .. (1.9, 2.8)
+  bedroom:     axis-aligned rect (2.1, 0.2) .. (3.8, 2.8)
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="200" height="150"
+     viewBox="0 0 200 150">
+
+  <!-- Walls laid at the document root (no transform). -->
+  <!-- Bottom exterior edge, thin polygon at y=140..150. -->
+  <polygon class="Wall" points="0,140 200,140 200,150 0,150"/>
+  <!-- Top exterior edge as a rect (CubiCasa uses both forms). -->
+  <rect class="Wall" x="0" y="0" width="200" height="10"/>
+
+  <!-- Walls under a nested transform chain: outer translate + inner
+       translate compose to an effective shift of (5, 10). Each polygon
+       below is specified in the innermost local frame. -->
+  <g transform="translate(3,4)">
+    <g transform="translate(2,6)">
+      <!-- Left exterior wall, local (-5,-10)..(5,140) -> abs (0,0)..(10,150). -->
+      <polygon class="Wall" points="-5,-10 5,-10 5,140 -5,140"/>
+      <!-- Right exterior wall, local (185,-10)..(195,140) -> abs (190,0)..(200,150). -->
+      <polygon class="Wall" points="185,-10 195,-10 195,140 185,140"/>
+      <!-- Interior vertical divider at x=100, local (90,0)..(100,130). -->
+      <polygon class="Wall" points="90,0 100,0 100,130 90,130"/>
+    </g>
+  </g>
+
+  <!-- Door spanning the interior divider, under a translate. The 20x20
+       square's bbox center is (10,10) locally; the translate(90,65)
+       puts it at absolute (100,75) = metric (2.0, 1.5). -->
+  <g transform="translate(90,65)">
+    <polygon class="Door" points="0,0 20,0 20,20 0,20"/>
+  </g>
+
+  <!-- Window on the top wall, direct rect so no transform is involved.
+       Bbox center (60,5) = metric (1.2, 0.1). -->
+  <rect class="Window" x="40" y="2" width="40" height="6"/>
+
+  <!-- Rooms inside a translate(10,10). Bedroom polygon uses a <path>
+       with absolute M/L commands to exercise the path branch of the
+       loader as well. -->
+  <g transform="translate(10,10)">
+    <!-- living_room absolute rect (10,10)..(95,140). -->
+    <polygon class="Room LivingRoom" points="0,0 85,0 85,130 0,130"/>
+    <!-- bedroom absolute rect (105,10)..(190,140). -->
+    <path class="Room Bedroom" d="M 95 0 L 180 0 L 180 130 L 95 130 Z"/>
+  </g>
+</svg>

@@ -1,0 +1,1 @@
+{"scale":{"pixels_per_meter":50},"walls":[{"start":[0,0],"end":[5,0],"thickness":0.15},{"start":[5,0],"end":[5,4],"thickness":0.15},{"start":[5,4],"end":[0,4],"thickness":0.15},{"start":[0,4],"end":[0,0],"thickness":0.15}],"doors":[],"windows":[{"position":[2.5,0],"width":1.2,"wall_index":0}],"rooms":[{"label":"bedroom","polygon":[[0,0],[5,0],[5,4],[0,4]],"area":20.0}]}

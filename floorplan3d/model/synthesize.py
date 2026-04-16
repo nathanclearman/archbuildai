@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import colorsys
+import io
 import math
 import random
 from dataclasses import dataclass, field
@@ -1897,14 +1898,83 @@ def _apply_augmentation(plan_dict: dict, rot_k: int, flip_x: bool) -> dict:
     }
 
 
+# ---------- photometric augmentation ----------
+#
+# Simulate the photo / scan / print artifacts real MLS listings accumulate
+# between the architect's CAD export and our model's eyeballs. Operates on
+# the rendered image only — the JSON targets are untouched.
+
+# Warm / cool "paper" multipliers applied to the rendered RGB. Values are
+# RGB gains (1.0 = no change). Target is a light-shift the rendered plan
+# would experience when printed or photocopied onto non-pure-white stock.
+# Kept deliberately subtle — too much tint eats contrast between wall ink
+# and room fill and makes training labels harder to attend to.
+PAPER_TINTS: tuple[tuple[float, float, float], ...] = (
+    (1.00, 0.98, 0.92),  # cream (aged office paper)
+    (0.98, 0.95, 0.88),  # manila
+    (1.00, 0.99, 0.96),  # natural white
+    (0.95, 0.97, 1.00),  # cool / blueprint-side
+    (0.97, 0.96, 0.93),  # soft gray newsprint
+)
+
+JPEG_QUALITY_RANGE: tuple[int, int] = (35, 92)
+
+P_TINT: float = 0.6
+P_JPEG: float = 0.7
+
+
+def _apply_paper_tint(img: Image.Image, rng: random.Random) -> Image.Image:
+    """Multiply each channel by a paper-color gain so the "white" areas
+    take on a warm/cool cast. Blueprint-style renders (already a strong
+    blue) are passed through unchanged — a second tint would just make
+    them muddy.
+    """
+    # Heuristic: if the darkest pixel is brighter than the median, the
+    # image has no black ink and is probably a blueprint — skip.
+    gains = rng.choice(PAPER_TINTS)
+    # Nudge each gain by up to +-2% so we don't get five discrete buckets
+    # after 10k samples.
+    gains = tuple(max(0.5, min(1.2, g * (1.0 + rng.uniform(-0.02, 0.02))))
+                  for g in gains)
+    r, g, b = img.split()
+    r = r.point(lambda v, k=gains[0]: max(0, min(255, int(v * k))))
+    g = g.point(lambda v, k=gains[1]: max(0, min(255, int(v * k))))
+    b = b.point(lambda v, k=gains[2]: max(0, min(255, int(v * k))))
+    return Image.merge("RGB", (r, g, b))
+
+
+def _apply_jpeg_roundtrip(img: Image.Image, rng: random.Random) -> Image.Image:
+    """Round-trip the image through in-memory JPEG encode/decode so the
+    model sees the 8x8 blocking + chroma-subsample ringing that shows up
+    around wall edges in every MLS / brochure floor plan."""
+    q = rng.randint(*JPEG_QUALITY_RANGE)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=q, subsampling=2)
+    buf.seek(0)
+    with Image.open(buf) as compressed:
+        return compressed.convert("RGB")
+
+
+def _augment_image(img: Image.Image, rng: random.Random) -> Image.Image:
+    """Photometric augmentation pipeline. Applied after render, before
+    disk write. Purely image-space — geometry JSON is never touched."""
+    if rng.random() < P_TINT:
+        img = _apply_paper_tint(img, rng)
+    if rng.random() < P_JPEG:
+        img = _apply_jpeg_roundtrip(img, rng)
+    return img
+
+
 def generate_one(seed: int, cfg: SynthConfig | None = None,
                  augment: bool = True):
     """Generate a single (image, plan_dict) pair.
 
     When augment=True (default), the plan is rotated by 0/90/180/270
-    degrees and optionally horizontally flipped before rendering. The
-    JSON and image stay in sync because the same transform is applied
-    to every coordinate.
+    degrees and optionally horizontally flipped before rendering, and
+    the rendered image gets a random paper tint + JPEG round-trip so
+    the model learns to ignore scan-grade noise. The JSON and image
+    stay in sync because the only geometry transform (rot/flip) is
+    applied to both; photometric aug touches pixels only.
     """
     cfg = cfg or SynthConfig()
     rng = random.Random(seed)
@@ -1921,6 +1991,8 @@ def generate_one(seed: int, cfg: SynthConfig | None = None,
     else:
         style = DEFAULT_STYLE
     img = render(plan_dict, cfg, style=style)
+    if augment:
+        img = _augment_image(img, rng)
     return img, plan_dict
 
 

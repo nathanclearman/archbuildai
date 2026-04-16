@@ -25,6 +25,15 @@ Used to expand topological diversity beyond CubiCasa5k. See arXiv 2508.14006.
 ~1,062 diverse floor plans (villas, malls, complex buildings). Used to stress
 non-Manhattan geometry.
 
+## Held-out eval: real MLS listings
+
+See `real_mls/README.md`. A small hand-labelled set of genuine listing floor
+plans the model has never seen during training. Lives under `real_mls/` as
+`{slug}.png` + `{slug}.json` pairs and is loaded via
+`dataset.RealMLSLoader` / `dataset.build_eval_set`. **Never mix into
+training** — it's the only signal we have for real-world drift vs.
+CubiCasa's cleaner European-apartment distribution.
+
 ## Annotation Target Format
 
 Each training sample converts to a single `(image, json)` pair where the JSON

@@ -354,6 +354,52 @@ class GenerateOneTest(unittest.TestCase):
             schema.validate(plan)
             schema.deserialize(schema.serialize(plan))
 
+    def test_augment_on_is_seed_deterministic(self):
+        # Same seed -> same pixels. Photometric aug must not introduce
+        # any RNG source the public seed can't reproduce.
+        a, _ = synthesize.generate_one(11, augment=True)
+        b, _ = synthesize.generate_one(11, augment=True)
+        self.assertEqual(a.tobytes(), b.tobytes())
+
+
+# ---------- photometric augmentation ----------
+
+class PhotometricAugTest(unittest.TestCase):
+    def _white(self, n=64):
+        from PIL import Image
+        return Image.new("RGB", (n, n), (255, 255, 255))
+
+    def test_paper_tint_shifts_white(self):
+        # Every entry in PAPER_TINTS has at least one channel gain < 1,
+        # so a pure-white input must come back with a non-pure-white pixel.
+        rng = random.Random(0)
+        out = synthesize._apply_paper_tint(self._white(), rng)
+        px = out.getpixel((0, 0))
+        self.assertLess(min(px), 255)
+        # ...but stay within a narrow band — tint, not posterize.
+        self.assertGreater(min(px), 200)
+
+    def test_jpeg_roundtrip_preserves_shape(self):
+        rng = random.Random(0)
+        img = self._white(128)
+        out = synthesize._apply_jpeg_roundtrip(img, rng)
+        self.assertEqual(out.size, img.size)
+        self.assertEqual(out.mode, "RGB")
+
+    def test_augment_image_is_rng_deterministic(self):
+        # Same random.Random state should produce byte-identical output.
+        img = self._white()
+        out1 = synthesize._augment_image(img.copy(), random.Random(7))
+        out2 = synthesize._augment_image(img.copy(), random.Random(7))
+        self.assertEqual(out1.tobytes(), out2.tobytes())
+
+    def test_augment_image_different_seeds_differ(self):
+        # Sanity: a different RNG should usually produce different pixels.
+        img = self._white()
+        out1 = synthesize._augment_image(img.copy(), random.Random(1))
+        out2 = synthesize._augment_image(img.copy(), random.Random(2))
+        self.assertNotEqual(out1.tobytes(), out2.tobytes())
+
 
 if __name__ == "__main__":
     unittest.main()
