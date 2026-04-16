@@ -26,6 +26,9 @@ runs/
 floorplan3d/model/data/cubicasa5k/
 floorplan3d/model/data/robin/
 floorplan3d/model/data/yolo_format/
+# Synthetic corpus — deterministic from synthesize.py, regenerate with:
+#   python floorplan3d/model/synthesize.py --out floorplan3d/model/data/synthetic --count 200 --seed 0
+floorplan3d/model/data/synthetic/
 
 # Blender
 *.blend1
