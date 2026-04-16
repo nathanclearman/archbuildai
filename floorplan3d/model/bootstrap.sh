@@ -4,7 +4,7 @@
 # Run this ONCE on a fresh Lambda or RunPod H100 pod to go from zero to
 # "training in progress" in a single command:
 #
-#   curl -sSL https://raw.githubusercontent.com/nathanclearman/archbuildai/claude/debug-detection-issues-IiUC7/floorplan3d/model/bootstrap.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/nathanclearman/archbuildai/claude/debug-detection-issues-1zk7j/floorplan3d/model/bootstrap.sh | bash
 #
 # Or, after `git clone`:
 #
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/nathanclearman/archbuildai.git}"
-BRANCH="${BRANCH:-claude/debug-detection-issues-IiUC7}"
+BRANCH="${BRANCH:-claude/debug-detection-issues-1zk7j}"
 # Use /workspace if a persistent filesystem is mounted there; otherwise
 # fall back to the user's home directory on the instance's local NVMe.
 if [ -z "${WORKDIR:-}" ]; then

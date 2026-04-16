@@ -48,7 +48,7 @@ ssh ubuntu@<your-pod-ip>
 On the pod, run the bootstrap in one line:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/nathanclearman/archbuildai/claude/debug-detection-issues-IiUC7/floorplan3d/model/bootstrap.sh | bash
+curl -sSL https://raw.githubusercontent.com/nathanclearman/archbuildai/claude/debug-detection-issues-1zk7j/floorplan3d/model/bootstrap.sh | bash
 ```
 
 That script will:
@@ -75,7 +75,7 @@ interrupting training:
 
 ```bash
 tmux new -s train
-curl -sSL https://raw.githubusercontent.com/nathanclearman/archbuildai/claude/debug-detection-issues-IiUC7/floorplan3d/model/bootstrap.sh | bash
+curl -sSL https://raw.githubusercontent.com/nathanclearman/archbuildai/claude/debug-detection-issues-1zk7j/floorplan3d/model/bootstrap.sh | bash
 # Ctrl+B then D to detach; come back later with `tmux attach -t train`
 ```
 
@@ -118,7 +118,7 @@ Environment variables you can set before running bootstrap.sh:
 
 | Var            | Default                             | What it does |
 |----------------|-------------------------------------|--------------|
-| `BRANCH`       | `claude/debug-detection-issues-IiUC7` | Git branch to check out |
+| `BRANCH`       | `claude/debug-detection-issues-1zk7j` | Git branch to check out |
 | `SYNTH_COUNT`  | `10000`                             | Number of synthetic plans |
 | `EPOCHS`       | `2`                                 | Training epochs |
 | `BASE_MODEL`   | `Qwen/Qwen2.5-VL-7B-Instruct`       | Base model (try `Qwen/Qwen2.5-VL-3B-Instruct` for a cheaper smoke test) |

@@ -57,6 +57,7 @@ class TrainConfig:
     warmup_ratio: float = 0.03
     save_steps: int = 500
     logging_steps: int = 10
+    dataloader_num_workers: int = 2
     seed: int = 0
 
 
@@ -188,7 +189,14 @@ def main():
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
-    model = prepare_model_for_kbit_training(model)
+    # gradient_checkpointing saves activations by re-running forward on
+    # backward, which is incompatible with the KV cache. Leaving use_cache
+    # on triggers a per-step warning from transformers and in some
+    # versions a silent correctness bug. Disable explicitly.
+    model.config.use_cache = False
+    model = prepare_model_for_kbit_training(
+        model, use_gradient_checkpointing=True
+    )
 
     lora = LoraConfig(
         r=cfg.lora_r,
@@ -219,17 +227,28 @@ def main():
             return format_conversation(self.processor, image, s.target_json, self.max_length)
 
     def data_collator(batch):
-        # Training batch of 1 is the common case for VLM QLoRA; pad manually
-        # if batch_size > 1.
+        # Processor already produced tensors with a leading batch dim of 1
+        # in __getitem__, so a single-example batch is ready to go as-is.
+        # Squeezing would drop that dim and crash the model's forward on
+        # step 1 — the kind of bug that silently runs on a dry CPU smoke
+        # but turns a cloud pod into $5-of-nothing.
         if len(batch) == 1:
-            return {k: v.squeeze(0) if hasattr(v, "squeeze") else v for k, v in batch[0].items()}
+            return batch[0]
         keys = batch[0].keys()
         out = {}
         for k in keys:
             vals = [b[k] for b in batch]
-            out[k] = torch.nn.utils.rnn.pad_sequence(
-                [v.squeeze(0) for v in vals], batch_first=True, padding_value=0
-            )
+            # Text tensors have shape [1, seq_len] from the processor; drop
+            # the batch-of-1 so pad_sequence can stack to [B, max_len].
+            # pixel_values / image_grid_thw are passed through because Qwen
+            # flattens patches across the batch with per-image grids, and
+            # pad_sequence would corrupt that layout.
+            if k in ("input_ids", "attention_mask", "labels"):
+                out[k] = torch.nn.utils.rnn.pad_sequence(
+                    [v.squeeze(0) for v in vals], batch_first=True, padding_value=0
+                )
+            else:
+                out[k] = torch.cat(vals, dim=0) if hasattr(vals[0], "shape") else vals
         return out
 
     training_args = TrainingArguments(
@@ -244,6 +263,11 @@ def main():
         save_total_limit=3,
         bf16=True,
         gradient_checkpointing=True,
+        # Overlap image decode + thumbnail with the GPU step. 0 (default)
+        # serializes everything on the main process and bottlenecks the
+        # H100 on PIL; 2 is enough for a single-GPU VLM job and avoids
+        # worker-fork overhead that larger values impose.
+        dataloader_num_workers=cfg.dataloader_num_workers,
         report_to="none",
         remove_unused_columns=False,
         seed=cfg.seed,
