@@ -83,6 +83,33 @@ class Plan:
     rooms: list[Room]
     footprint: tuple[float, float]  # overall width, height in meters
     exterior_door: tuple[str, float] | None = None  # (room_label, side) where side ∈ {N,S,E,W}
+    # Bay-window protrusions attached to exterior walls. Post-process
+    # artifacts: templates build rect rooms first, then bays are added
+    # in generate_one for the fraction of samples that should have
+    # them. Kept as a Plan field (rather than a Room field) so the
+    # pipeline stage that consumes them — plan_to_schema — can iterate
+    # without having to scan every room.
+    bays: list["BayWindow"] = field(default_factory=list)
+
+
+@dataclass
+class BayWindow:
+    """A trapezoidal bump-out on one exterior side of a room.
+
+    Geometry:
+        base_width    — length along the host wall (typically 2.2–3.0 m)
+        depth         — how far it protrudes outward (typically 0.5–0.9 m)
+        top_ratio     — top_width / base_width; 0.55 gives the classic
+                        45-degree-ish look
+        center_t      — 0..1 position of the bay midpoint along the host
+                        side, measured from the side's low-coord end
+    """
+    room_label: str
+    side: str          # "N" | "S" | "E" | "W"
+    center_t: float
+    base_width: float
+    depth: float
+    top_ratio: float = 0.55
 
 
 # ---------- templates ----------
@@ -777,6 +804,26 @@ def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
     # references the wall list.
     walls = _filter_internal_walls(walls, plan)
 
+    # Apply bays: for each BayWindow, remove the host wall segment and
+    # insert three new walls (left skirt, top, right skirt) plus one
+    # window on each. Order matters — we look up the host rect by label.
+    bay_windows_preplaced: list[dict] = []
+    for bay in plan.bays:
+        host = _find_room(plan, bay.room_label)
+        if host is None:
+            continue
+        before_len = len(walls)
+        walls = _apply_bay_to_walls(walls, host.rect, bay, thickness=0.15)
+        # The three bay walls are the last 3 entries we just appended;
+        # capture them by geometry for later window placement.
+        base_lo, top_lo, top_hi, base_hi = _bay_corners(host.rect, bay)
+        bay_windows_preplaced.extend(_bay_window_on_walls(
+            walls,
+            bay_wall_starts=[base_lo, top_lo, top_hi],
+            bay_wall_ends=[top_lo, top_hi, base_hi],
+        ))
+        del before_len
+
     # 2. Doors: declared room-to-room connections.
     # Each door is snapped onto the actual wall segment it belongs to: the
     # wall graph is now subdivided at T-junctions, so the nearest wall may
@@ -883,19 +930,33 @@ def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
                     "wall_index": wall_idx,
                 })
 
-    rooms_out = [
-        {
-            "label": r.label,
-            "polygon": [
+    # Bay-window-pre-placed entries go first; regular exterior-wall windows
+    # are appended after and may still be filtered by the usual clash check
+    # against doors. Bay windows never clash with anything — the wall
+    # they sit on was just introduced by _apply_bay_to_walls.
+    windows = bay_windows_preplaced + windows
+
+    bays_by_room: dict[str, list[BayWindow]] = {}
+    for b in plan.bays:
+        bays_by_room.setdefault(b.room_label, []).append(b)
+
+    rooms_out = []
+    for r in plan.rooms:
+        if r.label in bays_by_room:
+            polygon = _room_polygon_with_bays(r.rect, bays_by_room[r.label])
+        else:
+            polygon = [
                 [r.rect[0], r.rect[1]],
                 [r.rect[0] + r.rect[2], r.rect[1]],
                 [r.rect[0] + r.rect[2], r.rect[1] + r.rect[3]],
                 [r.rect[0], r.rect[1] + r.rect[3]],
-            ],
-            "area": round(r.rect[2] * r.rect[3], 2),
-        }
-        for r in plan.rooms
-    ]
+            ]
+        # Area: the rect plus each bay's trapezoid (½ · (a + b) · h).
+        area = r.rect[2] * r.rect[3]
+        for b in bays_by_room.get(r.label, []):
+            top = b.base_width * b.top_ratio
+            area += 0.5 * (b.base_width + top) * b.depth
+        rooms_out.append({"label": r.label, "polygon": polygon, "area": round(area, 2)})
 
     return FloorPlan(
         walls=walls,
@@ -1011,6 +1072,182 @@ def _build_walls(plan: Plan, thickness: float = 0.15, coord_precision: int = 3) 
 
 
 CIRCULATION_LABELS = {"hallway", "foyer", "mudroom"}
+
+
+# ---------- bay windows ----------
+#
+# Bays are applied as a post-process to the rect-based wall graph:
+# _build_walls produces a flat list of axis-aligned walls, then each
+# BayWindow surgically replaces the host wall segment with five walls
+# (two skirts + two angles + top) and inserts three pre-placed windows
+# on the three new exterior faces. The room polygon is augmented in
+# plan_to_schema so render() sees the protrusion in both the fill and
+# the wall-stroke passes.
+
+def _bay_corners(rect: tuple[float, float, float, float],
+                 bay: BayWindow) -> tuple[tuple[float, float], ...]:
+    """Return (base_lo, top_lo, top_hi, base_hi) in world coords.
+
+    `base_lo`/`base_hi` lie on the host exterior wall; `top_lo`/`top_hi`
+    are the outer trapezoid corners. Ordering along each pair is the
+    side's natural lo-to-hi direction (west-to-east for N/S,
+    north-to-south for E/W) so downstream loops can stitch without
+    resorting each bay."""
+    x, y, w, h = rect
+    bw = bay.base_width
+    tw = bay.base_width * bay.top_ratio
+    d = bay.depth
+    if bay.side in ("N", "S"):
+        cx = x + bay.center_t * w
+        y_base = y if bay.side == "N" else y + h
+        y_top = y_base - d if bay.side == "N" else y_base + d
+        return (
+            (cx - bw / 2, y_base),
+            (cx - tw / 2, y_top),
+            (cx + tw / 2, y_top),
+            (cx + bw / 2, y_base),
+        )
+    else:  # E / W
+        cy = y + bay.center_t * h
+        x_base = x if bay.side == "W" else x + w
+        x_top = x_base - d if bay.side == "W" else x_base + d
+        return (
+            (x_base, cy - bw / 2),
+            (x_top, cy - bw / 2),
+            (x_top, cy + bw / 2),
+            (x_base, cy + bw / 2),
+        )
+
+
+def _apply_bay_to_walls(walls: list[dict], rect: tuple[float, float, float, float],
+                        bay: BayWindow, thickness: float) -> list[dict]:
+    """Return a new walls list with `bay` applied to `rect`.
+
+    The host wall's exterior segment between the two base corners is
+    removed (there may be multiple collinear walls covering it, due to
+    the T-junction subdivision in _build_walls); three new walls — left
+    skirt, top, right skirt — replace it. Walls that only partially
+    overlap the bay base are trimmed rather than dropped."""
+    base_lo, top_lo, top_hi, base_hi = _bay_corners(rect, bay)
+    horizontal = bay.side in ("N", "S")
+    line_coord = base_lo[1] if horizontal else base_lo[0]
+    lo = base_lo[0] if horizontal else base_lo[1]
+    hi = base_hi[0] if horizontal else base_hi[1]
+
+    def on_line(w: dict) -> bool:
+        s, e = w["start"], w["end"]
+        if horizontal:
+            return abs(s[1] - line_coord) < 1e-6 and abs(e[1] - line_coord) < 1e-6
+        return abs(s[0] - line_coord) < 1e-6 and abs(e[0] - line_coord) < 1e-6
+
+    def span(w: dict) -> tuple[float, float]:
+        a = w["start"][0] if horizontal else w["start"][1]
+        b = w["end"][0] if horizontal else w["end"][1]
+        return (min(a, b), max(a, b))
+
+    out: list[dict] = []
+    for w in walls:
+        if not on_line(w):
+            out.append(w)
+            continue
+        s_lo, s_hi = span(w)
+        # No overlap with the bay base range — leave as is.
+        if s_hi <= lo + 1e-6 or s_lo >= hi - 1e-6:
+            out.append(w)
+            continue
+        # Trim the portion that lies outside [lo, hi], if any.
+        if s_lo < lo - 1e-6:
+            out.append(_seg(horizontal, line_coord, s_lo, lo, thickness))
+        if s_hi > hi + 1e-6:
+            out.append(_seg(horizontal, line_coord, hi, s_hi, thickness))
+        # The segment inside [lo, hi] is swallowed by the bay and dropped.
+
+    # Three new walls: left skirt, top, right skirt. We emit them in the
+    # order the outer perimeter would traverse (lo → top_lo → top_hi → hi)
+    # so any downstream consumer that expects perimeter order still works.
+    out.append({"start": list(base_lo), "end": list(top_lo), "thickness": thickness})
+    out.append({"start": list(top_lo),  "end": list(top_hi), "thickness": thickness})
+    out.append({"start": list(top_hi),  "end": list(base_hi), "thickness": thickness})
+    return out
+
+
+def _seg(horizontal: bool, line_coord: float, lo: float, hi: float,
+         thickness: float) -> dict:
+    if horizontal:
+        return {"start": [lo, line_coord], "end": [hi, line_coord], "thickness": thickness}
+    return {"start": [line_coord, lo], "end": [line_coord, hi], "thickness": thickness}
+
+
+def _bay_window_on_walls(walls: list[dict], bay_wall_starts: list[tuple[float, float]],
+                         bay_wall_ends: list[tuple[float, float]]) -> list[dict]:
+    """Find the wall indices that match each (start, end) pair and emit
+    a centered window on each. Called after _apply_bay_to_walls has
+    inserted the three bay walls; we locate them by endpoint match
+    rather than by position in the list because downstream filters
+    (_filter_internal_walls) could reorder.
+    """
+    out: list[dict] = []
+    for start, end in zip(bay_wall_starts, bay_wall_ends):
+        for i, w in enumerate(walls):
+            if (_pt_eq(w["start"], start) and _pt_eq(w["end"], end)) or (
+                _pt_eq(w["start"], end) and _pt_eq(w["end"], start)):
+                wlen = math.hypot(end[0] - start[0], end[1] - start[1])
+                win_width = round(max(0.6, wlen * 0.7), 2)
+                cx = (start[0] + end[0]) / 2
+                cy = (start[1] + end[1]) / 2
+                out.append({
+                    "position": [round(cx, 2), round(cy, 2)],
+                    "width": win_width,
+                    "wall_index": i,
+                })
+                break
+    return out
+
+
+def _pt_eq(a, b, tol: float = 1e-6) -> bool:
+    return abs(a[0] - b[0]) < tol and abs(a[1] - b[1]) < tol
+
+
+def _room_polygon_with_bays(rect: tuple[float, float, float, float],
+                            bays: list[BayWindow]) -> list[list[float]]:
+    """Walk the rect perimeter in CCW-screen-space order (same as the
+    existing rect fallback) and insert bay vertices where each bay
+    sits on its host side. Bays on the same side are emitted in the
+    side's natural traversal direction so the polygon stays simple."""
+    x, y, w, h = rect
+    corners = {
+        "N": [(x, y), (x + w, y)],
+        "E": [(x + w, y), (x + w, y + h)],
+        "S": [(x + w, y + h), (x, y + h)],
+        "W": [(x, y + h), (x, y)],
+    }
+    by_side: dict[str, list[BayWindow]] = {"N": [], "E": [], "S": [], "W": []}
+    for b in bays:
+        by_side[b.side].append(b)
+
+    def bay_keypoints(b: BayWindow) -> list[tuple[float, float]]:
+        base_lo, top_lo, top_hi, base_hi = _bay_corners(rect, b)
+        # Screen-CCW traversal order:
+        # N goes W→E (base_lo is west, base_hi is east)  — insert as-is
+        # E goes N→S (base_lo is north, base_hi is south) — insert as-is
+        # S goes E→W (need base_hi first, then top_hi, top_lo, base_lo)
+        # W goes S→N (need base_hi first, then top_hi, top_lo, base_lo)
+        if b.side in ("N", "E"):
+            return [base_lo, top_lo, top_hi, base_hi]
+        return [base_hi, top_hi, top_lo, base_lo]
+
+    poly: list[tuple[float, float]] = []
+    for side in ("N", "E", "S", "W"):
+        side_start, side_end = corners[side]
+        poly.append(side_start)
+        bays_here = sorted(by_side[side],
+                           key=lambda b: b.center_t if side in ("N", "E")
+                                         else 1 - b.center_t)
+        for b in bays_here:
+            poly.extend(bay_keypoints(b))
+        # side_end becomes the next side's side_start — omit to avoid dupes.
+    # Close: the first vertex (N side_start) is already there; nothing to do.
+    return [[round(p[0], 3), round(p[1], 3)] for p in poly]
 
 
 def _filter_internal_walls(walls: list[dict], plan: Plan,
@@ -2069,6 +2306,65 @@ P_TITLE_BLOCK: float = 0.35
 P_WATERMARK: float = 0.15
 P_DIMENSIONS: float = 0.6
 
+# Bay windows are common but not universal — roughly a third of
+# mid-century and newer US plans have at least one. Picked 0.35 so a
+# meaningful fraction of training samples exercise the angled-wall
+# geometry without every plan looking like a Victorian.
+P_BAY: float = 0.35
+
+
+# ---------- bay-window attachment ----------
+#
+# Bays only make sense on exterior walls long enough to host a 2+ m
+# bump-out, and only on rooms where the bay makes architectural sense
+# (public rooms and bedrooms, never service rooms like closets).
+_BAY_ELIGIBLE_ROOMS = {
+    "great_room", "living_room", "family_room", "dining_room",
+    "master_bedroom", "bedroom", "den", "office",
+    # also reasonable: breakfast nook = "kitchen" with a small bay
+    "kitchen",
+}
+
+
+def _maybe_attach_bay(plan: Plan, rng: random.Random) -> None:
+    """Mutate `plan` in place: with some probability, add a single bay
+    window to a random eligible exterior side of an eligible room.
+    No-op if no room qualifies, so small templates (studio etc.) stay
+    untouched."""
+    if rng.random() >= P_BAY:
+        return
+    fw, fh = plan.footprint
+    candidates: list[tuple[Room, str, float]] = []  # (room, side, side_length)
+    for r in plan.rooms:
+        if r.label not in _BAY_ELIGIBLE_ROOMS:
+            continue
+        _, _, w, h = r.rect
+        for side in ("N", "S", "E", "W"):
+            if not _edge_is_exterior(r.rect, side, fw, fh):
+                continue
+            side_len = w if side in ("N", "S") else h
+            # Need ~2.4 m for a reasonable bay plus 0.3 m skirt each end.
+            if side_len < 3.0:
+                continue
+            candidates.append((r, side, side_len))
+    if not candidates:
+        return
+    host, side, side_len = rng.choice(candidates)
+    base_width = round(rng.uniform(2.2, min(3.0, side_len - 0.6)), 2)
+    # center_t kept away from the corners so we always leave >=0.3 m
+    # skirt on each side.
+    min_t = (base_width / 2 + 0.3) / side_len
+    max_t = 1 - min_t
+    center_t = round(rng.uniform(min_t, max_t), 3)
+    depth = round(rng.uniform(0.55, 0.85), 2)
+    plan.bays.append(BayWindow(
+        room_label=host.label,
+        side=side,
+        center_t=center_t,
+        base_width=base_width,
+        depth=depth,
+    ))
+
 
 def _apply_paper_tint(img: Image.Image, rng: random.Random) -> Image.Image:
     """Multiply each channel by a paper-color gain so the "white" areas
@@ -2154,6 +2450,8 @@ def generate_one(seed: int, cfg: SynthConfig | None = None,
     rng = random.Random(seed)
     template = rng.choice(TEMPLATES)
     plan = template(rng)
+    if augment:
+        _maybe_attach_bay(plan, rng)
     plan_dict = plan_to_schema(plan, rng)
     show_dimensions = False
     title_block: str | None = None

@@ -22,15 +22,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "model"))
 import schema  # type: ignore
 import synthesize  # type: ignore
 from synthesize import (  # type: ignore
+    BayWindow,
     Plan,
     Room,
     STYLES,
     TEMPLATES,
     _apply_augmentation,
+    _apply_bay_to_walls,
+    _bay_corners,
     _build_walls,
     _filter_internal_walls,
     _fixture_rect,
+    _maybe_attach_bay,
     _pick_swing_target,
+    _room_polygon_with_bays,
     _snap_door_to_wall,
     _swing_vector_into_room,
     _wall_unit_vector,
@@ -472,6 +477,181 @@ class OverlayTest(unittest.TestCase):
         b = synthesize.render(self.plan, self.cfg, show_dimensions=True,
                               title_block="FLOOR PLAN", watermark="DRAFT")
         self.assertEqual(a.tobytes(), b.tobytes())
+
+
+# ---------- bay windows ----------
+
+class BayWindowGeometryTest(unittest.TestCase):
+    def test_north_bay_corners_protrude_outward(self):
+        # Room at (0, 0, 6, 4). A bay on N with center_t=0.5, base=2.4,
+        # depth=0.75, top_ratio=0.55 should produce:
+        #   base_lo (1.8, 0)
+        #   top_lo  (2.34, -0.75)
+        #   top_hi  (3.66, -0.75)
+        #   base_hi (4.2, 0)
+        rect = (0.0, 0.0, 6.0, 4.0)
+        bay = BayWindow("great_room", "N", 0.5, 2.4, 0.75, 0.55)
+        base_lo, top_lo, top_hi, base_hi = _bay_corners(rect, bay)
+        self.assertAlmostEqual(base_lo[0], 1.8, places=3)
+        self.assertAlmostEqual(base_lo[1], 0.0, places=3)
+        self.assertAlmostEqual(top_lo[0],  2.34, places=3)
+        self.assertAlmostEqual(top_lo[1], -0.75, places=3)
+        self.assertAlmostEqual(top_hi[0],  3.66, places=3)
+        self.assertAlmostEqual(top_hi[1], -0.75, places=3)
+        self.assertAlmostEqual(base_hi[0], 4.2, places=3)
+        self.assertAlmostEqual(base_hi[1], 0.0, places=3)
+
+    def test_east_bay_protrudes_east(self):
+        rect = (0.0, 0.0, 4.0, 6.0)
+        bay = BayWindow("living_room", "E", 0.5, 2.4, 0.75, 0.55)
+        base_lo, top_lo, top_hi, base_hi = _bay_corners(rect, bay)
+        # Base corners stay on x=4 (the east wall).
+        self.assertAlmostEqual(base_lo[0], 4.0, places=3)
+        self.assertAlmostEqual(base_hi[0], 4.0, places=3)
+        # Top corners protrude east (x > 4).
+        self.assertGreater(top_lo[0], 4.0)
+        self.assertGreater(top_hi[0], 4.0)
+
+
+class ApplyBayToWallsTest(unittest.TestCase):
+    def test_replaces_host_segment_with_three_walls(self):
+        # Single rect room 6x4, walls built naturally.
+        plan = Plan(rooms=[Room("great_room", (0, 0, 6, 4))], footprint=(6, 4))
+        walls = _build_walls(plan)
+        n_before = len(walls)
+        bay = BayWindow("great_room", "N", 0.5, 2.4, 0.75, 0.55)
+        walls_after = _apply_bay_to_walls(walls, (0, 0, 6, 4), bay, thickness=0.15)
+        # N wall was one segment spanning [0,6]. It should now be two
+        # skirt walls (0..1.8 and 4.2..6) plus three new bay walls —
+        # so the total count rises from n_before to n_before+4
+        # (one removed, five added).
+        self.assertEqual(len(walls_after), n_before + 4)
+
+    def test_does_not_touch_walls_on_other_sides(self):
+        plan = Plan(rooms=[Room("great_room", (0, 0, 6, 4))], footprint=(6, 4))
+        walls = _build_walls(plan)
+        bay = BayWindow("great_room", "N", 0.5, 2.4, 0.75, 0.55)
+        walls_after = _apply_bay_to_walls(walls, (0, 0, 6, 4), bay, thickness=0.15)
+        # S / E / W walls should survive untouched.
+        def present(wanted_start, wanted_end):
+            for w in walls_after:
+                if (w["start"] == list(wanted_start) and w["end"] == list(wanted_end)) \
+                   or (w["start"] == list(wanted_end) and w["end"] == list(wanted_start)):
+                    return True
+            return False
+        self.assertTrue(present((0, 4), (6, 4)))  # south
+        self.assertTrue(present((0, 0), (0, 4)))  # west
+        self.assertTrue(present((6, 0), (6, 4)))  # east
+
+    def test_top_wall_is_parallel_to_host_side(self):
+        rect = (0, 0, 6, 4)
+        bay = BayWindow("great_room", "N", 0.5, 2.4, 0.75, 0.55)
+        plan = Plan(rooms=[Room("great_room", rect)], footprint=(6, 4))
+        walls = _apply_bay_to_walls(_build_walls(plan), rect, bay, thickness=0.15)
+        # Top wall on N bay lies at y = -depth and is horizontal.
+        tops = [w for w in walls
+                if abs(w["start"][1] + 0.75) < 1e-3 and abs(w["end"][1] + 0.75) < 1e-3]
+        self.assertEqual(len(tops), 1)
+
+
+class RoomPolygonWithBaysTest(unittest.TestCase):
+    def test_rect_polygon_extended_with_bay_vertices(self):
+        rect = (0, 0, 6, 4)
+        bay = BayWindow("r", "N", 0.5, 2.4, 0.75, 0.55)
+        poly = _room_polygon_with_bays(rect, [bay])
+        # 4 original corners + 4 bay vertices = 8.
+        self.assertEqual(len(poly), 8)
+        # Every bay corner must appear.
+        bay_pts = [list(p) for p in _bay_corners(rect, bay)]
+        for p in bay_pts:
+            self.assertIn([round(p[0], 3), round(p[1], 3)], poly)
+
+    def test_polygon_min_bound_shifts_for_north_bay(self):
+        # A north bay makes the polygon extend upward (smaller y).
+        rect = (0, 0, 6, 4)
+        bay = BayWindow("r", "N", 0.5, 2.4, 0.75, 0.55)
+        poly = _room_polygon_with_bays(rect, [bay])
+        min_y = min(p[1] for p in poly)
+        self.assertAlmostEqual(min_y, -0.75, places=3)
+
+
+class PlanToSchemaBayTest(unittest.TestCase):
+    def test_bay_grows_wall_and_window_counts(self):
+        rect = (0, 0, 8, 5)
+        bay = BayWindow("great_room", "S", 0.5, 2.6, 0.7, 0.55)
+        plan_no_bay = Plan(rooms=[Room("great_room", rect)], footprint=(8, 5))
+        plan_bay = Plan(rooms=[Room("great_room", rect)], footprint=(8, 5), bays=[bay])
+        rng = random.Random(0)
+        d_no = synthesize.plan_to_schema(plan_no_bay, rng)
+        rng = random.Random(0)
+        d_yes = synthesize.plan_to_schema(plan_bay, rng)
+        # More walls (5 - 1 = 4 extra) and at least three more windows
+        # (pre-placed bay windows).
+        self.assertGreaterEqual(len(d_yes["walls"]) - len(d_no["walls"]), 3)
+        self.assertGreaterEqual(len(d_yes["windows"]) - len(d_no["windows"]), 3)
+
+    def test_bay_room_area_grows(self):
+        rect = (0, 0, 8, 5)
+        bay = BayWindow("great_room", "S", 0.5, 2.6, 0.7, 0.55)
+        plan = Plan(rooms=[Room("great_room", rect)], footprint=(8, 5), bays=[bay])
+        d = synthesize.plan_to_schema(plan, random.Random(0))
+        base_area = 8 * 5
+        # Trapezoid: ½ · (base + top) · depth = ½ · (2.6 + 2.6*0.55) · 0.7
+        trap_area = 0.5 * (2.6 + 2.6 * 0.55) * 0.7
+        self.assertAlmostEqual(d["rooms"][0]["area"], round(base_area + trap_area, 2),
+                               places=2)
+
+    def test_plan_to_schema_bay_validates(self):
+        rect = (0, 0, 8, 5)
+        bay = BayWindow("great_room", "E", 0.5, 2.2, 0.6, 0.55)
+        plan = Plan(rooms=[Room("great_room", rect)], footprint=(8, 5), bays=[bay])
+        d = synthesize.plan_to_schema(plan, random.Random(0))
+        schema.validate(d)
+        schema.deserialize(schema.serialize(d))
+
+
+class MaybeAttachBayTest(unittest.TestCase):
+    def test_no_op_when_roll_fails(self):
+        # Seeding the rng so rng.random() yields a value >= P_BAY
+        # leaves plan.bays empty. Find such a seed.
+        for seed in range(200):
+            rng = random.Random(seed)
+            if rng.random() >= synthesize.P_BAY:
+                rng = random.Random(seed)
+                plan = synthesize.ranch_open_concept(rng)
+                _maybe_attach_bay(plan, rng)
+                self.assertEqual(plan.bays, [], f"seed {seed} should not attach")
+                return
+        self.fail("no failing roll found — P_BAY suspiciously high")
+
+    def test_attached_bay_targets_eligible_room(self):
+        # Force a success roll by patching rng. Drive with a seed where
+        # the first rng.random() returns < P_BAY.
+        for seed in range(200):
+            rng = random.Random(seed)
+            plan = synthesize.ranch_open_concept(rng)
+            _maybe_attach_bay(plan, rng)
+            if plan.bays:
+                b = plan.bays[0]
+                self.assertIn(b.room_label, synthesize._BAY_ELIGIBLE_ROOMS)
+                self.assertIn(b.side, ("N", "S", "E", "W"))
+                self.assertGreaterEqual(b.base_width, 2.2)
+                self.assertLessEqual(b.base_width, 3.0)
+                return
+        self.fail("no successful roll in 200 seeds — P_BAY suspiciously low")
+
+    def test_generate_one_with_bay_still_validates(self):
+        # Sweep enough seeds that at least one hits P_BAY and produces a
+        # bay-laden plan; every output must still validate.
+        found_bay = False
+        for seed in range(60):
+            _, plan = synthesize.generate_one(seed)
+            schema.validate(plan)
+            schema.deserialize(schema.serialize(plan))
+            # Rough detection: a bay bumps the polygon vertex count > 4.
+            if any(len(r["polygon"]) > 4 for r in plan["rooms"]):
+                found_bay = True
+        self.assertTrue(found_bay, "no bay ever attached in 60 seeds")
 
 
 if __name__ == "__main__":
