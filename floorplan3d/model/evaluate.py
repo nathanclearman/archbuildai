@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -153,7 +154,7 @@ def match_rooms(pred: list[dict], gt: list[dict]) -> list[tuple[int, int, float]
 def _wall_length(w: dict) -> float:
     sx, sy = w["start"]
     ex, ey = w["end"]
-    return ((ex - sx) ** 2 + (ey - sy) ** 2) ** 0.5
+    return math.hypot(ex - sx, ey - sy)
 
 
 def _total_wall_length(walls: list[dict]) -> float:
@@ -331,7 +332,12 @@ def copy_predictor(samples: Iterable[Sample]) -> Predictor:
     """
     gt_by_path: dict[str, dict] = {}
     for s in samples:
-        gt_by_path[str(Path(s.image_path).resolve())] = json.loads(s.target_json)
+        key = str(Path(s.image_path).resolve())
+        # Symlink collisions would silently keep only the last GT. Loud
+        # here is better than a confusing partial-match downstream.
+        if key in gt_by_path:
+            raise ValueError(f"copy_predictor: two samples resolve to {key}")
+        gt_by_path[key] = json.loads(s.target_json)
 
     def _predict(image_path: str) -> Plan:
         key = str(Path(image_path).resolve())
@@ -365,10 +371,12 @@ def cv_predictor(_samples: Iterable[Sample] | None = None, ppm: float = 50.0) ->
 
 
 def vlm_predictor(_samples: Iterable[Sample] | None = None,
-                  weights_dir: Path | str = "model/weights") -> Predictor:
-    """Fine-tuned VLM predictor. Same lazy-import discipline as cv."""
+                  weights_dir: Path | str | None = None) -> Predictor:
+    """Fine-tuned VLM predictor. Same lazy-import discipline as cv.
+    Default weights dir is resolved relative to this file, not CWD, so
+    direct callers don't get surprised by CWD-sensitive path resolution."""
     from inference import run_vlm  # type: ignore
-    weights = Path(weights_dir)
+    weights = Path(weights_dir) if weights_dir is not None else Path(__file__).parent / "weights"
 
     def _predict(image_path: str) -> Plan:
         return run_vlm(image_path, weights)
