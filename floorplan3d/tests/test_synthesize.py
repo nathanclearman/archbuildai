@@ -398,6 +398,31 @@ class PhotometricAugTest(unittest.TestCase):
         self.assertEqual(out.size, img.size)
         self.assertEqual(out.mode, "RGB")
 
+    def test_fold_crease_preserves_shape_and_mode(self):
+        rng = random.Random(0)
+        img = self._white(128)
+        out = synthesize._apply_fold_crease(img, rng)
+        self.assertEqual(out.size, img.size)
+        self.assertEqual(out.mode, "RGB")
+
+    def test_fold_crease_darkens_some_pixels(self):
+        # A pure-white input must come back with at least some pixels
+        # below 255 — otherwise the fold didn't render at all.
+        rng = random.Random(1)
+        out = synthesize._apply_fold_crease(self._white(128), rng)
+        darkened = sum(1 for p in out.getdata() if min(p) < 250)
+        self.assertGreater(darkened, 0)
+
+    def test_fold_crease_is_rng_deterministic(self):
+        a = synthesize._apply_fold_crease(self._white(), random.Random(5))
+        b = synthesize._apply_fold_crease(self._white(), random.Random(5))
+        self.assertEqual(a.tobytes(), b.tobytes())
+
+    def test_fold_crease_different_seeds_produce_different_folds(self):
+        a = synthesize._apply_fold_crease(self._white(), random.Random(1))
+        b = synthesize._apply_fold_crease(self._white(), random.Random(2))
+        self.assertNotEqual(a.tobytes(), b.tobytes())
+
     def test_grayscale_collapses_chroma(self):
         # A red-only RGB input should come back with R == G == B after
         # the grayscale pass (luminance conversion).

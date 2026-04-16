@@ -2499,6 +2499,11 @@ P_TINT: float = 0.6
 P_JPEG: float = 0.7
 P_SKEW: float = 0.5
 P_GRAYSCALE: float = 0.15
+# Fold / binder crease. Moderate probability — plenty of listings come
+# from scanned paper but plenty don't. 0.2 gives enough positive
+# samples to stop the model from treating every linear dark streak as
+# a wall.
+P_FOLD: float = 0.2
 P_TITLE_BLOCK: float = 0.35
 P_WATERMARK: float = 0.15
 P_DIMENSIONS: float = 0.6
@@ -2627,6 +2632,66 @@ def _apply_grayscale(img: Image.Image) -> Image.Image:
     return ImageOps.grayscale(img).convert("RGB")
 
 
+def _apply_fold_crease(img: Image.Image, rng: random.Random) -> Image.Image:
+    """Darken a soft line across the image to simulate a physical fold
+    or binder crease picked up by a scanner. Orientation is 70%
+    axis-aligned (horizontal or vertical fold) and 30% diagonal — the
+    diagonal case covers off-axis document placement and book-spine
+    gutters.
+
+    Why this matters for training: a dark line is exactly what the
+    model spends most of its capacity identifying (walls). Without a
+    crease class in the photometric aug, the model would learn that
+    "any linear dark streak means wall", which a real scanned listing
+    would immediately falsify. Subtle but adversarial — the fold is
+    softer (gaussian-blurred) and narrower than a real wall stroke,
+    but the model needs supervision on the distinction.
+    """
+    from PIL import ImageFilter
+    w, h = img.size
+    mask = Image.new("L", (w, h), 0)
+    mdraw = ImageDraw.Draw(mask)
+
+    # Peak darkness in the mask (0..255). Low values keep the crease
+    # subtle enough that geometry remains legible through it.
+    peak = rng.randint(90, 170)
+
+    orient = rng.choices(
+        ["horizontal", "vertical", "diagonal"],
+        weights=[0.35, 0.35, 0.30], k=1,
+    )[0]
+
+    if orient == "horizontal":
+        # Central 60 % of the height — folds near the edges are rare
+        # because the canvas margin already lives there.
+        y = rng.randint(h // 5, 4 * h // 5)
+        mdraw.line([(0, y), (w, y)], fill=peak, width=2)
+    elif orient == "vertical":
+        x = rng.randint(w // 5, 4 * w // 5)
+        mdraw.line([(x, 0), (x, h)], fill=peak, width=2)
+    else:
+        # Diagonal: random offset, either TL→BR or TR→BL.
+        offset = rng.randint(-w // 3, w // 3)
+        if rng.random() < 0.5:
+            mdraw.line([(0, offset), (w, h + offset)], fill=peak, width=2)
+        else:
+            mdraw.line([(w, offset), (0, h + offset)], fill=peak, width=2)
+
+    # Gaussian blur gives the line a soft falloff instead of a 2-px hard
+    # edge — the resulting darkening band is ~2 * radius pixels wide.
+    # Radius scales with canvas size so the look is consistent across
+    # 300 / 900 / 1200 px renders.
+    radius = max(2.0, h / 200.0)
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=radius))
+
+    # Composite a dark ink through the mask. A near-black fill plus a
+    # ~50 % peak-alpha mask produces a multiplicative-looking effect:
+    # where the mask is strong the original pixel blends toward black;
+    # elsewhere the original shows through untouched.
+    dark = Image.new("RGB", (w, h), (15, 15, 15))
+    return Image.composite(dark, img, mask)
+
+
 def _augment_image(img: Image.Image, rng: random.Random,
                    bg_color: tuple[int, int, int] = (255, 255, 255)
                    ) -> Image.Image:
@@ -2636,6 +2701,8 @@ def _augment_image(img: Image.Image, rng: random.Random,
         img = _apply_paper_tint(img, rng)
     if rng.random() < P_SKEW:
         img = _apply_small_skew(img, rng, bg_color)
+    if rng.random() < P_FOLD:
+        img = _apply_fold_crease(img, rng)
     if rng.random() < P_GRAYSCALE:
         img = _apply_grayscale(img)
     if rng.random() < P_JPEG:
