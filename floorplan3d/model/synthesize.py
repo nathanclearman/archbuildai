@@ -1652,12 +1652,20 @@ def _render_window(draw, window, walls, *, bg, color_a, color_b,
     draw.line([end_a, end_b], fill=color_b, width=1)
 
 
-def _render_labels(draw, plan_dict, text_color, ppm, to_px) -> None:
+def _render_labels(draw, plan_dict, text_color, ppm, to_px, *,
+                   show_dimensions: bool = False) -> None:
     for r in plan_dict["rooms"]:
         xs = [p[0] for p in r["polygon"]]
         ys = [p[1] for p in r["polygon"]]
         cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
         label = r["label"].replace("_", " ").title()
+        if show_dimensions:
+            # MLS convention: short dimension first, e.g. "12'6" x 14'0"".
+            # _draw_label_fitted handles the embedded newline.
+            w_m = max(xs) - min(xs)
+            h_m = max(ys) - min(ys)
+            short, long = sorted([w_m, h_m])
+            label = f"{label}\n{_metric_to_ft_in(short)} x {_metric_to_ft_in(long)}"
         _draw_label_fitted(
             draw, to_px((cx, cy)), label,
             room_w_px=(max(xs) - min(xs)) * ppm,
@@ -1666,10 +1674,39 @@ def _render_labels(draw, plan_dict, text_color, ppm, to_px) -> None:
         )
 
 
-def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None):
+# ---------- US dimension callout formatting ----------
+
+_METERS_TO_INCHES = 39.3700787
+
+
+def _metric_to_ft_in(m: float) -> str:
+    """Format a positive metric length as a US floor-plan dimension
+    callout, e.g. 3.86 m -> `12'8"`. Inches are rounded to the nearest
+    integer and 12" rolls over to the next foot so we never emit
+    `12'12"`. Matches the convention used on US MLS listings."""
+    total_in = max(0.0, m) * _METERS_TO_INCHES
+    ft = int(total_in // 12)
+    inches = int(round(total_in - ft * 12))
+    if inches >= 12:
+        ft += 1
+        inches -= 12
+    return f"{ft}'{inches}\""
+
+
+def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None,
+           *, show_dimensions: bool = False, title_block: str | None = None,
+           watermark: str | None = None):
     """Render the floor plan to a PIL Image. Pure orchestration —
     each layer (rooms, fixtures, walls, openings, labels) is delegated
-    to a `_render_*` helper that takes only what it needs."""
+    to a `_render_*` helper that takes only what it needs.
+
+    `show_dimensions` appends a `W'W" x L'L"` callout under each room
+    label (US MLS convention). `title_block` adds a "FLOOR PLAN" /
+    "MAIN LEVEL" banner in the corner. `watermark` overlays a diagonal
+    semi-transparent string across the whole canvas the way listing
+    exports stamp broker IDs. All three are off by default so the pure
+    render path stays deterministic.
+    """
     style = style or DEFAULT_STYLE
     size = cfg.image_size
     ppm = cfg.pixels_per_meter
@@ -1706,7 +1743,13 @@ def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None):
                        gap_px=gap_px, wall_px=wall_px, ppm=ppm, to_px=to_px)
 
     if cfg.draw_labels:
-        _render_labels(draw, plan_dict, style["text"], ppm, to_px)
+        _render_labels(draw, plan_dict, style["text"], ppm, to_px,
+                       show_dimensions=show_dimensions)
+
+    if title_block:
+        _render_title_block(img, title_block, style)
+    if watermark:
+        img = _render_watermark(img, watermark, style)
 
     return img
 
@@ -1773,10 +1816,16 @@ def _draw_label_fitted(draw, centroid_px, text: str,
                        room_w_px: float, room_h_px: float,
                        margin_px: int = LABEL_MARGIN_PX,
                        fill: tuple = (60, 60, 60)) -> None:
-    """Draw `text` at `centroid_px` wrapped and shrunk to fit the room box."""
+    """Draw `text` at `centroid_px` wrapped and shrunk to fit the room box.
+
+    If `text` contains `\\n` the breaks are honored as forced line
+    separators (used for dimension callouts like `BEDROOM\\n12'6" x 14'0"`).
+    A forced-break layout that can't fit even at the smallest font falls
+    back to the first line alone so a tight room never shows truncated
+    dimensions.
+    """
     max_w = max(room_w_px - 2 * margin_px, 20)
     max_h = max(room_h_px - 2 * margin_px, 12)
-    words = text.split()
     line_gap = LABEL_LINE_GAP_PX
 
     def _draw_lines(lines: list[str], font) -> None:
@@ -1788,19 +1837,33 @@ def _draw_label_fitted(draw, centroid_px, text: str,
             draw.text((cx, top_y + i * (line_h + line_gap)), ln,
                       fill=fill, font=font, anchor="mm")
 
+    def _fits(lines: list[str], font) -> bool:
+        sizes = [_measure(draw, font, ln) for ln in lines]
+        total_w = max(w for w, _ in sizes)
+        line_h = max(h for _, h in sizes)
+        total_h = line_h * len(lines) + line_gap * (len(lines) - 1)
+        return total_w <= max_w and total_h <= max_h
+
+    # Forced-break path: used for label + dimension callouts. We try the
+    # font ladder as given; if nothing fits, drop the secondary lines and
+    # fall through to the word-wrap path with just the first line.
+    if "\n" in text:
+        forced = [seg for seg in text.split("\n") if seg.strip()]
+        for font_size in LABEL_FONT_LADDER:
+            font = _get_font(font_size)
+            if _fits(forced, font):
+                _draw_lines(forced, font)
+                return
+        text = forced[0]
+
+    words = text.split()
     # Try font sizes from large to small. For each size, try 1-, 2-, 3-line
     # wraps and pick the first that fits horizontally and vertically.
     for font_size in LABEL_FONT_LADDER:
         font = _get_font(font_size)
         for n_lines in range(1, min(len(words), 3) + 1):
             lines = _wrap_words(words, n_lines)
-            # Measure each line exactly once; the old version called
-            # _measure twice per line inside a zip() generator.
-            sizes = [_measure(draw, font, ln) for ln in lines]
-            total_w = max(w for w, _ in sizes)
-            line_h = max(h for _, h in sizes)
-            total_h = line_h * len(lines) + line_gap * (len(lines) - 1)
-            if total_w <= max_w and total_h <= max_h:
+            if _fits(lines, font):
                 _draw_lines(lines, font)
                 return
 
@@ -1898,6 +1961,77 @@ def _apply_augmentation(plan_dict: dict, rot_k: int, flip_x: bool) -> dict:
     }
 
 
+# ---------- title block + watermark overlays ----------
+#
+# These are image-space only — `render()` emits the final pixels after
+# the layout passes, so overlays never interact with the JSON. They're
+# driven by explicit strings so a caller can reproduce a specific sample
+# (useful for debugging "why does the model hallucinate a watermark
+# when there isn't one").
+
+TITLE_BLOCK_CANDIDATES: tuple[str, ...] = (
+    "FLOOR PLAN",
+    "MAIN LEVEL",
+    "FIRST FLOOR",
+    "GROUND FLOOR",
+    "UPPER LEVEL",
+    "LOWER LEVEL",
+)
+
+WATERMARK_CANDIDATES: tuple[str, ...] = (
+    "SAMPLE PLAN",
+    "NOT TO SCALE",
+    "FOR MARKETING USE ONLY",
+    "DRAFT",
+    "MLS PREVIEW",
+)
+
+
+def _render_title_block(img: Image.Image, text: str, style: dict) -> None:
+    """Draw a small banner in the bottom-left corner. Real MLS plans
+    use a title block to note the level; including it trains the model
+    to ignore floating UI text rather than misreading it as a room
+    label."""
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    font = _get_font(max(12, h // 45))
+    pad = max(6, h // 80)
+    tw, th = _measure(draw, font, text)
+    # Background rectangle slightly inset from the corner so the banner
+    # reads as a label rather than extending off-canvas.
+    x0, y0 = pad, h - pad - th - 2 * pad
+    x1, y1 = x0 + tw + 2 * pad, h - pad
+    border = style.get("wall", (25, 25, 25))
+    bg = style.get("bg", (255, 255, 255))
+    draw.rectangle([x0, y0, x1, y1], fill=bg, outline=border, width=2)
+    draw.text((x0 + pad, y0 + pad), text, fill=border, font=font, anchor="lt")
+
+
+def _render_watermark(img: Image.Image, text: str, style: dict) -> Image.Image:
+    """Overlay diagonal semi-transparent text across the canvas, as many
+    listing exports stamp broker IDs. Returns a new image because we go
+    via RGBA to get proper alpha, then flatten back to RGB."""
+    w, h = img.size
+    # Build the watermark in RGBA so partial transparency composites.
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    odraw = ImageDraw.Draw(overlay)
+    font = _get_font(max(24, h // 12))
+    # Faint, using the style's wall color as the base ink.
+    ink = style.get("wall", (25, 25, 25))
+    alpha = 40  # ~15% opacity
+    # Repeat the watermark in a diagonal tile so a large canvas isn't
+    # dominated by a single central string.
+    tw, th = _measure(odraw, font, text)
+    step = max(tw + 120, 260)
+    for cx in range(-w, 2 * w, step):
+        for cy in range(-h, 2 * h, step):
+            odraw.text((cx, cy), text, fill=(*ink, alpha), font=font, anchor="lt")
+    overlay = overlay.rotate(30, resample=Image.BILINEAR, expand=False,
+                             fillcolor=(0, 0, 0, 0))
+    composed = Image.alpha_composite(img.convert("RGBA"), overlay)
+    return composed.convert("RGB")
+
+
 # ---------- photometric augmentation ----------
 #
 # Simulate the photo / scan / print artifacts real MLS listings accumulate
@@ -1919,8 +2053,21 @@ PAPER_TINTS: tuple[tuple[float, float, float], ...] = (
 
 JPEG_QUALITY_RANGE: tuple[int, int] = (35, 92)
 
+# Small-angle skew — real scans and photos-of-screens are rarely square
+# to the page. Kept tight (+/- 2 deg) because wide plans fill most of the
+# canvas and a larger angle rotates wall corners outside the frame.
+SKEW_ANGLE_DEG: float = 2.0
+
+# Probabilities — tuned so each effect fires on a meaningful fraction of
+# samples without every sample looking identical. Every aug is independent
+# of the others; a sample can be tinted + skewed + JPEG'd + grayscale'd.
 P_TINT: float = 0.6
 P_JPEG: float = 0.7
+P_SKEW: float = 0.5
+P_GRAYSCALE: float = 0.15
+P_TITLE_BLOCK: float = 0.35
+P_WATERMARK: float = 0.15
+P_DIMENSIONS: float = 0.6
 
 
 def _apply_paper_tint(img: Image.Image, rng: random.Random) -> Image.Image:
@@ -1955,11 +2102,37 @@ def _apply_jpeg_roundtrip(img: Image.Image, rng: random.Random) -> Image.Image:
         return compressed.convert("RGB")
 
 
-def _augment_image(img: Image.Image, rng: random.Random) -> Image.Image:
+def _apply_small_skew(img: Image.Image, rng: random.Random,
+                      bg_color: tuple[int, int, int]) -> Image.Image:
+    """Rotate the image by a few degrees around its center. Geometry
+    JSON is axis-aligned by construction, so this teaches the model to
+    unskew rather than learn an easier axis-aligned prior that real
+    scans will violate. `bg_color` is used to fill the corners the
+    rotation exposes, matching whatever paper stock the style chose."""
+    angle = rng.uniform(-SKEW_ANGLE_DEG, SKEW_ANGLE_DEG)
+    return img.rotate(angle, resample=Image.BILINEAR, expand=False,
+                      fillcolor=bg_color)
+
+
+def _apply_grayscale(img: Image.Image) -> Image.Image:
+    """Collapse to single-channel luminance then back to RGB. Photocopies
+    and older fax scans lose color entirely — the model should still
+    read the geometry."""
+    from PIL import ImageOps
+    return ImageOps.grayscale(img).convert("RGB")
+
+
+def _augment_image(img: Image.Image, rng: random.Random,
+                   bg_color: tuple[int, int, int] = (255, 255, 255)
+                   ) -> Image.Image:
     """Photometric augmentation pipeline. Applied after render, before
     disk write. Purely image-space — geometry JSON is never touched."""
     if rng.random() < P_TINT:
         img = _apply_paper_tint(img, rng)
+    if rng.random() < P_SKEW:
+        img = _apply_small_skew(img, rng, bg_color)
+    if rng.random() < P_GRAYSCALE:
+        img = _apply_grayscale(img)
     if rng.random() < P_JPEG:
         img = _apply_jpeg_roundtrip(img, rng)
     return img
@@ -1970,17 +2143,21 @@ def generate_one(seed: int, cfg: SynthConfig | None = None,
     """Generate a single (image, plan_dict) pair.
 
     When augment=True (default), the plan is rotated by 0/90/180/270
-    degrees and optionally horizontally flipped before rendering, and
-    the rendered image gets a random paper tint + JPEG round-trip so
-    the model learns to ignore scan-grade noise. The JSON and image
-    stay in sync because the only geometry transform (rot/flip) is
-    applied to both; photometric aug touches pixels only.
+    degrees and optionally horizontally flipped before rendering, the
+    room labels may include dimension callouts, and the image may get
+    title-block / watermark overlays plus photometric noise (paper
+    tint, JPEG round-trip, small-angle skew, grayscale). The JSON and
+    image stay in sync because the only geometry transform (rot/flip)
+    is applied to both; every other aug touches pixels only.
     """
     cfg = cfg or SynthConfig()
     rng = random.Random(seed)
     template = rng.choice(TEMPLATES)
     plan = template(rng)
     plan_dict = plan_to_schema(plan, rng)
+    show_dimensions = False
+    title_block: str | None = None
+    watermark: str | None = None
     if augment:
         rot_k = rng.randrange(4)
         flip_x = rng.random() < 0.5
@@ -1988,11 +2165,18 @@ def generate_one(seed: int, cfg: SynthConfig | None = None,
             plan_dict = _apply_augmentation(plan_dict, rot_k, flip_x)
         style_name = rng.choice(list(STYLES.keys()))
         style = STYLES[style_name]
+        show_dimensions = rng.random() < P_DIMENSIONS
+        if rng.random() < P_TITLE_BLOCK:
+            title_block = rng.choice(TITLE_BLOCK_CANDIDATES)
+        if rng.random() < P_WATERMARK:
+            watermark = rng.choice(WATERMARK_CANDIDATES)
     else:
         style = DEFAULT_STYLE
-    img = render(plan_dict, cfg, style=style)
+    img = render(plan_dict, cfg, style=style,
+                 show_dimensions=show_dimensions,
+                 title_block=title_block, watermark=watermark)
     if augment:
-        img = _augment_image(img, rng)
+        img = _augment_image(img, rng, bg_color=style["bg"])
     return img, plan_dict
 
 

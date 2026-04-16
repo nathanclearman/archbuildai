@@ -386,6 +386,24 @@ class PhotometricAugTest(unittest.TestCase):
         self.assertEqual(out.size, img.size)
         self.assertEqual(out.mode, "RGB")
 
+    def test_small_skew_preserves_shape(self):
+        rng = random.Random(3)
+        img = self._white(128)
+        out = synthesize._apply_small_skew(img, rng, bg_color=(255, 255, 255))
+        self.assertEqual(out.size, img.size)
+        self.assertEqual(out.mode, "RGB")
+
+    def test_grayscale_collapses_chroma(self):
+        # A red-only RGB input should come back with R == G == B after
+        # the grayscale pass (luminance conversion).
+        from PIL import Image
+        red = Image.new("RGB", (4, 4), (200, 20, 20))
+        out = synthesize._apply_grayscale(red)
+        r, g, b = out.getpixel((0, 0))
+        self.assertEqual(r, g)
+        self.assertEqual(g, b)
+        self.assertEqual(out.mode, "RGB")  # not "L" — downstream expects RGB
+
     def test_augment_image_is_rng_deterministic(self):
         # Same random.Random state should produce byte-identical output.
         img = self._white()
@@ -399,6 +417,61 @@ class PhotometricAugTest(unittest.TestCase):
         out1 = synthesize._augment_image(img.copy(), random.Random(1))
         out2 = synthesize._augment_image(img.copy(), random.Random(2))
         self.assertNotEqual(out1.tobytes(), out2.tobytes())
+
+
+# ---------- US dimension callouts ----------
+
+class DimensionFormatTest(unittest.TestCase):
+    def test_exact_feet(self):
+        # 3.048 m == 10'0" exactly (10 ft = 3.048 m).
+        self.assertEqual(synthesize._metric_to_ft_in(3.048), "10'0\"")
+
+    def test_inch_rollover(self):
+        # 3.81 m = 12.5 ft -> 12'6". Regression case: make sure we don't
+        # ever emit "12'12"" when the inch fraction rounds up to 12.
+        out = synthesize._metric_to_ft_in(3.81)
+        self.assertEqual(out, "12'6\"")
+        # And a length that rounds to exactly 12" -> bumps to next foot.
+        out = synthesize._metric_to_ft_in(3.657)  # 11.998 ft
+        self.assertFalse("'12\"" in out, f"leaked 12\": {out}")
+
+    def test_zero_is_zero(self):
+        self.assertEqual(synthesize._metric_to_ft_in(0.0), "0'0\"")
+
+    def test_negative_clamps_to_zero(self):
+        # Shouldn't happen in practice, but don't crash.
+        self.assertEqual(synthesize._metric_to_ft_in(-2.0), "0'0\"")
+
+
+# ---------- overlays ----------
+
+class OverlayTest(unittest.TestCase):
+    def setUp(self):
+        self.cfg = synthesize.SynthConfig(image_size=300)
+        _, self.plan = synthesize.generate_one(5, self.cfg, augment=False)
+
+    def test_title_block_does_not_change_size(self):
+        img = synthesize.render(self.plan, self.cfg, title_block="MAIN LEVEL")
+        base = synthesize.render(self.plan, self.cfg)
+        self.assertEqual(img.size, base.size)
+        # Bottom-left corner should differ: the title banner sits there.
+        self.assertNotEqual(img.getpixel((10, 290)), base.getpixel((10, 290)))
+
+    def test_watermark_does_not_change_size(self):
+        img = synthesize.render(self.plan, self.cfg, watermark="DRAFT")
+        base = synthesize.render(self.plan, self.cfg)
+        self.assertEqual(img.size, base.size)
+        # Most pixels should differ somewhere because the watermark tiles
+        # across the canvas.
+        self.assertNotEqual(img.tobytes(), base.tobytes())
+
+    def test_render_stays_deterministic(self):
+        # Render must be pure given its inputs — overlays included.
+        a = synthesize.render(self.plan, self.cfg, show_dimensions=True,
+                              title_block="FLOOR PLAN", watermark="DRAFT")
+        b = synthesize.render(self.plan, self.cfg, show_dimensions=True,
+                              title_block="FLOOR PLAN", watermark="DRAFT")
+        self.assertEqual(a.tobytes(), b.tobytes())
 
 
 if __name__ == "__main__":
