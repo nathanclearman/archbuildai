@@ -398,6 +398,40 @@ class PhotometricAugTest(unittest.TestCase):
         self.assertEqual(out.size, img.size)
         self.assertEqual(out.mode, "RGB")
 
+    def test_vignette_darkens_corners_more_than_center(self):
+        # Vignette is a radial gradient — corner must come out darker
+        # than center, and by a visible margin (>10 grey levels on the
+        # default intensity range).
+        rng = random.Random(3)
+        img = self._white(200)
+        out = synthesize._apply_vignette(img, rng)
+        center = out.getpixel((100, 100))
+        corner = out.getpixel((5, 5))
+        self.assertGreater(center[0] - corner[0], 10,
+                           f"corner {corner} not darker than center {center}")
+
+    def test_vignette_preserves_shape_and_mode(self):
+        rng = random.Random(0)
+        img = self._white(128)
+        out = synthesize._apply_vignette(img, rng)
+        self.assertEqual(out.size, img.size)
+        self.assertEqual(out.mode, "RGB")
+
+    def test_vignette_is_rng_deterministic(self):
+        a = synthesize._apply_vignette(self._white(), random.Random(5))
+        b = synthesize._apply_vignette(self._white(), random.Random(5))
+        self.assertEqual(a.tobytes(), b.tobytes())
+
+    def test_vignette_preserves_black_walls(self):
+        # Multiplicative darkening: 0 * anything = 0. A black wall at
+        # the corner stays black — we must not turn walls grey, just
+        # darken the paper. Assert a black input pixel is still black.
+        from PIL import Image
+        img = Image.new("RGB", (64, 64), (0, 0, 0))
+        out = synthesize._apply_vignette(img, random.Random(0))
+        self.assertEqual(out.getpixel((0, 0)), (0, 0, 0))
+        self.assertEqual(out.getpixel((32, 32)), (0, 0, 0))
+
     def test_fold_crease_preserves_shape_and_mode(self):
         rng = random.Random(0)
         img = self._white(128)

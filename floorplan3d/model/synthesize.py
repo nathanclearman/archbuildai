@@ -2504,6 +2504,12 @@ P_GRAYSCALE: float = 0.15
 # samples to stop the model from treating every linear dark streak as
 # a wall.
 P_FOLD: float = 0.2
+
+# Vignette (lens / scanner radial falloff). Subtle but nearly universal
+# on phone-photo'd or cheap-scanner listings; 0.3 gives the model
+# consistent exposure to radial brightness gradients without every
+# sample looking deliberately art-directed.
+P_VIGNETTE: float = 0.3
 P_TITLE_BLOCK: float = 0.35
 P_WATERMARK: float = 0.15
 P_DIMENSIONS: float = 0.6
@@ -2632,6 +2638,43 @@ def _apply_grayscale(img: Image.Image) -> Image.Image:
     return ImageOps.grayscale(img).convert("RGB")
 
 
+def _apply_vignette(img: Image.Image, rng: random.Random) -> Image.Image:
+    """Multiply a radial darkening gradient onto the image to simulate
+    scanner / camera lens falloff — the characteristic "darker at the
+    corners" of every phone-photo listing. Built as a ladder of
+    concentric filled ellipses on an L-mode mask (outer ones dark,
+    inner ones progressively brighter), then multiplied channel-wise
+    via ImageChops.multiply so the effect is attenuation rather than
+    alpha blending: a black wall stays black, a cream room fill gets
+    darker in the corners the way a real scan would.
+
+    Falloff is `intensity * t**2` where t is normalized radial distance,
+    so the center stays close to the original and darkening accelerates
+    toward the corners — standard quadratic vignette curve.
+    """
+    from PIL import ImageChops
+    w, h = img.size
+    intensity = rng.uniform(0.15, 0.40)
+    n_rings = 48  # more rings → smoother gradient; 48 is inperceptibly
+                  # smooth on a 900-px canvas and cheap to build.
+
+    mask = Image.new("L", (w, h), 0)
+    mdraw = ImageDraw.Draw(mask)
+    cx, cy = w / 2, h / 2
+    max_r = math.hypot(cx, cy)
+
+    for i in range(n_rings + 1):
+        # i=0 paints the outermost ring (darkest); subsequent iterations
+        # overdraw inward with progressively brighter fills.
+        t = 1.0 - i / n_rings  # normalized radius: 1 at outer, 0 at center
+        r = max_r * t
+        val = int(round(255 * (1.0 - intensity * t * t)))
+        mdraw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=val)
+
+    # Multiply broadcasts the scalar mask across all three channels.
+    return ImageChops.multiply(img, mask.convert("RGB"))
+
+
 def _apply_fold_crease(img: Image.Image, rng: random.Random) -> Image.Image:
     """Darken a soft line across the image to simulate a physical fold
     or binder crease picked up by a scanner. Orientation is 70%
@@ -2703,6 +2746,8 @@ def _augment_image(img: Image.Image, rng: random.Random,
         img = _apply_small_skew(img, rng, bg_color)
     if rng.random() < P_FOLD:
         img = _apply_fold_crease(img, rng)
+    if rng.random() < P_VIGNETTE:
+        img = _apply_vignette(img, rng)
     if rng.random() < P_GRAYSCALE:
         img = _apply_grayscale(img)
     if rng.random() < P_JPEG:
