@@ -54,6 +54,23 @@ class PolygonIoUTest(unittest.TestCase):
     def test_degenerate_polygon_returns_zero(self):
         self.assertEqual(polygon_iou([[0, 0], [1, 0]], UNIT_SQUARE), 0.0)
 
+    def test_lshape_polygon_iou_with_self_is_one(self):
+        # L-shape rooms are first-class in this project — see
+        # _filter_internal_walls. Polygon IoU must handle non-convex
+        # polygons; PIL's polygon fill does (even-odd rule on CCW verts)
+        # but we test it explicitly so a future raster-backend swap can't
+        # silently regress L-shape scoring.
+        l_shape = [[0, 0], [2, 0], [2, 1], [1, 1], [1, 2], [0, 2]]
+        self.assertGreater(polygon_iou(l_shape, l_shape), 0.99)
+
+    def test_lshape_vs_bounding_rect_matches_area_ratio(self):
+        # L-shape has area 3 (2x1 base + 1x1 stub). Its bounding rectangle
+        # has area 4. IoU(L, bbox) = 3 / 4 = 0.75 — if IoU were using
+        # the bbox instead of the polygon, this would return 1.0.
+        l_shape = [[0, 0], [2, 0], [2, 1], [1, 1], [1, 2], [0, 2]]
+        bbox = [[0, 0], [2, 0], [2, 2], [0, 2]]
+        self.assertAlmostEqual(polygon_iou(l_shape, bbox), 0.75, delta=0.03)
+
 
 class RoomMatchingTest(unittest.TestCase):
     def test_greedy_picks_best_iou_per_pair(self):
@@ -95,7 +112,7 @@ class EvaluateSampleTest(unittest.TestCase):
         self.assertTrue(m.valid)
         self.assertEqual(m.wall_count_pred, m.wall_count_gt)
         self.assertAlmostEqual(m.wall_length_ratio, 1.0, places=2)
-        self.assertGreater(m.mean_room_iou, 0.99)
+        self.assertGreater(m.room_iou_coverage, 0.99)
         self.assertEqual(m.room_label_accuracy, 1.0)
 
     def test_none_prediction_is_invalid(self):
@@ -104,15 +121,49 @@ class EvaluateSampleTest(unittest.TestCase):
         self.assertFalse(m.valid)
         self.assertEqual(m.wall_count_pred, 0)
         self.assertEqual(m.wall_count_gt, 2)
-        self.assertEqual(m.mean_room_iou, 0.0)
+        self.assertEqual(m.room_iou_coverage, 0.0)
+        # wall_length_ratio is undefined when pred is missing, not 0 —
+        # aggregation needs to skip the row rather than average in 0.
+        self.assertIsNone(m.wall_length_ratio)
 
     def test_wrong_label_drops_label_accuracy_not_iou(self):
         gt = self._gt()
         pred = json.loads(json.dumps(gt))
         pred["rooms"][0]["label"] = "bedroom"
         m = evaluate_sample("x", pred, gt)
-        self.assertGreater(m.mean_room_iou, 0.99)
+        self.assertGreater(m.room_iou_coverage, 0.99)
         self.assertEqual(m.room_label_accuracy, 0.0)
+
+    def test_one_perfect_room_out_of_five_scores_02_not_10(self):
+        # The bug the review pass caught: dividing by len(matches) rewards
+        # a predictor that emits a single perfect room against a 5-room
+        # GT plan with a full 1.0. With IoU coverage (divide by max |pred|,
+        # |gt|), the same prediction correctly scores 0.2.
+        gt = {
+            "scale": {"pixels_per_meter": 50},
+            "walls": [],
+            "doors": [],
+            "windows": [],
+            "rooms": [
+                {"label": f"r{i}", "polygon": [[i, 0], [i + 1, 0], [i + 1, 1], [i, 1]], "area": 1.0}
+                for i in range(5)
+            ],
+        }
+        pred = {
+            "scale": {"pixels_per_meter": 50},
+            "walls": [],
+            "doors": [],
+            "windows": [],
+            "rooms": [gt["rooms"][0]],
+        }
+        m = evaluate_sample("x", pred, gt)
+        self.assertAlmostEqual(m.room_iou_coverage, 0.2, delta=0.02)
+
+    def test_empty_walls_both_sides_makes_ratio_none(self):
+        gt = {"scale": {"pixels_per_meter": 50}, "walls": [], "doors": [],
+              "windows": [], "rooms": []}
+        m = evaluate_sample("x", gt, gt)
+        self.assertIsNone(m.wall_length_ratio)
 
 
 class AggregateTest(unittest.TestCase):
@@ -128,7 +179,7 @@ class AggregateTest(unittest.TestCase):
             door_count_pred=0, door_count_gt=0,
             window_count_pred=0, window_count_gt=0,
             room_count_pred=1, room_count_gt=1,
-            wall_length_ratio=1.0, mean_room_iou=1.0,
+            wall_length_ratio=1.0, room_iou_coverage=1.0,
             room_label_accuracy=1.0, matched_rooms=1,
         )
         invalid = SampleMetrics(
@@ -137,12 +188,21 @@ class AggregateTest(unittest.TestCase):
             door_count_pred=0, door_count_gt=0,
             window_count_pred=0, window_count_gt=0,
             room_count_pred=0, room_count_gt=1,
-            wall_length_ratio=0.0, mean_room_iou=0.0,
+            wall_length_ratio=None, room_iou_coverage=0.0,
             room_label_accuracy=0.0, matched_rooms=0,
         )
         agg = aggregate([valid, invalid])
         self.assertEqual(agg["n"], 2)
         self.assertEqual(agg["parse_rate"], 0.5)
+        # Count error over all = (|1-1| + |0-2|) / 2 = 1.0
+        self.assertEqual(agg["mean_wall_count_abs_err"], 1.0)
+        # Over valid only = |1-1| / 1 = 0.0. The valid-only variant keeps
+        # "the model gets counts right when it does predict" separate from
+        # "the model sometimes fails to predict at all."
+        self.assertEqual(agg["mean_wall_count_abs_err_valid"], 0.0)
+        # None-ratio was excluded from the mean, not averaged in as 0.
+        self.assertEqual(agg["mean_wall_length_ratio"], 1.0)
+        self.assertEqual(agg["wall_length_ratio_defined_n"], 1)
 
 
 class RunEvalTest(unittest.TestCase):
@@ -167,23 +227,44 @@ class RunEvalTest(unittest.TestCase):
     def test_copy_predictor_hits_perfect_aggregate(self):
         samples = self._samples()
         self.assertGreaterEqual(len(samples), 2)
-        gt_by_image = {str(s.image_path): json.loads(s.target_json) for s in samples}
-        per_sample, agg = run_eval(samples, copy_predictor(gt_by_image))
+        per_sample, agg = run_eval(samples, copy_predictor(samples))
         self.assertEqual(agg["parse_rate"], 1.0)
         self.assertEqual(agg["mean_wall_count_abs_err"], 0.0)
         self.assertEqual(agg["mean_door_count_abs_err"], 0.0)
         self.assertAlmostEqual(agg["mean_wall_length_ratio"], 1.0, places=2)
-        self.assertGreater(agg["mean_room_iou"], 0.99)
+        self.assertGreater(agg["mean_room_iou_coverage"], 0.99)
         self.assertEqual(agg["mean_room_label_accuracy"], 1.0)
+
+    def test_copy_predictor_is_robust_to_path_normalization(self):
+        # Earlier version keyed the cache by the exact string form the
+        # loader produced. Passing the same file with a different path
+        # spelling (resolved vs. as-loaded) would KeyError silently and
+        # look like a bad model. Post-fix, .resolve() normalizes both.
+        samples = self._samples()
+        predict = copy_predictor(samples)
+        predict(str(Path(samples[0].image_path).resolve()))
+
+    def test_copy_predictor_raises_loudly_on_unknown_path(self):
+        # A silent KeyError would get swallowed by run_eval's except and
+        # show up as valid=False, indistinguishable from a broken model.
+        samples = self._samples()
+        predict = copy_predictor(samples)
+        with self.assertRaises(KeyError):
+            predict("/tmp/not-a-real-image.png")
 
     def test_null_predictor_is_zero_iou_but_still_parses(self):
         samples = self._samples()
-        per_sample, agg = run_eval(samples, null_predictor())
+        per_sample, agg = run_eval(samples, null_predictor(samples))
         self.assertEqual(agg["parse_rate"], 1.0)
-        self.assertEqual(agg["mean_room_iou"], 0.0)
+        self.assertEqual(agg["mean_room_iou_coverage"], 0.0)
         self.assertEqual(agg["mean_room_label_accuracy"], 0.0)
         # Null predictor has 0 walls, so count error = mean(|0 - gt|).
         self.assertGreater(agg["mean_wall_count_abs_err"], 0.0)
+        # All predictions "valid" in the schema sense (empty plan passes
+        # validate()), so valid-only count error equals over-all.
+        self.assertEqual(
+            agg["mean_wall_count_abs_err"], agg["mean_wall_count_abs_err_valid"]
+        )
 
 
 if __name__ == "__main__":

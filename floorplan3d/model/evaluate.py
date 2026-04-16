@@ -12,19 +12,25 @@ The predictor is pluggable:
   - null: returns an empty plan. Lower-bound baseline; shows the "cost
     of predicting nothing" so any trained model can be compared to it.
   - cv:   classical CV extractor (cv_walls.extract). Requires opencv;
-    skipped with a warning if unavailable.
-  - vlm:  the fine-tuned Qwen2.5-VL adapter (inference.run_vlm). Skipped
-    if no weights are on disk.
+    raises ImportError at first-call time if unavailable.
+  - vlm:  the fine-tuned Qwen2.5-VL adapter (inference.run_vlm). Requires
+    weights on disk; raises at first-call time if missing.
 
 Metrics are deliberately simple and additive, so adding a predictor or
 metric later is a local change, not a refactor:
-  - count deltas: |pred - gt| for walls / doors / windows / rooms
+  - count deltas: |pred - gt| for walls / doors / windows / rooms.
+    Reported twice in the aggregate — once over all samples (so invalid
+    predictions count as "predicted 0") and once over valid samples
+    only (so count error isn't compressed against parse failures).
   - total-wall-length ratio (pred / gt), reported as a factor, not a
-    squared error, so 0.5 and 2.0 both show up as "off by 2x"
-  - mean room polygon IoU, via rasterized intersection-over-union with
-    greedy max-IoU room matching (no shapely dep)
-  - room label accuracy over matched rooms
-  - parse rate (prediction validates against schema)
+    squared error, so 0.5 and 2.0 both show up as "off by 2x". None
+    when either side is empty (ratio is undefined); excluded from the
+    mean rather than dragged to 0.
+  - room IoU coverage: sum of matched-pair IoUs divided by the larger
+    of |pred_rooms|, |gt_rooms|. A predictor that emits 1 perfect room
+    against a 5-room GT plan scores 0.2, not 1.0.
+  - room label accuracy over matched rooms.
+  - parse rate (prediction validates against schema).
 
 No numpy / shapely / cv2 required — pure Python + PIL. Heavy predictors
 import their own deps lazily.
@@ -168,9 +174,17 @@ class SampleMetrics:
     window_count_gt: int
     room_count_pred: int
     room_count_gt: int
-    wall_length_ratio: float  # pred / gt, 0 if gt has no walls
-    mean_room_iou: float      # over matched rooms, 0 if none matched
-    room_label_accuracy: float  # over matched rooms, 0 if none matched
+    # None when either pred or gt has zero total wall length: the ratio is
+    # undefined there. Aggregate skips Nones rather than averaging them in
+    # as 0, which would otherwise conflate "undefined" with "100x off".
+    wall_length_ratio: float | None
+    # Sum of matched-pair IoUs divided by max(|pred_rooms|, |gt_rooms|), so
+    # unmatched rooms on either side drag the score down. 0 when both sides
+    # are empty.
+    room_iou_coverage: float
+    # Fraction of matched rooms where pred label == gt label. 0 when no
+    # rooms were matched.
+    room_label_accuracy: float
     matched_rooms: int
 
     def to_dict(self) -> dict:
@@ -201,8 +215,8 @@ def evaluate_sample(slug: str, pred: dict | None, gt: dict) -> SampleMetrics:
             window_count_gt=len(gt_windows),
             room_count_pred=0,
             room_count_gt=len(gt_rooms),
-            wall_length_ratio=0.0,
-            mean_room_iou=0.0,
+            wall_length_ratio=None,
+            room_iou_coverage=0.0,
             room_label_accuracy=0.0,
             matched_rooms=0,
         )
@@ -214,17 +228,21 @@ def evaluate_sample(slug: str, pred: dict | None, gt: dict) -> SampleMetrics:
 
     gt_len = _total_wall_length(gt_walls)
     pred_len = _total_wall_length(p_walls)
-    wall_ratio = (pred_len / gt_len) if gt_len > 0 else 0.0
+    # None when either side is zero-length: the ratio is undefined there.
+    # A hallucinated wall set with gt_len=0 is caught by the wall-count
+    # delta, not by this ratio.
+    wall_ratio = (pred_len / gt_len) if (gt_len > 0 and pred_len > 0) else None
 
     matches = match_rooms(p_rooms, gt_rooms)
+    denom = max(len(p_rooms), len(gt_rooms))
     if matches:
-        mean_iou = sum(m[2] for m in matches) / len(matches)
+        iou_coverage = sum(m[2] for m in matches) / denom
         correct_label = sum(
             1 for i, j, _ in matches if p_rooms[i]["label"] == gt_rooms[j]["label"]
         )
         label_acc = correct_label / len(matches)
     else:
-        mean_iou = 0.0
+        iou_coverage = 0.0
         label_acc = 0.0
 
     return SampleMetrics(
@@ -238,8 +256,8 @@ def evaluate_sample(slug: str, pred: dict | None, gt: dict) -> SampleMetrics:
         window_count_gt=len(gt_windows),
         room_count_pred=len(p_rooms),
         room_count_gt=len(gt_rooms),
-        wall_length_ratio=round(wall_ratio, 3),
-        mean_room_iou=round(mean_iou, 3),
+        wall_length_ratio=(round(wall_ratio, 3) if wall_ratio is not None else None),
+        room_iou_coverage=round(iou_coverage, 3),
         room_label_accuracy=round(label_acc, 3),
         matched_rooms=len(matches),
     )
@@ -247,75 +265,97 @@ def evaluate_sample(slug: str, pred: dict | None, gt: dict) -> SampleMetrics:
 
 # ---------- aggregation ----------
 
+def _mean(values: list[float]) -> float:
+    """Mean that returns 0.0 on empty input so the aggregate dict shape
+    is stable regardless of sample count / validity. Rounds to 3dp so
+    downstream diffing is readable."""
+    if not values:
+        return 0.0
+    return round(sum(values) / len(values), 3)
+
+
 def aggregate(per_sample: list[SampleMetrics]) -> dict:
-    """Mean / parse-rate across per-sample metrics. Returns zeros on an
-    empty input rather than raising, so callers can still print a
-    predictable report shape."""
+    """Parse rate + mean metrics across per-sample rows.
+
+    Count errors are reported twice: over all samples (so invalid
+    predictions count as predicted-zero) and over valid samples only
+    (so the count signal isn't diluted by parse failures). Ratios /
+    IoU are reported only over valid samples — they're undefined
+    otherwise. `wall_length_ratio` additionally skips samples where
+    either pred or gt has no walls (ratio is undefined).
+    """
     n = len(per_sample)
-    if n == 0:
-        return {
-            "n": 0,
-            "parse_rate": 0.0,
-            "mean_wall_count_abs_err": 0.0,
-            "mean_door_count_abs_err": 0.0,
-            "mean_window_count_abs_err": 0.0,
-            "mean_room_count_abs_err": 0.0,
-            "mean_wall_length_ratio": 0.0,
-            "mean_room_iou": 0.0,
-            "mean_room_label_accuracy": 0.0,
-            "mean_matched_room_recall": 0.0,
-        }
-
-    def mean(f):
-        return round(sum(f(m) for m in per_sample) / n, 3)
-
     valid = [m for m in per_sample if m.valid]
-    valid_n = max(len(valid), 1)
 
-    def mean_valid(f):
-        return round(sum(f(m) for m in valid) / valid_n, 3)
+    def abs_err(field_pred: str, field_gt: str):
+        return [abs(getattr(m, field_pred) - getattr(m, field_gt)) for m in per_sample]
+
+    def abs_err_valid(field_pred: str, field_gt: str):
+        return [abs(getattr(m, field_pred) - getattr(m, field_gt)) for m in valid]
 
     def recall(m: SampleMetrics) -> float:
         return (m.matched_rooms / m.room_count_gt) if m.room_count_gt else 0.0
 
+    wall_ratios = [m.wall_length_ratio for m in valid if m.wall_length_ratio is not None]
+
     return {
         "n": n,
-        "parse_rate": round(len(valid) / n, 3),
-        "mean_wall_count_abs_err": mean(lambda m: abs(m.wall_count_pred - m.wall_count_gt)),
-        "mean_door_count_abs_err": mean(lambda m: abs(m.door_count_pred - m.door_count_gt)),
-        "mean_window_count_abs_err": mean(lambda m: abs(m.window_count_pred - m.window_count_gt)),
-        "mean_room_count_abs_err": mean(lambda m: abs(m.room_count_pred - m.room_count_gt)),
-        "mean_wall_length_ratio": mean_valid(lambda m: m.wall_length_ratio),
-        "mean_room_iou": mean_valid(lambda m: m.mean_room_iou),
-        "mean_room_label_accuracy": mean_valid(lambda m: m.room_label_accuracy),
-        "mean_matched_room_recall": mean_valid(recall),
+        "parse_rate": round(len(valid) / n, 3) if n else 0.0,
+        "mean_wall_count_abs_err": _mean(abs_err("wall_count_pred", "wall_count_gt")),
+        "mean_door_count_abs_err": _mean(abs_err("door_count_pred", "door_count_gt")),
+        "mean_window_count_abs_err": _mean(abs_err("window_count_pred", "window_count_gt")),
+        "mean_room_count_abs_err": _mean(abs_err("room_count_pred", "room_count_gt")),
+        "mean_wall_count_abs_err_valid": _mean(abs_err_valid("wall_count_pred", "wall_count_gt")),
+        "mean_door_count_abs_err_valid": _mean(abs_err_valid("door_count_pred", "door_count_gt")),
+        "mean_window_count_abs_err_valid": _mean(abs_err_valid("window_count_pred", "window_count_gt")),
+        "mean_room_count_abs_err_valid": _mean(abs_err_valid("room_count_pred", "room_count_gt")),
+        "mean_wall_length_ratio": _mean(wall_ratios),
+        "wall_length_ratio_defined_n": len(wall_ratios),
+        "mean_room_iou_coverage": _mean([m.room_iou_coverage for m in valid]),
+        "mean_room_label_accuracy": _mean([m.room_label_accuracy for m in valid]),
+        "mean_matched_room_recall": _mean([recall(m) for m in valid]),
     }
 
 
 # ---------- predictors ----------
 
-def copy_predictor(gt_by_image: dict[str, dict]) -> Predictor:
-    """Sanity-check predictor: return the GT verbatim. Every metric
-    should pin to its best value. If it doesn't, the metric code is
-    wrong, not the model."""
+def copy_predictor(samples: Iterable[Sample]) -> Predictor:
+    """Sanity-check predictor: return the GT verbatim.
+
+    Keyed by the resolved absolute image path so it's robust to caller
+    path-normalization drift. On a cache miss we raise loudly — a silent
+    KeyError would get swallowed by run_eval's except and show up as
+    valid=False, which would look exactly like a broken model. Making
+    it explicit turns "my baseline mysteriously scores zero" into
+    "copy_predictor has no GT for <path>".
+    """
+    gt_by_path: dict[str, dict] = {}
+    for s in samples:
+        gt_by_path[str(Path(s.image_path).resolve())] = json.loads(s.target_json)
+
     def _predict(image_path: str) -> Plan:
-        return gt_by_image[image_path]
+        key = str(Path(image_path).resolve())
+        if key not in gt_by_path:
+            raise KeyError(f"copy_predictor has no GT for {image_path!r}")
+        return gt_by_path[key]
     return _predict
 
 
-def null_predictor() -> Predictor:
+def null_predictor(_samples: Iterable[Sample] | None = None) -> Predictor:
     """Floor-baseline predictor: empty plan. Shows the score of
     'predicting nothing', so any real model is anchored to a known
-    worst-case."""
+    worst-case. Takes samples it ignores so all builders share one
+    signature — makes the dispatch table trivial."""
     def _predict(image_path: str) -> Plan:
         return {"scale": {"pixels_per_meter": 50}, "walls": [], "doors": [], "windows": [], "rooms": []}
     return _predict
 
 
-def cv_predictor(ppm: float = 50.0) -> Predictor:
-    """Classical-CV predictor (cv_walls.extract). Lazy import so the
-    harness loads fine when opencv isn't installed; the CLI surfaces the
-    ImportError on first use rather than at module load."""
+def cv_predictor(_samples: Iterable[Sample] | None = None, ppm: float = 50.0) -> Predictor:
+    """Classical-CV predictor (cv_walls.extract). Lazy cv2 import lives
+    in cv_walls.extract itself, so constructing the predictor is cheap
+    and the real ImportError only surfaces on the first prediction call
+    — which is what callers expect when probing whether CV is available."""
     from cv_walls import CVConfig, extract  # type: ignore
     cfg = CVConfig(pixels_per_meter=ppm)
 
@@ -324,13 +364,26 @@ def cv_predictor(ppm: float = 50.0) -> Predictor:
     return _predict
 
 
-def vlm_predictor(weights_dir: Path) -> Predictor:
+def vlm_predictor(_samples: Iterable[Sample] | None = None,
+                  weights_dir: Path | str = "model/weights") -> Predictor:
     """Fine-tuned VLM predictor. Same lazy-import discipline as cv."""
     from inference import run_vlm  # type: ignore
+    weights = Path(weights_dir)
 
     def _predict(image_path: str) -> Plan:
-        return run_vlm(image_path, weights_dir)
+        return run_vlm(image_path, weights)
     return _predict
+
+
+# Builder signature: (samples, **kwargs) -> Predictor. Each entry is
+# self-contained so adding a predictor is one dict line, not a new
+# branch in main().
+PREDICTOR_BUILDERS: dict[str, Callable[..., Predictor]] = {
+    "copy": copy_predictor,
+    "null": null_predictor,
+    "cv": cv_predictor,
+    "vlm": vlm_predictor,
+}
 
 
 # ---------- runner ----------
@@ -360,26 +413,27 @@ def format_report(per_sample: list[SampleMetrics], agg: dict) -> str:
     if not per_sample:
         lines.append("  (no samples)")
     for m in per_sample:
+        ratio = "n/a" if m.wall_length_ratio is None else m.wall_length_ratio
         lines.append(
             f"  {m.slug:20s} valid={m.valid} "
             f"walls={m.wall_count_pred}/{m.wall_count_gt} "
             f"doors={m.door_count_pred}/{m.door_count_gt} "
             f"wins={m.window_count_pred}/{m.window_count_gt} "
             f"rooms={m.room_count_pred}/{m.room_count_gt} "
-            f"wall_len_ratio={m.wall_length_ratio} "
-            f"room_iou={m.mean_room_iou} "
+            f"wall_len_ratio={ratio} "
+            f"room_iou_cov={m.room_iou_coverage} "
             f"label_acc={m.room_label_accuracy}"
         )
     lines.append("aggregate:")
     for k, v in agg.items():
-        lines.append(f"  {k:32s} {v}")
+        lines.append(f"  {k:36s} {v}")
     return "\n".join(lines)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--real-mls", required=True, help="path to real_mls dataset root")
-    ap.add_argument("--predictor", choices=("copy", "null", "cv", "vlm"), default="null")
+    ap.add_argument("--predictor", choices=tuple(PREDICTOR_BUILDERS), default="null")
     ap.add_argument("--weights", default=str(Path(__file__).parent / "weights"),
                     help="VLM weights dir (only used with --predictor vlm)")
     ap.add_argument("--ppm", type=float, default=50.0,
@@ -393,15 +447,13 @@ def main():
         print(f"[eval] no samples under {args.real_mls}", file=sys.stderr)
         sys.exit(1)
 
-    if args.predictor == "copy":
-        gt_by_image = {str(s.image_path): json.loads(s.target_json) for s in samples}
-        predict = copy_predictor(gt_by_image)
-    elif args.predictor == "null":
-        predict = null_predictor()
-    elif args.predictor == "cv":
-        predict = cv_predictor(args.ppm)
-    else:
-        predict = vlm_predictor(Path(args.weights))
+    build = PREDICTOR_BUILDERS[args.predictor]
+    kwargs: dict = {}
+    if args.predictor == "cv":
+        kwargs["ppm"] = args.ppm
+    elif args.predictor == "vlm":
+        kwargs["weights_dir"] = args.weights
+    predict = build(samples, **kwargs)
 
     per_sample, agg = run_eval(samples, predict)
 
