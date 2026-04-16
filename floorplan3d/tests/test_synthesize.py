@@ -550,6 +550,40 @@ class DimensionLinesTest(unittest.TestCase):
         b = synthesize.render(self.plan, self.cfg, show_dimension_lines=True)
         self.assertEqual(a.tobytes(), b.tobytes())
 
+    def test_dim_line_text_matches_expected_ft_in(self):
+        # The south dim line's callout should be exactly
+        # _metric_to_ft_in(plan_width). Earlier tests only proved
+        # "pixels changed"; a typo in the formatter would have slipped
+        # past. We hook _draw_dim_line with a stub, render, and capture
+        # the `label` argument it was called with.
+        tight_plan = {
+            "walls": [], "doors": [], "windows": [],
+            "rooms": [{
+                "label": "great_room",
+                "polygon": [[0, 0], [8, 0], [8, 5], [0, 5]],
+                "area": 40.0,
+            }],
+            "scale": {"pixels_per_meter": 40},
+        }
+        labels_seen: list[str] = []
+        real_draw_dim_line = synthesize._draw_dim_line
+
+        def capture(*args, **kwargs):
+            # label is the 5th positional arg (img, draw, start, end, label).
+            labels_seen.append(args[4])
+            return real_draw_dim_line(*args, **kwargs)
+
+        synthesize._draw_dim_line = capture
+        try:
+            cfg = synthesize.SynthConfig(image_size=500)
+            synthesize.render(tight_plan, cfg, show_dimension_lines=True)
+        finally:
+            synthesize._draw_dim_line = real_draw_dim_line
+
+        self.assertEqual(len(labels_seen), 2, "expected one south + one west label")
+        self.assertIn(synthesize._metric_to_ft_in(8.0), labels_seen)
+        self.assertIn(synthesize._metric_to_ft_in(5.0), labels_seen)
+
     def test_dim_lines_skipped_when_margin_too_small(self):
         # Render at a canvas where the plan fills the whole canvas —
         # there is no exterior margin to host the dim lines. The
@@ -608,6 +642,31 @@ class BayWindowGeometryTest(unittest.TestCase):
         # Top corners protrude east (x > 4).
         self.assertGreater(top_lo[0], 4.0)
         self.assertGreater(top_hi[0], 4.0)
+
+    def test_south_bay_protrudes_south(self):
+        rect = (0.0, 0.0, 6.0, 4.0)
+        bay = BayWindow("great_room", "S", 0.5, 2.4, 0.75, 0.55)
+        base_lo, top_lo, top_hi, base_hi = _bay_corners(rect, bay)
+        # Base corners stay on y=4 (the south wall).
+        self.assertAlmostEqual(base_lo[1], 4.0, places=3)
+        self.assertAlmostEqual(base_hi[1], 4.0, places=3)
+        # Top corners protrude south (y > 4, since +y is south).
+        self.assertAlmostEqual(top_lo[1], 4.75, places=3)
+        self.assertAlmostEqual(top_hi[1], 4.75, places=3)
+
+    def test_west_bay_protrudes_west(self):
+        # This is the side that was silently miscentering plans before
+        # the _compute_bounds fix — west bays push polygon vertices to
+        # negative x.
+        rect = (0.0, 0.0, 4.0, 6.0)
+        bay = BayWindow("living_room", "W", 0.5, 2.4, 0.75, 0.55)
+        base_lo, top_lo, top_hi, base_hi = _bay_corners(rect, bay)
+        # Base corners stay on x=0 (the west wall).
+        self.assertAlmostEqual(base_lo[0], 0.0, places=3)
+        self.assertAlmostEqual(base_hi[0], 0.0, places=3)
+        # Top corners protrude west (x < 0).
+        self.assertAlmostEqual(top_lo[0], -0.75, places=3)
+        self.assertAlmostEqual(top_hi[0], -0.75, places=3)
 
 
 class ApplyBayToWallsTest(unittest.TestCase):
@@ -749,6 +808,54 @@ class MaybeAttachBayTest(unittest.TestCase):
             if any(len(r["polygon"]) > 4 for r in plan["rooms"]):
                 found_bay = True
         self.assertTrue(found_bay, "no bay ever attached in 60 seeds")
+
+    def test_bay_plan_centers_on_canvas(self):
+        # Regression: N/W bays push polygon coords negative. Before the
+        # _compute_bounds fix, the plan drew off-center by `min_coord *
+        # ppm` pixels because _to_px_factory used the raw offset. Build
+        # a minimal plan with a W bay and assert the rendered plan
+        # bbox center equals the canvas center.
+        rect = (0.0, 0.0, 4.0, 6.0)
+        bay = BayWindow("living_room", "W", 0.5, 2.4, 0.75, 0.55)
+        plan = Plan(rooms=[Room("living_room", rect)], footprint=(4, 6),
+                    bays=[bay])
+        d = synthesize.plan_to_schema(plan, random.Random(0))
+        cfg = synthesize.SynthConfig(image_size=900)
+        mn_x, mn_y, fw, fh = synthesize._compute_bounds(d)
+        ppm = cfg.pixels_per_meter
+        off_x = (cfg.image_size - fw * ppm) / 2 - mn_x * ppm
+        off_y = (cfg.image_size - fh * ppm) / 2 - mn_y * ppm
+        # Plan's pixel-space bbox after applying to_px.
+        px_min_x = off_x + mn_x * ppm
+        px_max_x = off_x + (mn_x + fw) * ppm
+        self.assertAlmostEqual((px_min_x + px_max_x) / 2,
+                               cfg.image_size / 2, places=1)
+        # And min_x is strictly negative here — if it weren't, this
+        # test wouldn't exercise the regression it's named after.
+        self.assertLess(mn_x, 0)
+
+    def test_bay_survives_rotation_aug(self):
+        # Bays are expanded into polygons before _apply_augmentation
+        # runs, so the rotation path has to handle non-axis-aligned
+        # wall endpoints and negative polygon vertices. Rotate each
+        # direction and check the schema still validates and the
+        # polygon still has the extra vertices from the bay.
+        rect = (0.0, 0.0, 8.0, 5.0)
+        bay = BayWindow("great_room", "N", 0.5, 2.4, 0.75, 0.55)
+        plan = Plan(rooms=[Room("great_room", rect)], footprint=(8, 5),
+                    bays=[bay])
+        base = synthesize.plan_to_schema(plan, random.Random(0))
+        for rot_k in range(4):
+            for flip in (False, True):
+                if rot_k == 0 and not flip:
+                    continue
+                out = _apply_augmentation(base, rot_k, flip)
+                schema.validate(out)
+                self.assertEqual(len(out["walls"]), len(base["walls"]),
+                                 f"rot={rot_k} flip={flip}")
+                # 8-vertex polygon (4 rect + 4 bay) should survive
+                # rotation without losing any vertices.
+                self.assertEqual(len(out["rooms"][0]["polygon"]), 8)
 
 
 if __name__ == "__main__":

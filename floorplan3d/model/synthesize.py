@@ -1765,10 +1765,28 @@ FIXTURE_DRAWERS: dict[str, Callable] = {
 
 def _compute_extents(plan_dict: dict) -> tuple[float, float]:
     """Footprint width and height in meters, derived from room polygon
-    extremes. Centralized so render() and other consumers agree."""
+    extremes. Centralized so render() and other consumers agree.
+
+    Kept as a (width, height) 2-tuple for backward compatibility; use
+    `_compute_bounds` when you also need the min corner (necessary when
+    polygons extend into negative coordinates — bay windows on N/W
+    sides are the current case in point)."""
     xs = [p[0] for r in plan_dict["rooms"] for p in r["polygon"]]
     ys = [p[1] for r in plan_dict["rooms"] for p in r["polygon"]]
     return max(xs) - min(xs), max(ys) - min(ys)
+
+
+def _compute_bounds(plan_dict: dict) -> tuple[float, float, float, float]:
+    """Return (min_x, min_y, width, height) in meters over every room
+    polygon vertex. Used by render() to center plans whose polygons
+    don't start at (0, 0) — a bay window pushes the host room's
+    polygon into negative coordinates on the protrusion side, and
+    without this correction the plan shifts off-canvas by `min_coord *
+    ppm` pixels."""
+    xs = [p[0] for r in plan_dict["rooms"] for p in r["polygon"]]
+    ys = [p[1] for r in plan_dict["rooms"] for p in r["polygon"]]
+    mn_x, mn_y = min(xs), min(ys)
+    return mn_x, mn_y, max(xs) - mn_x, max(ys) - mn_y
 
 
 def _to_px_factory(off_x: float, off_y: float, ppm: float):
@@ -1990,9 +2008,13 @@ def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None,
     size = cfg.image_size
     ppm = cfg.pixels_per_meter
 
-    fw, fh = _compute_extents(plan_dict)
-    off_x = (size - fw * ppm) / 2
-    off_y = (size - fh * ppm) / 2
+    # Bounds rather than extents: polygons with bay windows on the N/W
+    # sides have vertices at negative coords, so centering on
+    # (size - w*ppm)/2 alone leaves the plan shifted by min_coord*ppm.
+    # Subtracting min*ppm from the offset restores centering.
+    min_x, min_y, fw, fh = _compute_bounds(plan_dict)
+    off_x = (size - fw * ppm) / 2 - min_x * ppm
+    off_y = (size - fh * ppm) / 2 - min_y * ppm
     to_px = _to_px_factory(off_x, off_y, ppm)
 
     img = Image.new("RGB", (size, size), style["bg"])
@@ -2027,8 +2049,17 @@ def render(plan_dict: dict, cfg: SynthConfig, style: dict | None = None,
                        show_dimensions=show_dimensions)
 
     if show_dimension_lines:
-        _render_dimension_lines(draw, plan_dict, style["text"],
-                                ppm, off_x, off_y, size)
+        # Pixel-space bbox of the plan — derived from the same offset
+        # that to_px uses so the dim lines line up exactly with the
+        # wall corners regardless of polygon min-coord.
+        plan_px_bbox = (
+            off_x + min_x * ppm,
+            off_y + min_y * ppm,
+            off_x + (min_x + fw) * ppm,
+            off_y + (min_y + fh) * ppm,
+        )
+        _render_dimension_lines(img, draw, plan_dict, style["text"],
+                                plan_px_bbox, size)
 
     if title_block:
         _render_title_block(img, title_block, style)
@@ -2335,37 +2366,40 @@ _DIM_TICK_LEN_PX: int = 6         # length of the 45-degree end ticks
 _DIM_EXT_OVERSHOOT_PX: int = 4    # how far the extension lines extend past the dim line
 
 
-def _render_dimension_lines(draw, plan_dict: dict, ink,
-                            ppm: float, off_x: float, off_y: float,
+def _render_dimension_lines(img: Image.Image, draw, plan_dict: dict, ink,
+                            plan_px_bbox: tuple[float, float, float, float],
                             canvas_size: int) -> None:
     """Draw exterior dimension lines along the south and west edges of
     the plan. Silently skipped on whichever axes don't have room in the
     canvas margin — better to produce a clean plan than to cram the
     line on top of the walls.
+
+    `plan_px_bbox` is (x_min, y_min, x_max, y_max) in pixel space, as
+    computed from the same (off, ppm) that render() uses for walls —
+    passing it through avoids re-deriving the bbox and keeps the
+    dim-line layer consistent with the rest of the canvas when polygons
+    extend into negative meter-space (bay windows).
     """
-    fw, fh = _compute_extents(plan_dict)
-    # Plan's pixel-space bbox.
-    x_min = off_x
-    y_min = off_y
-    x_max = off_x + fw * ppm
-    y_max = off_y + fh * ppm
+    fw_m, fh_m = _compute_extents(plan_dict)
+    x_min, y_min, x_max, y_max = plan_px_bbox
 
     # South line at y = y_max + offset, showing total width.
     south_y = y_max + _DIM_LINE_OFFSET_PX
     if south_y + _DIM_TICK_LEN_PX < canvas_size:
-        _draw_dim_line(draw, (x_min, south_y), (x_max, south_y),
-                       _metric_to_ft_in(fw), ink, axis="horizontal",
+        _draw_dim_line(img, draw, (x_min, south_y), (x_max, south_y),
+                       _metric_to_ft_in(fw_m), ink, axis="horizontal",
                        perp_toward=-1, plan_edge_coord=y_max)
 
     # West line at x = x_min - offset, showing total height.
     west_x = x_min - _DIM_LINE_OFFSET_PX
     if west_x - _DIM_TICK_LEN_PX > 0:
-        _draw_dim_line(draw, (west_x, y_min), (west_x, y_max),
-                       _metric_to_ft_in(fh), ink, axis="vertical",
+        _draw_dim_line(img, draw, (west_x, y_min), (west_x, y_max),
+                       _metric_to_ft_in(fh_m), ink, axis="vertical",
                        perp_toward=1, plan_edge_coord=x_min)
 
 
-def _draw_dim_line(draw, start: tuple[float, float], end: tuple[float, float],
+def _draw_dim_line(img: Image.Image, draw,
+                   start: tuple[float, float], end: tuple[float, float],
                    label: str, ink, *, axis: str, perp_toward: int,
                    plan_edge_coord: float) -> None:
     """Paint one dimension line between `start` and `end` with extension
@@ -2377,11 +2411,19 @@ def _draw_dim_line(draw, start: tuple[float, float], end: tuple[float, float],
     the plan edge: -1 means the plan is above / left, +1 means below /
     right. `plan_edge_coord` is the y (for horizontal) or x (for
     vertical) of the plan edge the extensions snap back to.
+    `img` is the host image — needed for the vertical case because PIL's
+    draw.text() doesn't rotate; we paste a rotated label sub-image onto
+    the host instead.
     """
     sx, sy = start
     ex, ey = end
     # Main dim line.
     draw.line([start, end], fill=ink, width=1)
+
+    # 45-degree ticks at each end (classic architectural slash marks).
+    t = _DIM_TICK_LEN_PX / 2
+    draw.line([(sx - t, sy + t), (sx + t, sy - t)], fill=ink, width=1)
+    draw.line([(ex - t, ey + t), (ex + t, ey - t)], fill=ink, width=1)
 
     # Extension lines from the plan corners back to the dim line, with
     # a small overshoot past the dim line (architectural convention).
@@ -2389,10 +2431,6 @@ def _draw_dim_line(draw, start: tuple[float, float], end: tuple[float, float],
         overshoot_y = sy - perp_toward * _DIM_EXT_OVERSHOOT_PX
         draw.line([(sx, plan_edge_coord), (sx, overshoot_y)], fill=ink, width=1)
         draw.line([(ex, plan_edge_coord), (ex, overshoot_y)], fill=ink, width=1)
-        # 45-degree ticks at each end (classic architectural slash marks).
-        t = _DIM_TICK_LEN_PX / 2
-        draw.line([(sx - t, sy + t), (sx + t, sy - t)], fill=ink, width=1)
-        draw.line([(ex - t, ey + t), (ex + t, ey - t)], fill=ink, width=1)
         # Label centered, offset up from the line.
         font = _get_font(11)
         draw.text(((sx + ex) / 2, sy - 3), label,
@@ -2401,22 +2439,23 @@ def _draw_dim_line(draw, start: tuple[float, float], end: tuple[float, float],
         overshoot_x = sx - perp_toward * _DIM_EXT_OVERSHOOT_PX
         draw.line([(plan_edge_coord, sy), (overshoot_x, sy)], fill=ink, width=1)
         draw.line([(plan_edge_coord, ey), (overshoot_x, ey)], fill=ink, width=1)
-        t = _DIM_TICK_LEN_PX / 2
-        draw.line([(sx - t, sy + t), (sx + t, sy - t)], fill=ink, width=1)
-        draw.line([(ex - t, ey + t), (ex + t, ey - t)], fill=ink, width=1)
-        # Label centered, offset toward the plan (the side people read from).
         font = _get_font(11)
-        # Rotate the text 90° by baking into a small sub-image.
-        _draw_rotated_text(draw, ((sx + ex) / 2, (sy + ey) / 2), label, font, ink)
+        # PIL's draw.text has no rotation argument — paste a rotated
+        # sub-image onto the host. Host is passed explicitly so we
+        # don't rely on private ImageDraw attributes.
+        _paste_rotated_text(img, draw, ((sx + ex) / 2, (sy + ey) / 2),
+                            label, font, ink)
 
 
-def _draw_rotated_text(draw, anchor_xy: tuple[float, float], text: str,
-                       font, ink) -> None:
-    """Render `text` rotated 90° CCW at `anchor_xy` (center). PIL's
-    Draw.text has no rotation argument, so we render to a small
-    throwaway RGBA image, rotate it, and paste into the host canvas."""
-    # Measure at the target font.
-    tw, th = _measure(draw, font, text)
+def _paste_rotated_text(host_img: Image.Image, host_draw,
+                        anchor_xy: tuple[float, float], text: str,
+                        font, ink) -> None:
+    """Render `text` rotated 90° CCW at `anchor_xy` (center) onto
+    `host_img`. Renders to a throwaway RGBA sub-image first so the
+    rotation is exact and alpha-composited — direct drawing into the
+    host RGB would force a pre-rotation rasterisation that reads wrong
+    on all but axis-aligned angles."""
+    tw, th = _measure(host_draw, font, text)
     pad = 2
     label_img = Image.new("RGBA", (tw + 2 * pad, th + 2 * pad), (0, 0, 0, 0))
     ldraw = ImageDraw.Draw(label_img)
@@ -2424,10 +2463,6 @@ def _draw_rotated_text(draw, anchor_xy: tuple[float, float], text: str,
     rotated = label_img.rotate(90, resample=Image.BILINEAR, expand=True)
     rw, rh = rotated.size
     ax, ay = anchor_xy
-    # Draw.text returns None; we need access to the underlying image to
-    # paste. PIL's ImageDraw has an `._image` attribute on versions we
-    # support, but the stable path is through the draw's `im` alias:
-    host_img = draw._image  # type: ignore[attr-defined]
     host_img.paste(rotated, (int(ax - rw / 2), int(ay - rh / 2)), rotated)
 
 
