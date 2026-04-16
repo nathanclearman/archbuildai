@@ -333,10 +333,18 @@ def copy_predictor(samples: Iterable[Sample]) -> Predictor:
     gt_by_path: dict[str, dict] = {}
     for s in samples:
         key = str(Path(s.image_path).resolve())
-        # Symlink collisions would silently keep only the last GT. Loud
-        # here is better than a confusing partial-match downstream.
+        # Two samples that resolve to the same file can happen legitimately
+        # when a dataset is re-exposed under a symlinked or mounted root.
+        # Warn and keep the first — raising here would refuse a legitimate
+        # config. A real collision where the two samples carry different
+        # GT would still be caught at comparison time (matched rooms drop).
         if key in gt_by_path:
-            raise ValueError(f"copy_predictor: two samples resolve to {key}")
+            print(
+                f"[eval] copy_predictor: two samples resolve to {key}; "
+                f"keeping first",
+                file=sys.stderr,
+            )
+            continue
         gt_by_path[key] = json.loads(s.target_json)
 
     def _predict(image_path: str) -> Plan:

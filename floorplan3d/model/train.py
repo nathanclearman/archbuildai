@@ -44,7 +44,6 @@ class TrainConfig:
     base_model: str = "Qwen/Qwen2.5-VL-7B-Instruct"
     cubicasa_root: str | None = None
     synthetic_root: str | None = None
-    resplan_root: str | None = None
     output_dir: str = "model/weights"
     epochs: int = 2
     per_device_batch_size: int = 1
@@ -107,14 +106,9 @@ def format_conversation(processor, image, target_json, max_length):
     # Mask everything except the assistant's reply so loss is only on the target.
     input_ids = inputs["input_ids"][0]
     labels = input_ids.clone()
-    # Find the last "<|im_start|>assistant" token boundary — everything before
-    # should be -100. This relies on Qwen's chat template; adjust if you swap
-    # base models.
     assistant_token_ids = processor.tokenizer.encode("<|im_start|>assistant", add_special_tokens=False)
-    boundary = _find_subseq(input_ids.tolist(), assistant_token_ids)
-    if boundary != -1:
-        cutoff = boundary + len(assistant_token_ids)
-        labels[:cutoff] = -100
+    cutoff = _mask_prompt_cutoff(input_ids.tolist(), assistant_token_ids)
+    labels[:cutoff] = -100
     inputs["labels"] = labels.unsqueeze(0)
     return inputs
 
@@ -126,12 +120,43 @@ def _find_subseq(seq, sub):
     return -1
 
 
+def _mask_prompt_cutoff(input_ids: list[int], assistant_token_ids: list[int]) -> int:
+    """Return the label-masking cutoff — the index just past the assistant
+    role boundary in `input_ids`. Everything strictly before the returned
+    index should be set to -100 so loss is computed only on the assistant
+    reply.
+
+    Raises RuntimeError if the boundary isn't found. The previous silent
+    fallback (leave all tokens as labels) would teach the model to
+    reproduce the system prompt + image tokens as supervision targets,
+    producing a mediocre loss curve that looks like a data problem. A
+    loud failure at step 0 costs nothing; a silent one costs a training
+    run.
+    """
+    if not assistant_token_ids:
+        raise RuntimeError(
+            "Empty assistant_token_ids — the tokenizer produced no tokens "
+            "for '<|im_start|>assistant'. The chat template or tokenizer "
+            "config has changed in an incompatible way."
+        )
+    boundary = _find_subseq(input_ids, assistant_token_ids)
+    if boundary == -1:
+        raise RuntimeError(
+            "Could not locate the assistant-role boundary token sequence "
+            "in the tokenized conversation. The chat template or "
+            "processor.tokenizer no longer emits '<|im_start|>assistant' "
+            "as a contiguous subsequence — verify the base model and "
+            "transformers version. Training with a silent fallback would "
+            "mask nothing and leak the prompt into supervision."
+        )
+    return boundary + len(assistant_token_ids)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default=TrainConfig.base_model)
     parser.add_argument("--cubicasa")
     parser.add_argument("--synthetic")
-    parser.add_argument("--resplan")
     parser.add_argument("--out", default=TrainConfig.output_dir)
     parser.add_argument("--epochs", type=int, default=TrainConfig.epochs)
     parser.add_argument("--batch-size", type=int, default=TrainConfig.per_device_batch_size)
@@ -147,7 +172,6 @@ def main():
         base_model=args.base,
         cubicasa_root=args.cubicasa,
         synthetic_root=args.synthetic,
-        resplan_root=args.resplan,
         output_dir=args.out,
         epochs=args.epochs,
         per_device_batch_size=args.batch_size,
@@ -243,7 +267,19 @@ def main():
             # pixel_values / image_grid_thw are passed through because Qwen
             # flattens patches across the batch with per-image grids, and
             # pad_sequence would corrupt that layout.
-            if k in ("input_ids", "attention_mask", "labels"):
+            if k == "labels":
+                # -100 is cross-entropy's ignore_index — padded positions
+                # must NOT contribute to the training loss. Padding with 0
+                # (a real token id in Qwen's vocab) would teach the model
+                # to predict that token on padding, which is silent
+                # corruption at batch_size > 1.
+                out[k] = torch.nn.utils.rnn.pad_sequence(
+                    [v.squeeze(0) for v in vals], batch_first=True, padding_value=-100
+                )
+            elif k in ("input_ids", "attention_mask"):
+                # input_ids at padded positions are ignored by the forward
+                # because attention_mask=0 masks them out, so padding value
+                # doesn't affect loss — 0 is conventional.
                 out[k] = torch.nn.utils.rnn.pad_sequence(
                     [v.squeeze(0) for v in vals], batch_first=True, padding_value=0
                 )
@@ -263,6 +299,16 @@ def main():
         save_total_limit=3,
         bf16=True,
         gradient_checkpointing=True,
+        # Recent torch flags the default (reentrant) checkpointing path
+        # with a per-step deprecation warning under PEFT + bnb. Opting
+        # into the non-reentrant variant silences it and keeps behaviour
+        # identical for this training loop.
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        # Explicit to match the HF default. Stated loudly because QLoRA
+        # on a VLM is known to spike on pathological samples and the
+        # default is doing real work — not a free parameter to silently
+        # inherit.
+        max_grad_norm=1.0,
         # Overlap image decode + thumbnail with the GPU step. 0 (default)
         # serializes everything on the main process and bottlenecks the
         # H100 on PIL; 2 is enough for a single-GPU VLM job and avoids
