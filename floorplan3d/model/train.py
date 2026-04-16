@@ -24,9 +24,13 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-# NOTE: heavy imports happen inside main() so `python train.py --help` works
-# without torch installed, and so the Blender add-on process never drags
-# these in by accident.
+from PIL import Image
+
+# NOTE: heavy imports (torch / transformers / peft) happen inside main() so
+# `python train.py --help` works without an ML env, and so the Blender
+# add-on process never drags them in by accident. PIL is cheap and already
+# a hard project dep, so it lives at module scope — FloorPlanDS needs it
+# to be importable by multiprocessing workers under `spawn` start method.
 
 
 SYSTEM_PROMPT = (
@@ -60,8 +64,25 @@ class TrainConfig:
     seed: int = 0
 
 
+# Coarse char-per-token upper bound for Qwen's BPE on JSON text. JSON is
+# dense in short tokens (punctuation, digit runs) and averages ~2.5-3.2
+# chars/token in practice; 4.0 is a conservative ceiling — any target
+# whose raw chars exceed max_length * this factor cannot possibly fit
+# after tokenization, regardless of prompt overhead. Borderline samples
+# (over max_length*2 but under max_length*4) still reach training and
+# get a precise token-count check inside format_conversation.
+MAX_TARGET_CHARS_PER_TOKEN = 4.0
+
+
 def build_samples(cfg: TrainConfig):
-    """Return a list of (image_path, target_json_string) samples."""
+    """Return a list of (image_path, target_json_string) samples.
+
+    Applies a cheap char-based pre-filter to drop targets that cannot
+    fit within cfg.max_length tokens. Exact token counting requires the
+    processor and would cost a full tokenization pass over the corpus;
+    a conservative char bound catches the obvious outliers (e.g. dense
+    CubiCasa plans with hundreds of walls) without the overhead.
+    """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
     from dataset import build_training_set  # type: ignore
@@ -77,12 +98,40 @@ def build_samples(cfg: TrainConfig):
             "No training samples found. Point --cubicasa at a CubiCasa5k "
             "extraction, or --synthetic at an output of synthesize.py."
         )
-    print(f"loaded {len(samples)} samples")
-    return samples
+
+    kept, dropped, char_budget = _filter_oversized_samples(samples, cfg.max_length)
+    if dropped:
+        print(
+            f"pre-filter: dropped {dropped}/{len(samples)} samples with "
+            f"target JSON over {char_budget} chars (~{cfg.max_length} tokens). "
+            f"These would have crashed format_conversation mid-training."
+        )
+    print(f"loaded {len(kept)} samples")
+    return kept
+
+
+def _filter_oversized_samples(samples, max_length):
+    """Drop samples whose raw target JSON exceeds the char budget.
+
+    Returns (kept, dropped_count, char_budget). Pure function so it's
+    unit-testable without a dataset on disk.
+    """
+    char_budget = int(max_length * MAX_TARGET_CHARS_PER_TOKEN)
+    kept = [s for s in samples if len(s.target_json) <= char_budget]
+    return kept, len(samples) - len(kept), char_budget
 
 
 def format_conversation(processor, image, target_json, max_length):
-    """Format a single sample as a Qwen2.5-VL chat conversation."""
+    """Format a single sample as a Qwen2.5-VL chat conversation.
+
+    Raises RuntimeError if the tokenized sequence exceeds `max_length`.
+    The previous `truncation=True` silently cut the assistant reply mid-
+    JSON, teaching the model to emit malformed output — a training-data
+    corruption invisible on the loss curve. Loud failure here lets
+    callers filter long samples before training starts; the caller
+    build_samples() does a coarse char-based pre-filter so the raise
+    only fires on borderline cases.
+    """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -100,9 +149,16 @@ def format_conversation(processor, image, target_json, max_length):
         images=[image],
         return_tensors="pt",
         padding=False,
-        truncation=True,
-        max_length=max_length,
+        truncation=False,
     )
+    seq_len = inputs["input_ids"].shape[1]
+    if seq_len > max_length:
+        raise RuntimeError(
+            f"Sample exceeds max_length={max_length} tokens (got {seq_len}). "
+            f"Filter long samples in build_samples() before training, or "
+            f"raise TrainConfig.max_length. Silent truncation would corrupt "
+            f"the target JSON and teach the model to emit malformed output."
+        )
     # Mask everything except the assistant's reply so loss is only on the target.
     input_ids = inputs["input_ids"][0]
     labels = input_ids.clone()
@@ -152,6 +208,35 @@ def _mask_prompt_cutoff(input_ids: list[int], assistant_token_ids: list[int]) ->
     return boundary + len(assistant_token_ids)
 
 
+class FloorPlanDS:
+    """Map-style dataset over (image_path, target_json) samples.
+
+    No `torch.utils.data.Dataset` inheritance — PyTorch's DataLoader
+    duck-types on `__len__` + `__getitem__`, and keeping this class at
+    module scope (not nested inside main()) matters for pickling under
+    the `spawn` multiprocessing start method. A nested class would
+    fail with `PicklingError: Can't pickle ...<locals>.FloorPlanDS` the
+    moment dataloader_num_workers > 0 on macOS or Windows — a Linux-
+    fork-only bug that vanishes in a CI move.
+    """
+
+    def __init__(self, samples, processor, max_length):
+        self.samples = samples
+        self.processor = processor
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        image = Image.open(s.image_path).convert("RGB")
+        # Downscale very large plans to keep token count tractable.
+        if max(image.size) > 1024:
+            image.thumbnail((1024, 1024))
+        return format_conversation(self.processor, image, s.target_json, self.max_length)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default=TrainConfig.base_model)
@@ -184,7 +269,6 @@ def main():
 
     # Heavy imports here so --help works without ML deps.
     import torch
-    from PIL import Image
     from transformers import (
         AutoProcessor,
         Qwen2_5_VLForConditionalGeneration,
@@ -193,7 +277,6 @@ def main():
         BitsAndBytesConfig,
     )
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-    from torch.utils.data import Dataset
 
     samples = build_samples(cfg)
 
@@ -232,23 +315,6 @@ def main():
     )
     model = get_peft_model(model, lora)
     model.print_trainable_parameters()
-
-    class FloorPlanDS(Dataset):
-        def __init__(self, samples, processor, max_length):
-            self.samples = samples
-            self.processor = processor
-            self.max_length = max_length
-
-        def __len__(self):
-            return len(self.samples)
-
-        def __getitem__(self, idx):
-            s = self.samples[idx]
-            image = Image.open(s.image_path).convert("RGB")
-            # Downscale very large plans to keep token count tractable.
-            if max(image.size) > 1024:
-                image.thumbnail((1024, 1024))
-            return format_conversation(self.processor, image, s.target_json, self.max_length)
 
     def data_collator(batch):
         # Processor already produced tensors with a leading batch dim of 1

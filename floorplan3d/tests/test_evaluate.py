@@ -125,6 +125,22 @@ class EvaluateSampleTest(unittest.TestCase):
         # wall_length_ratio is undefined when pred is missing, not 0 —
         # aggregation needs to skip the row rather than average in 0.
         self.assertIsNone(m.wall_length_ratio)
+        # No explicit error passed → None, so consumers can distinguish
+        # "predictor returned None without context" from "predictor
+        # raised with a message".
+        self.assertIsNone(m.error)
+
+    def test_error_pass_through_is_preserved_in_sample_metrics(self):
+        # When a predictor raises, run_eval captures the exception message
+        # and forwards it to evaluate_sample. Here we call evaluate_sample
+        # directly with the error string — a downstream consumer of the
+        # per-sample dict needs the reason to diagnose without stderr.
+        gt = self._gt()
+        m = evaluate_sample("x", None, gt, error="ValueError: malformed JSON")
+        self.assertFalse(m.valid)
+        self.assertEqual(m.error, "ValueError: malformed JSON")
+        # Round-trip through to_dict so the JSON CLI path also sees it.
+        self.assertEqual(m.to_dict()["error"], "ValueError: malformed JSON")
 
     def test_wrong_label_drops_label_accuracy_not_iou(self):
         gt = self._gt()
@@ -158,6 +174,32 @@ class EvaluateSampleTest(unittest.TestCase):
         }
         m = evaluate_sample("x", pred, gt)
         self.assertAlmostEqual(m.room_iou_coverage, 0.2, delta=0.02)
+
+    def test_label_accuracy_uses_max_denominator_not_matches(self):
+        # Twin to test_one_perfect_room_out_of_five_scores_02_not_10 but
+        # for label accuracy. A predictor that matches 1 of 5 rooms and
+        # gets its label right used to score label_acc=1.0 (perfect),
+        # which is the review bug. Post-fix: divide by max(|pred|, |gt|)
+        # like iou_coverage so the metric reads as 0.2.
+        gt = {
+            "scale": {"pixels_per_meter": 50},
+            "walls": [],
+            "doors": [],
+            "windows": [],
+            "rooms": [
+                {"label": f"r{i}", "polygon": [[i, 0], [i + 1, 0], [i + 1, 1], [i, 1]], "area": 1.0}
+                for i in range(5)
+            ],
+        }
+        pred = {
+            "scale": {"pixels_per_meter": 50},
+            "walls": [],
+            "doors": [],
+            "windows": [],
+            "rooms": [gt["rooms"][0]],
+        }
+        m = evaluate_sample("x", pred, gt)
+        self.assertAlmostEqual(m.room_label_accuracy, 0.2, delta=0.02)
 
     def test_empty_walls_both_sides_makes_ratio_none(self):
         gt = {"scale": {"pixels_per_meter": 50}, "walls": [], "doors": [],

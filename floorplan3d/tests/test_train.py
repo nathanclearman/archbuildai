@@ -14,7 +14,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "model"))
 
-from train import _find_subseq, _mask_prompt_cutoff  # type: ignore
+from train import (  # type: ignore
+    FloorPlanDS,
+    MAX_TARGET_CHARS_PER_TOKEN,
+    _filter_oversized_samples,
+    _find_subseq,
+    _mask_prompt_cutoff,
+)
 
 
 class TestFindSubseq(unittest.TestCase):
@@ -68,6 +74,59 @@ class TestMaskPromptCutoff(unittest.TestCase):
         # producing a 0-length sequence is rare but real — raise early.
         with self.assertRaises(RuntimeError):
             _mask_prompt_cutoff(input_ids=[1, 2, 3], assistant_token_ids=[])
+
+
+class _FakeSample:
+    """Stand-in for dataset.Sample with only the field the filter cares
+    about. Avoids pulling the real Sample class (and its heavier deps)
+    into a unit test that only exercises a char-length filter."""
+    def __init__(self, target_json: str):
+        self.target_json = target_json
+
+
+class TestFilterOversizedSamples(unittest.TestCase):
+    def test_keeps_short_samples(self):
+        samples = [_FakeSample("x" * 100) for _ in range(3)]
+        kept, dropped, budget = _filter_oversized_samples(samples, max_length=1024)
+        self.assertEqual(len(kept), 3)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(budget, int(1024 * MAX_TARGET_CHARS_PER_TOKEN))
+
+    def test_drops_oversized_samples(self):
+        # budget = 100 * 4.0 = 400 chars.
+        short = _FakeSample("x" * 100)
+        big = _FakeSample("x" * 500)
+        kept, dropped, budget = _filter_oversized_samples([short, big], max_length=100)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(budget, 400)
+        self.assertIs(kept[0], short)
+
+    def test_boundary_sample_is_kept(self):
+        # Exactly at the char budget is inclusive. Predictable behaviour
+        # matters more than the specific choice here.
+        exactly = _FakeSample("x" * 400)
+        kept, dropped, _ = _filter_oversized_samples([exactly], max_length=100)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(dropped, 0)
+
+
+class TestFloorPlanDSPicklable(unittest.TestCase):
+    """FloorPlanDS must be defined at module scope, not nested in main(),
+    so it can be pickled when dataloader_num_workers > 0 under the
+    `spawn` multiprocessing start method (macOS / Windows). A nested
+    class raises PicklingError; a module-scope class round-trips.
+    """
+
+    def test_class_qualname_is_module_scoped(self):
+        # A nested class would be <locals>.FloorPlanDS; module-scope is
+        # just FloorPlanDS. This check catches a regression the moment
+        # someone moves the class back inside main().
+        self.assertEqual(FloorPlanDS.__qualname__, "FloorPlanDS")
+
+    def test_class_is_picklable(self):
+        import pickle
+        pickle.loads(pickle.dumps(FloorPlanDS))
 
 
 if __name__ == "__main__":

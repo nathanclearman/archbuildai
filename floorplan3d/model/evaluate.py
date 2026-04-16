@@ -187,17 +187,27 @@ class SampleMetrics:
     # rooms were matched.
     room_label_accuracy: float
     matched_rooms: int
+    # Populated when the predictor raised (valid=False). The first 200
+    # chars of the exception — enough to tell apart "JSON parse error",
+    # "schema violation", "cuda oom", "no weights" without dragging a
+    # full stack trace into the report. None when valid=True.
+    error: str | None = None
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
 
 
-def evaluate_sample(slug: str, pred: dict | None, gt: dict) -> SampleMetrics:
+def evaluate_sample(slug: str, pred: dict | None, gt: dict,
+                    error: str | None = None) -> SampleMetrics:
     """Score one prediction against one ground-truth plan.
 
     `pred is None` (predictor raised or produced unparseable output) is
     treated as a valid evaluation data point — it shows up as zeros with
-    valid=False, which is exactly the signal eval should surface.
+    valid=False, which is exactly the signal eval should surface. The
+    optional `error` argument carries the predictor's exception message
+    so a downstream consumer can tell apart "the model returned
+    malformed JSON" from "the model had no weights loaded" without
+    spelunking stderr.
     """
     gt_walls = gt.get("walls", [])
     gt_doors = gt.get("doors", [])
@@ -220,6 +230,7 @@ def evaluate_sample(slug: str, pred: dict | None, gt: dict) -> SampleMetrics:
             room_iou_coverage=0.0,
             room_label_accuracy=0.0,
             matched_rooms=0,
+            error=error,
         )
 
     p_walls = pred.get("walls", [])
@@ -241,7 +252,13 @@ def evaluate_sample(slug: str, pred: dict | None, gt: dict) -> SampleMetrics:
         correct_label = sum(
             1 for i, j, _ in matches if p_rooms[i]["label"] == gt_rooms[j]["label"]
         )
-        label_acc = correct_label / len(matches)
+        # Same denominator as iou_coverage. Dividing by len(matches)
+        # (the old behaviour) let a predictor that matched 1 of 10 rooms
+        # with the right label report label_acc=1.0, which reads as
+        # perfect when the predictor is nearly blind. Using max(|pred|,
+        # |gt|) instead penalizes both under-prediction and
+        # over-prediction, matching the coverage semantics.
+        label_acc = correct_label / denom
     else:
         iou_coverage = 0.0
         label_acc = 0.0
@@ -404,20 +421,28 @@ PREDICTOR_BUILDERS: dict[str, Callable[..., Predictor]] = {
 
 # ---------- runner ----------
 
+ERROR_MSG_MAX_CHARS = 200
+
+
 def run_eval(samples: Iterable[Sample], predict: Predictor) -> tuple[list[SampleMetrics], dict]:
     per_sample: list[SampleMetrics] = []
     for s in samples:
         gt = json.loads(s.target_json)
+        err: str | None = None
         try:
             pred = predict(str(s.image_path))
             validate(pred)
         except Exception as e:
             # Any predictor failure (missing deps, malformed output, schema
-            # violation) becomes a row with valid=False, so eval always
-            # produces a complete report instead of bailing on the first error.
-            print(f"[eval] {s.image_path.name}: predictor failed: {e}", file=sys.stderr)
+            # violation) becomes a row with valid=False carrying the
+            # exception message, so eval always produces a complete report
+            # and downstream consumers don't need stderr to diagnose.
+            # Truncated to keep the aggregate JSON readable when dozens of
+            # samples fail with the same long stack trace message.
+            err = f"{type(e).__name__}: {e}"[:ERROR_MSG_MAX_CHARS]
+            print(f"[eval] {s.image_path.name}: predictor failed: {err}", file=sys.stderr)
             pred = None
-        m = evaluate_sample(s.image_path.stem, pred, gt)
+        m = evaluate_sample(s.image_path.stem, pred, gt, error=err)
         per_sample.append(m)
     agg = aggregate(per_sample)
     return per_sample, agg
@@ -440,6 +465,10 @@ def format_report(per_sample: list[SampleMetrics], agg: dict) -> str:
             f"room_iou_cov={m.room_iou_coverage} "
             f"label_acc={m.room_label_accuracy}"
         )
+        if m.error:
+            # Reason lives on its own indented line so the grid columns
+            # above stay aligned for grep / diffing.
+            lines.append(f"    error: {m.error}")
     lines.append("aggregate:")
     for k, v in agg.items():
         lines.append(f"  {k:36s} {v}")
