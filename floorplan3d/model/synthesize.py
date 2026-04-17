@@ -49,12 +49,88 @@ LABEL_MARGIN_PX: int = 6
 
 # US room vocabulary used throughout the project. Keep this list in sync
 # with claude_refiner.py's prompt — drift between them = bad eval numbers.
+# `stairs` and `study` were previously emitted by two_story_colonial and
+# cape_cod_cottage without appearing here; adding them closes the
+# vocabulary gap the MIN_ROOM_DIMS probe uncovered.
 US_ROOM_LABELS = [
     "great_room", "living_room", "family_room", "dining_room", "kitchen",
     "master_bedroom", "bedroom", "en_suite", "bathroom", "powder_room",
     "walk_in_closet", "closet", "foyer", "hallway", "mudroom",
-    "laundry_room", "pantry", "garage", "office", "den",
+    "laundry_room", "pantry", "garage", "office", "den", "study",
+    "stairs", "main_room",
 ]
+
+
+# Minimum short-axis length (in metres) that a room of each label may
+# have. The short axis is min(width, height) of the room's bounding
+# rect — what you'd have to walk across to cross the room the narrow
+# way. Values below these points are unrealistic for US residential
+# plans and would teach the VLM that 5-ft master bedrooms exist.
+#
+# Calibration: first draft used aggressive "ideal" minimums (bedroom
+# 2.7 m, master 3.0 m, dining 2.7 m). A 500-sample probe across the
+# current template pool found 67-100% violation rates on 5 of 9
+# templates — meaning a hard gate at those values would either force
+# every generation run into retries-and-raise or a wholesale template
+# rewrite. The values below are tightened to the smallest dims any real
+# US plan would plausibly carry (code minimum or queen-bed minimum,
+# whichever is tighter) so the gate catches clearly-bad rooms without
+# rejecting legitimately-compact ones. If we want more spacious training
+# data later, tighten these values AND tune the offending templates in
+# the same pass.
+#
+# The merger collapses multi-rectangle rooms (e.g. studio_apartment's
+# L-shape) in plan_to_schema, but _validate_plan_dims runs earlier on
+# the raw per-rect Plan. A template that decomposes a big open room
+# into a narrow strip + wide column (studio main_room) therefore faces
+# the minimum on BOTH constituent rects. That's intentional — a "room"
+# whose narrow arm is below bed-width isn't a usable open space.
+MIN_ROOM_DIMS: dict[str, float] = {
+    "great_room":     3.0,   # 10 ft — open-concept centerpiece
+    "living_room":    2.7,   # 9 ft
+    "family_room":    2.7,
+    "dining_room":    2.4,   # 8 ft — fits a 4-person table
+    "kitchen":        2.1,   # 7 ft — galley kitchens exist
+    "master_bedroom": 3.0,   # queen bed + walkaround, non-negotiable
+    "bedroom":        2.4,   # 8 ft — IRC habitable-room minimum
+    "en_suite":       1.5,
+    "bathroom":       1.5,
+    "powder_room":    1.2,
+    "walk_in_closet": 1.2,
+    "closet":         0.6,
+    "foyer":          1.2,
+    "hallway":        0.9,   # 36" code minimum
+    "mudroom":        1.2,
+    "laundry_room":   1.2,
+    "pantry":         0.8,
+    "garage":         3.0,   # one car stall + walkaround
+    "office":         2.1,
+    "den":            2.1,
+    "study":          2.1,
+    "stairs":         0.9,
+    "main_room":      2.2,   # studio open space — narrow arm tolerated
+}
+
+
+def _validate_plan_dims(plan: "Plan") -> list[tuple[str, float, float]]:
+    """Return a list of (label, short_axis_m, minimum_m) for every room
+    whose short axis falls below its label's minimum in MIN_ROOM_DIMS.
+
+    Empty list = plan passes. Unknown labels (not in MIN_ROOM_DIMS) are
+    reported as violations with minimum=inf so a template that
+    misspells a label can't slip through silently — previously a typo
+    like "bed_room" would just be accepted.
+    """
+    violations: list[tuple[str, float, float]] = []
+    for r in plan.rooms:
+        _, _, w, h = r.rect
+        short = min(w, h)
+        minimum = MIN_ROOM_DIMS.get(r.label)
+        if minimum is None:
+            violations.append((r.label, short, float("inf")))
+        elif short < minimum:
+            violations.append((r.label, short, minimum))
+    return violations
 
 
 @dataclass
@@ -3067,6 +3143,29 @@ def _augment_image(img: Image.Image, rng: random.Random,
     return img
 
 
+# Up to this many fresh seed offsets are tried before generate_one gives
+# up on producing a dimensionally valid plan. A value much smaller than
+# the inverse of the observed violation rate will fail spuriously; much
+# larger and a genuinely-broken template would loop quietly. 8 is a
+# compromise: covers >99% of observed per-template violation rates in
+# the current template pool while still surfacing a broken template
+# quickly enough to be debuggable.
+GENERATE_ONE_MAX_RETRIES: int = 8
+
+
+def _build_plan(seed: int, augment: bool) -> tuple["Plan", random.Random]:
+    """Pick a template and run it under a deterministic rng. Attaches
+    bay windows iff augment=True. Extracted so the retry loop in
+    generate_one can call it with different seed offsets without
+    duplicating the template-selection logic."""
+    rng = random.Random(seed)
+    template = rng.choice(TEMPLATES)
+    plan = template(rng)
+    if augment:
+        _maybe_attach_bay(plan, rng)
+    return plan, rng
+
+
 def generate_one(seed: int, cfg: SynthConfig | None = None,
                  augment: bool = True):
     """Generate a single (image, plan_dict) pair.
@@ -3078,13 +3177,40 @@ def generate_one(seed: int, cfg: SynthConfig | None = None,
     tint, JPEG round-trip, small-angle skew, grayscale). The JSON and
     image stay in sync because the only geometry transform (rot/flip)
     is applied to both; every other aug touches pixels only.
+
+    Plans whose rooms violate MIN_ROOM_DIMS (e.g. a 5-ft-wide master
+    bedroom produced by an unlucky rng draw in colonial_compartment-
+    alized) are rejected and regenerated under `seed + 1`, `seed + 2`,
+    ... up to GENERATE_ONE_MAX_RETRIES offsets. The rejection path is
+    the only place violations can get into training data, so it has to
+    be loud rather than silent. Exhausting the retry budget raises —
+    on healthy templates the budget is never exceeded, so a raise
+    signals a genuinely broken template (or a MIN_ROOM_DIMS value too
+    aggressive for the current template pool) that needs fixing, not
+    covering up with more retries.
     """
     cfg = cfg or SynthConfig()
-    rng = random.Random(seed)
-    template = rng.choice(TEMPLATES)
-    plan = template(rng)
-    if augment:
-        _maybe_attach_bay(plan, rng)
+
+    for attempt in range(GENERATE_ONE_MAX_RETRIES + 1):
+        plan, rng = _build_plan(seed + attempt, augment)
+        violations = _validate_plan_dims(plan)
+        if not violations:
+            break
+    else:
+        # Show only the first 3 violations — a single bad template can
+        # produce many, and the first few are enough to identify which
+        # label / which template is undersized.
+        preview = ", ".join(
+            f"{lbl}={s:.2f}m<{m:.2f}m" for lbl, s, m in violations[:3]
+        )
+        raise RuntimeError(
+            f"generate_one: exhausted {GENERATE_ONE_MAX_RETRIES} retries "
+            f"starting from seed {seed} without finding a plan that "
+            f"satisfies MIN_ROOM_DIMS. Last violations: {preview}. "
+            f"Either a template has a geometric lower bound that's too "
+            f"tight, or MIN_ROOM_DIMS has a minimum that's too aggressive."
+        )
+
     plan_dict = plan_to_schema(plan, rng)
     show_dimensions = False
     title_block: str | None = None

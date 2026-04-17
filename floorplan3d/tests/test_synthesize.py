@@ -23,10 +23,12 @@ import schema  # type: ignore
 import synthesize  # type: ignore
 from synthesize import (  # type: ignore
     BayWindow,
+    MIN_ROOM_DIMS,
     Plan,
     Room,
     STYLES,
     TEMPLATES,
+    US_ROOM_LABELS,
     _apply_augmentation,
     _apply_bay_to_walls,
     _bay_corners,
@@ -42,6 +44,7 @@ from synthesize import (  # type: ignore
     _snap_door_to_wall,
     _swing_vector_into_room,
     _union_polygon_axis_aligned,
+    _validate_plan_dims,
     _wall_unit_vector,
 )
 
@@ -1168,6 +1171,135 @@ class StudioApartmentIntegrationTest(unittest.TestCase):
             # And the merged polygon should have 6 vertices (L-shape).
             self.assertEqual(len(schema_main_rooms[0]["polygon"]), 6,
                              f"seed={seed}: expected 6-vertex L-shape")
+
+
+# ---------- room dimension validator ----------
+
+class MinRoomDimsCoverageTest(unittest.TestCase):
+    """Every label any template emits must have an entry in MIN_ROOM_DIMS,
+    otherwise _validate_plan_dims flags it as an unknown-label violation
+    and generate_one's retry loop can't recover. Likewise every label
+    listed in MIN_ROOM_DIMS should be present in the canonical vocab
+    US_ROOM_LABELS — drift between the two is exactly the bug that
+    shipped `stairs` and `study` into the training data without anyone
+    noticing. This test pins both directions.
+    """
+
+    def test_every_template_label_has_a_min_dim(self):
+        import random as _r
+        emitted = set()
+        for t in TEMPLATES:
+            # 30 seeds per template is enough to exercise RNG branches
+            # that relabel / conditionally emit (studio bathroom, ranch
+            # powder_room, two_story stairs). If a rare branch misses
+            # here, the producing template has a reachability issue and
+            # the test rightly doesn't protect it.
+            for seed in range(30):
+                plan = t(_r.Random(seed))
+                for r in plan.rooms:
+                    emitted.add(r.label)
+        missing = emitted - set(MIN_ROOM_DIMS)
+        self.assertEqual(missing, set(),
+                         f"labels emitted by templates but absent from "
+                         f"MIN_ROOM_DIMS: {missing}")
+
+    def test_min_room_dims_labels_are_in_vocab(self):
+        missing = set(MIN_ROOM_DIMS) - set(US_ROOM_LABELS)
+        self.assertEqual(missing, set(),
+                         f"MIN_ROOM_DIMS has labels not in US_ROOM_LABELS: "
+                         f"{missing}")
+
+    def test_every_vocab_label_has_a_min_dim(self):
+        # The reverse gap — a vocab label with no dimension minimum —
+        # would let a template adopt it and skip validation silently.
+        missing = set(US_ROOM_LABELS) - set(MIN_ROOM_DIMS)
+        self.assertEqual(missing, set(),
+                         f"US_ROOM_LABELS has labels not in MIN_ROOM_DIMS: "
+                         f"{missing}")
+
+
+class ValidatePlanDimsTest(unittest.TestCase):
+    def test_well_sized_plan_has_no_violations(self):
+        plan = Plan(
+            rooms=[
+                Room("living_room", (0, 0, 5.0, 4.0)),
+                Room("bedroom", (0, 4.0, 3.0, 3.5)),
+            ],
+            footprint=(5.0, 7.5),
+        )
+        self.assertEqual(_validate_plan_dims(plan), [])
+
+    def test_undersized_master_bedroom_is_flagged(self):
+        # 1.6 m master (the exact shape colonial_compartmentalized was
+        # producing before the validator landed). Short axis < 3.0 m min.
+        plan = Plan(
+            rooms=[Room("master_bedroom", (0, 0, 4.5, 1.6))],
+            footprint=(4.5, 1.6),
+        )
+        v = _validate_plan_dims(plan)
+        self.assertEqual(len(v), 1)
+        label, short, minimum = v[0]
+        self.assertEqual(label, "master_bedroom")
+        self.assertAlmostEqual(short, 1.6)
+        self.assertAlmostEqual(minimum, MIN_ROOM_DIMS["master_bedroom"])
+
+    def test_unknown_label_is_flagged_as_infinite_min(self):
+        # A typo like "bed_room" (underscore-inserted) would silently
+        # slip past a dict.get-without-default. The validator must
+        # surface unknown labels as infinite-minimum violations so the
+        # retry loop doesn't mistake them for passing plans.
+        plan = Plan(
+            rooms=[Room("bed_room", (0, 0, 10.0, 10.0))],
+            footprint=(10.0, 10.0),
+        )
+        v = _validate_plan_dims(plan)
+        self.assertEqual(len(v), 1)
+        self.assertEqual(v[0][0], "bed_room")
+        self.assertEqual(v[0][2], float("inf"))
+
+    def test_short_axis_is_min_of_w_h(self):
+        # Either orientation of the same rect produces the same short
+        # axis. Catches a class of bug where a validator only looked at
+        # one axis.
+        tall = Plan(rooms=[Room("bedroom", (0, 0, 5.0, 2.0))], footprint=(5, 2))
+        wide = Plan(rooms=[Room("bedroom", (0, 0, 2.0, 5.0))], footprint=(2, 5))
+        vt = _validate_plan_dims(tall)
+        vw = _validate_plan_dims(wide)
+        self.assertEqual(len(vt), 1)
+        self.assertEqual(len(vw), 1)
+        self.assertAlmostEqual(vt[0][1], 2.0)
+        self.assertAlmostEqual(vw[0][1], 2.0)
+
+
+class GenerateOneRespectsMinDimsTest(unittest.TestCase):
+    """Smoke test: over a swath of seeds, every plan produced by
+    generate_one must pass _validate_plan_dims. The retry loop inside
+    generate_one is the only barrier between broken templates and
+    polluted training data, so this test is the real gate."""
+
+    def test_swath_of_seeds_produces_no_dimension_violations(self):
+        # 100 seeds covers every template in the current pool given
+        # uniform random choice across 9 templates. If the retry budget
+        # is too low for a template's violation rate, this goes red
+        # with a RuntimeError from generate_one.
+        for seed in range(100):
+            _, plan_dict = synthesize.generate_one(seed, augment=False)
+            # generate_one validates the pre-merge Plan, but the JSON
+            # it returns has gone through plan_to_schema. Re-check the
+            # post-merge polygons satisfy the bbox short-axis minimum
+            # too: the merger produces at worst an L-shape whose bbox
+            # short axis is >= the narrower constituent rect's short
+            # axis, so this is a redundant-but-cheap second gate.
+            for r in plan_dict["rooms"]:
+                xs = [p[0] for p in r["polygon"]]
+                ys = [p[1] for p in r["polygon"]]
+                short = min(max(xs) - min(xs), max(ys) - min(ys))
+                minimum = MIN_ROOM_DIMS.get(r["label"], float("inf"))
+                self.assertGreaterEqual(
+                    short, minimum,
+                    msg=f"seed={seed} label={r['label']} short={short:.2f}m "
+                        f"< min={minimum:.2f}m",
+                )
 
 
 if __name__ == "__main__":
