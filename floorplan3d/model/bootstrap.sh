@@ -52,7 +52,7 @@ fi
 echo "--- installing system packages"
 $SUDO apt-get update -qq
 $SUDO apt-get install -y --no-install-recommends \
-    git git-lfs wget unzip jq ca-certificates > /dev/null
+    git git-lfs wget curl unzip jq ca-certificates > /dev/null
 git lfs install --skip-smudge > /dev/null
 
 # --- 2. Clone --------------------------------------------------------------
@@ -73,13 +73,54 @@ pip install --upgrade pip > /dev/null
 pip install -r floorplan3d/model/requirements.txt
 
 # --- 4. Download CubiCasa5k (~2GB) ----------------------------------------
+# Zenodo publishes the md5 for every file inside the record's JSON metadata.
+# We pull the expected hash before the big download, verify the archive
+# afterwards, and remove+exit on mismatch. Without this, a corrupted or
+# MITMed archive silently unzips a partial dataset — the loader then drops
+# malformed samples with a [skip] print and training proceeds on a
+# fraction of the intended corpus.
+CUBICASA_RECORD_ID="${CUBICASA_RECORD_ID:-2613548}"
+CUBICASA_FILE="${CUBICASA_FILE:-cubicasa5k.zip}"
+
 cd floorplan3d/model
 mkdir -p data
 if [ ! -d data/cubicasa5k ]; then
+    echo "--- resolving expected md5 from Zenodo record $CUBICASA_RECORD_ID"
+    EXPECTED_MD5=$(
+        curl -sSL --fail \
+            "https://zenodo.org/api/records/${CUBICASA_RECORD_ID}" \
+        | jq -r \
+            --arg f "$CUBICASA_FILE" \
+            '.files[] | select(.key == $f) | .checksum' \
+        | sed 's/^md5://'
+    )
+    if [ -z "$EXPECTED_MD5" ] || [ "$EXPECTED_MD5" = "null" ]; then
+        echo "ERROR: could not resolve md5 for $CUBICASA_FILE from Zenodo" >&2
+        echo "       record $CUBICASA_RECORD_ID. If the record was deleted" >&2
+        echo "       or the file renamed, update CUBICASA_RECORD_ID /" >&2
+        echo "       CUBICASA_FILE before rerunning." >&2
+        exit 1
+    fi
+    echo "    expected md5: $EXPECTED_MD5"
+
     echo "--- downloading CubiCasa5k (~2GB, 3-10 min)"
     wget -q --show-progress \
         -O data/cubicasa5k.zip \
-        https://zenodo.org/records/2613548/files/cubicasa5k.zip
+        "https://zenodo.org/records/${CUBICASA_RECORD_ID}/files/${CUBICASA_FILE}"
+
+    echo "--- verifying md5"
+    ACTUAL_MD5=$(md5sum data/cubicasa5k.zip | awk '{print $1}')
+    if [ "$ACTUAL_MD5" != "$EXPECTED_MD5" ]; then
+        echo "ERROR: md5 mismatch on data/cubicasa5k.zip" >&2
+        echo "    expected: $EXPECTED_MD5" >&2
+        echo "    got:      $ACTUAL_MD5" >&2
+        # Remove the bad archive so a rerun doesn't see it as "already
+        # present" and unzip corrupted data.
+        rm -f data/cubicasa5k.zip
+        exit 1
+    fi
+    echo "    md5 OK"
+
     echo "--- unzipping"
     unzip -q data/cubicasa5k.zip -d data/cubicasa5k
     rm data/cubicasa5k.zip

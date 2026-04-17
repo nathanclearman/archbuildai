@@ -21,12 +21,107 @@ DEFAULT_WEIGHTS_DIR = Path(__file__).resolve().parent.parent.parent / "model" / 
 INFERENCE_SCRIPT = Path(__file__).resolve().parent.parent.parent / "model" / "inference.py"
 
 
+# Probe timeout for `import torch` on a candidate interpreter. Torch's first
+# import is dominated by shared-object loading (~1-3s on a warm disk, up to
+# 8s on cold NVMe). 15s covers the slow path without letting a hung python
+# freeze Blender's UI thread forever.
+_PROBE_TIMEOUT_S = 15
+
+
+def _is_blender_python(executable: str) -> bool:
+    """True when `executable` looks like Blender's bundled interpreter.
+
+    Blender ships a Python with no ML deps; shelling out to it from inside
+    the add-on silently fails on `import torch`. We match on the file name
+    plus the ancestor path so we catch both Linux (`.../blender/3.x/python/bin/python3.10`)
+    and macOS (`.../Blender.app/Contents/Resources/.../python3.10`) layouts
+    without depending on `sys.executable` containing the string 'blender'
+    case-insensitively — that would false-positive on a user who happened
+    to unpack Python under `~/Blender-Projects/`.
+    """
+    p = Path(executable).resolve()
+    parts_lower = [part.lower() for part in p.parts]
+    return any("blender" in part for part in parts_lower[:-1])
+
+
+def _probe_python(candidate: str) -> bool:
+    """True iff `candidate` can import torch within the probe budget.
+
+    We import rather than check the path because a venv's python may be a
+    symlink whose name doesn't carry its installed packages. A silent
+    non-zero return (missing module, syntax error, permission denied) all
+    collapse to False — caller decides what to do with that.
+    """
+    try:
+        result = subprocess.run(
+            [candidate, "-c", "import torch"],
+            capture_output=True,
+            timeout=_PROBE_TIMEOUT_S,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    return result.returncode == 0
+
+
+# Candidates tried after FP3D_PYTHON and sys.executable. Covers the two
+# interpreters a user is likely to have on PATH with an ML env installed.
+# Order matters — `python3` is preferred on modern Ubuntu/macOS; plain
+# `python` resolves to 2.x on some older distros and is a fallback.
+_FALLBACK_PYTHON_CANDIDATES: tuple[str, ...] = ("python3", "python")
+
+
+def _resolve_python_bin(probe=_probe_python) -> str:
+    """Find a Python interpreter with `torch` installed.
+
+    Resolution order:
+      1. `FP3D_PYTHON` env var (explicit user override, no probe — trust it)
+      2. `sys.executable` (only when NOT Blender's bundled interpreter)
+      3. `python3`, `python` on PATH
+
+    Every candidate past (1) is probed with `_probe_python` so we don't
+    hand the user a silent `subprocess returncode=1` when the chosen
+    interpreter can't import torch. `probe` is an injection seam so tests
+    don't spawn real subprocesses.
+
+    Raises RuntimeError with a message pointing at FP3D_PYTHON when none
+    of the candidates work — much better UX than the previous default of
+    `sys.executable` which, inside Blender, is guaranteed to fail.
+    """
+    env = os.environ.get("FP3D_PYTHON")
+    if env:
+        return env
+
+    candidates: list[str] = []
+    if not _is_blender_python(sys.executable):
+        candidates.append(sys.executable)
+    candidates.extend(_FALLBACK_PYTHON_CANDIDATES)
+
+    for candidate in candidates:
+        if probe(candidate):
+            return candidate
+
+    raise RuntimeError(
+        "Could not find a Python interpreter with `torch` installed. "
+        "Set the FP3D_PYTHON environment variable to the path of a "
+        "Python that has the model dependencies (see "
+        "floorplan3d/model/requirements.txt). sys.executable is "
+        f"{sys.executable!r} — which is Blender's bundled interpreter "
+        "and does not carry ML dependencies."
+    )
+
+
 class LocalModelClient:
     """Client for the fine-tuned floor plan VLM."""
 
     def __init__(self, weights_dir=None, python_bin=None, timeout=120):
         self.weights_dir = Path(weights_dir) if weights_dir else DEFAULT_WEIGHTS_DIR
-        self.python_bin = python_bin or sys.executable
+        # Resolve lazily-but-eagerly: if caller passed an explicit path,
+        # trust it. Otherwise probe for a torch-capable interpreter and
+        # cache the result. The previous default (sys.executable) silently
+        # routed every Blender-initiated predict() to Blender's bundled
+        # Python, which has no torch — predict() then raised with a
+        # generic "Model inference failed" instead of a fixable message.
+        self.python_bin = python_bin if python_bin else _resolve_python_bin()
         self.timeout = timeout
 
     def predict(self, image_path, cv_only=False, refine=False):
