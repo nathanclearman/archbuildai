@@ -214,7 +214,13 @@ def ranch_open_concept(rng: random.Random) -> Plan:
     bedroom-wing neighbours, so this is the most connected arrangement
     achievable without an L-shaped corridor.
     """
-    w = rng.uniform(16, 20)           # overall width (meters)
+    # Width bumped from (16, 20) to (19, 22). At w=16 with all other
+    # rooms at their max, the rebalance below bottomed out against
+    # mbr_w / wic_w floors and bed3_w landed at ~0.3 m — a 1-ft-wide
+    # "bedroom" that MIN_ROOM_DIMS rejects. The new range gives bed3_w
+    # a worst-case ~1 m budget before rebalance, which the rebalance
+    # can comfortably lift to 2.5 m without floor-clipping.
+    w = rng.uniform(19, 22)           # overall width (meters)
     h = rng.uniform(11, 14)           # overall height
     garage_w = rng.uniform(5.5, 6.5)
     mud_w = rng.uniform(1.8, 2.6)
@@ -226,8 +232,13 @@ def ranch_open_concept(rng: random.Random) -> Plan:
     garage_h = great_h
 
     bed_wing_h = h - great_h
-    mbr_w = rng.uniform(4.5, 5.5)
-    wic_w = rng.uniform(1.8, 2.5)
+    # Tightened master column ranges: mbr_w (4.5, 5.0) was (4.5, 5.5) and
+    # wic_w (1.8, 2.2) was (1.8, 2.5). At their previous upper bounds the
+    # rebalance below couldn't reach the 2.5 m bed3_w target without
+    # hitting the 4.0 / 1.5 floors. The new caps leave enough rebalance
+    # budget for worst-case draws.
+    mbr_w = rng.uniform(4.5, 5.0)
+    wic_w = rng.uniform(1.8, 2.2)
     hall_w = rng.uniform(1.2, 1.5)
     bath_w = rng.uniform(2.0, 2.6)
     # bed3_w fills the remaining wing-row width. The bottom row is:
@@ -320,21 +331,32 @@ def colonial_compartmentalized(rng: random.Random) -> Plan:
       back band (back_h):     master  | hallway | bathroom/bed | bed2
     """
     w = rng.uniform(12, 15)
-    # h bumped: the previous (10, 12) range let middle_h shrink to ~1 m in
-    # the worst case, squeezing laundry_h below the 0.8 m shared-edge
-    # threshold used by plan_to_schema.
-    h = rng.uniform(11, 12)
+    # h bumped: the previous (11, 12) range let back_h shrink to 3.5 m in
+    # the worst case, which made mbr_h = back_h - ens_h drop below 2.0 m —
+    # a 5-ft master bedroom. MIN_ROOM_DIMS flags these; the retry loop
+    # masked the pathology by picking another template. Raising h and
+    # setting back_h explicitly (rather than deriving it last) lets
+    # middle_h absorb the slack instead of mbr_h. back_h ≥ 5.5 m covers
+    # the worst-case master: back_h(5.5) − ens_h(max 2.4) = mbr_h(3.1),
+    # with an epsilon above the 3.0 m master minimum.
+    h = rng.uniform(13, 15)
 
     foyer_w = rng.uniform(1.8, 2.4)
     dining_w = rng.uniform(3.5, 4.2)
     living_w = w - foyer_w - dining_w
 
-    # --- band heights: front + middle + back = h, each with a viable min ---
-    # Middle and back both need >= 3 m so the laundry column and bathroom
-    # stack keep real shared-edge width.
-    front_h = rng.uniform(3.8, 4.5)
-    middle_h = rng.uniform(3.0, min(4.5, h - front_h - 3.5))
-    back_h = h - front_h - middle_h
+    # --- band heights: front + back are explicit, middle absorbs slack ---
+    front_h = rng.uniform(3.5, 4.2)
+    back_h = rng.uniform(5.5, 6.5)
+    middle_h = h - front_h - back_h
+    # If the rng happened to pick a tall front+back that leaves <2.5 m for
+    # the middle band (kitchen + pantry + laundry), shrink back_h down to
+    # a floor of 5.4 (still master-minimum-safe) so middle_h recovers. A
+    # harder contention would bottom out with a violation that
+    # _validate_plan_dims catches and the retry loop rerolls.
+    if middle_h < 2.5:
+        back_h = max(5.4, back_h - (2.5 - middle_h))
+        middle_h = h - front_h - back_h
 
     # --- front band: dining | foyer | living (all full front_h) ---
     rooms: list[Room] = []
@@ -401,7 +423,13 @@ def colonial_compartmentalized(rng: random.Random) -> Plan:
 
     rooms.append(Room("hallway", (mbr_w, y0, hall_w, back_h)))
     rooms.append(Room("bathroom", (mbr_w + hall_w, y0, bath_w, back_h * 0.5)))
-    rooms.append(Room("bedroom", (mbr_w + hall_w, y0 + back_h * 0.5, bath_w, back_h * 0.5)))
+    # The room stacked under the bathroom used to be labelled `bedroom`,
+    # which it categorically isn't — width is capped by bath_w ∈ (2.2,
+    # 2.6) m, below the 2.4 m bedroom minimum on the tight end. In real
+    # US colonial plans this slot is a study, sewing room, or home
+    # office; relabelling matches MIN_ROOM_DIMS (office = 2.1 m) and
+    # the architectural reality.
+    rooms.append(Room("office", (mbr_w + hall_w, y0 + back_h * 0.5, bath_w, back_h * 0.5)))
     rooms.append(Room("bedroom", (mbr_w + hall_w + bath_w, y0, bed2_w, back_h)))
 
     return Plan(rooms=rooms, footprint=(w, h), exterior_door=("foyer", "N"))
@@ -759,7 +787,11 @@ def one_bedroom_apartment(rng: random.Random) -> Plan:
       +---------------------+
     """
     w = rng.uniform(7, 9)
-    h = rng.uniform(8, 11)
+    # h lower bound bumped from 8 to 9. At h=8, living_h_max=4.2, and
+    # bath_h floor=2.0, bedroom_h landed at 1.8 m — below the 2.4 m
+    # bedroom minimum. h ≥ 9 guarantees bedroom_h ≥ 2.8 m in the
+    # worst case even after the bath_h rebalance.
+    h = rng.uniform(9, 11)
 
     living_h = rng.uniform(3.5, 4.2)
     bath_h = rng.uniform(2.0, 2.4)
