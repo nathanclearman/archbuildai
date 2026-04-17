@@ -942,6 +942,26 @@ class RectsShareEdgeTest(unittest.TestCase):
     def test_shared_horizontal_edge(self):
         self.assertTrue(_rects_share_edge((0, 0, 4, 2), (0, 2, 4, 2)))
 
+    def test_sub_precision_float_drift_is_absorbed(self):
+        # Two rects whose shared edge differs by < 1 nm (10 dp) — below
+        # the merger's precision. After rounding they're identical and
+        # the function must report them as sharing an edge. Previously
+        # this relied on a separate 1 µm tolerance constant; the fix
+        # folded that tolerance into the shared rounding precision, so
+        # adjacency and the union-polygon builder agree by construction.
+        self.assertTrue(
+            _rects_share_edge((0, 0, 1, 1), (1 + 1e-10, 0, 1, 1))
+        )
+
+    def test_precision_drift_above_rounding_threshold_disagrees(self):
+        # One millimetre of drift — well above 9-dp rounding — correctly
+        # registers as disjoint. Pinning the threshold sanity-checks the
+        # precision choice: if someone lowers _MERGE_COORD_PRECISION to
+        # e.g. 2 dp (centimeter) this test goes red.
+        self.assertFalse(
+            _rects_share_edge((0, 0, 1, 1), (1.001, 0, 1, 1))
+        )
+
 
 class PolygonToRectTest(unittest.TestCase):
     def test_axis_aligned_square_round_trips(self):
@@ -957,6 +977,31 @@ class PolygonToRectTest(unittest.TestCase):
         # 4-vertex polygon but not axis-aligned (a parallelogram-ish).
         skew = [[0, 0], [2, 0], [3, 2], [1, 2]]
         self.assertIsNone(_polygon_to_rect(skew))
+
+    def test_bow_tie_is_rejected(self):
+        # Self-intersecting 4-vertex shape with exactly 2 unique x coords
+        # and 2 unique y coords (the same bbox as a rectangle), but the
+        # vertex set is not the four bbox corners — two vertices land on
+        # the diagonal instead. Before the fix this returned a phantom
+        # rect (0, 0, 2, 2) and the merger would happily union garbage.
+        bow_tie = [[0, 0], [2, 2], [2, 0], [0, 2]]
+        self.assertIsNone(_polygon_to_rect(bow_tie))
+
+    def test_rect_accepted_regardless_of_start_corner(self):
+        # All four CW rotations of the same rectangle should round-trip.
+        corners = [(0, 0), (2, 0), (2, 3), (0, 3)]
+        for start in range(4):
+            rotated = [list(corners[(start + k) % 4]) for k in range(4)]
+            self.assertEqual(
+                _polygon_to_rect(rotated), (0, 0, 2, 3),
+                msg=f"start corner {start}",
+            )
+
+    def test_rect_accepted_in_counter_clockwise_winding(self):
+        # Post-augmentation flips invert winding; the rect check must
+        # accept CCW polygons just as happily as CW.
+        ccw = [[0, 0], [0, 3], [2, 3], [2, 0]]
+        self.assertEqual(_polygon_to_rect(ccw), (0, 0, 2, 3))
 
 
 class UnionPolygonAxisAlignedTest(unittest.TestCase):

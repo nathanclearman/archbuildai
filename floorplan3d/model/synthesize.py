@@ -987,12 +987,17 @@ def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
 # each connected same-label group into a single record with a
 # rectilinear polygon.
 
-_RECT_EDGE_EPS: float = 1e-6
-# Shared coord-rounding precision for both the rect-extraction and the
-# grid-cell construction. Must be the same on both sides — a polygon
-# vertex that round-trips at one precision but not another would land in
-# a different cell and silently break the merge. 9 dp ≈ nanometer, well
-# below any physical scale we care about.
+# Shared coord-rounding precision used by every routine in the merger.
+# A single precision on one side and a separate tolerance on the other
+# (the previous layout) is a classic footgun: two rects with edges that
+# agree within the tolerance but disagree at the grid precision would be
+# declared "adjacent" by _rects_share_edge, then produce a thin gap in
+# _union_polygon_axis_aligned — the walker finds either a pinch point
+# or two disconnected components and either crashes or silently picks
+# one. Collapsing both sides onto the same precision and comparing
+# rounded coords for exact equality eliminates the class entirely.
+# 9 dp ≈ 1 nm, far below any physical scale we care about; any upstream
+# float drift that survives this rounding is drift we'd want to see.
 _MERGE_COORD_PRECISION: int = 9
 
 
@@ -1004,26 +1009,30 @@ def _rects_share_edge(a: tuple[float, float, float, float],
     rects that meet at a single point are not edge-connected and
     shouldn't be merged into a single room.
 
-    The 1e-6 m (=1 µm) tolerance is safe given upstream rect construction:
-    template rects come from rng.uniform() and edge coords are computed
-    by simple subtraction, so identical edges agree exactly in float
-    arithmetic. Tolerance exists to absorb rotations introduced by
-    _apply_augmentation if the merger ever runs post-aug.
+    Comparisons are on coords rounded to `_MERGE_COORD_PRECISION` —
+    the same precision used by `_union_polygon_axis_aligned`. Exact
+    equality on rounded coords is stricter than a float tolerance but
+    keeps the adjacency check and the union-polygon builder in perfect
+    agreement: anything this function says shares an edge, the builder
+    sees as an adjacent cell-pair.
     """
-    xa, ya, wa, ha = a
-    xb, yb, wb, hb = b
+    p = _MERGE_COORD_PRECISION
+    xa0, ya0 = round(a[0], p), round(a[1], p)
+    xa1, ya1 = round(a[0] + a[2], p), round(a[1] + a[3], p)
+    xb0, yb0 = round(b[0], p), round(b[1], p)
+    xb1, yb1 = round(b[0] + b[2], p), round(b[1] + b[3], p)
 
     # Vertical shared edge: A's right meets B's left, or vice versa.
-    if abs((xa + wa) - xb) < _RECT_EDGE_EPS or abs((xb + wb) - xa) < _RECT_EDGE_EPS:
-        y_lo = max(ya, yb)
-        y_hi = min(ya + ha, yb + hb)
-        return (y_hi - y_lo) > _RECT_EDGE_EPS
+    if xa1 == xb0 or xb1 == xa0:
+        y_lo = max(ya0, yb0)
+        y_hi = min(ya1, yb1)
+        return y_hi > y_lo
 
     # Horizontal shared edge: A's bottom meets B's top, or vice versa.
-    if abs((ya + ha) - yb) < _RECT_EDGE_EPS or abs((yb + hb) - ya) < _RECT_EDGE_EPS:
-        x_lo = max(xa, xb)
-        x_hi = min(xa + wa, xb + wb)
-        return (x_hi - x_lo) > _RECT_EDGE_EPS
+    if ya1 == yb0 or yb1 == ya0:
+        x_lo = max(xa0, xb0)
+        x_hi = min(xa1, xb1)
+        return x_hi > x_lo
 
     return False
 
@@ -1031,13 +1040,42 @@ def _rects_share_edge(a: tuple[float, float, float, float],
 def _polygon_to_rect(polygon: list[list[float]]) -> tuple[float, float, float, float] | None:
     """If `polygon` is a 4-vertex axis-aligned rectangle, return its
     (x, y, w, h). Otherwise None — bay windows and previously merged
-    L-shapes return None and are skipped by the merger."""
+    L-shapes return None and are skipped by the merger.
+
+    Validates that the four vertices are exactly the four bbox corners
+    (accepts both CW and CCW winding). Rejects self-intersecting shapes
+    like `[[0,0], [2,2], [2,0], [0,2]]` that happen to share a bbox
+    with a rectangle but describe a bow-tie. No template produces
+    bow-ties today, but silently merging garbage into garbage is a
+    debugging nightmare if one ever does — preserving the invariant
+    "`_polygon_to_rect` returns a rect iff the polygon IS a rect" is
+    cheap here.
+    """
     if len(polygon) != 4:
         return None
-    xs = sorted({round(p[0], _MERGE_COORD_PRECISION) for p in polygon})
-    ys = sorted({round(p[1], _MERGE_COORD_PRECISION) for p in polygon})
+    p = _MERGE_COORD_PRECISION
+    rounded = [(round(pt[0], p), round(pt[1], p)) for pt in polygon]
+    xs = sorted({pt[0] for pt in rounded})
+    ys = sorted({pt[1] for pt in rounded})
     if len(xs) != 2 or len(ys) != 2:
         return None
+    # The four vertex set must be exactly the four bbox corners. Works
+    # for any winding direction and for polygons that happen to list
+    # vertices starting from any corner.
+    expected = {(xs[0], ys[0]), (xs[0], ys[1]), (xs[1], ys[0]), (xs[1], ys[1])}
+    if set(rounded) != expected:
+        return None
+    # Set equality isn't enough: a bow-tie like [(0,0), (2,2), (2,0), (0,2)]
+    # has the same vertex SET as a rectangle but connects them via two
+    # diagonals. For a true rectangle every consecutive pair of
+    # vertices — including the wrap-around from last to first — must
+    # share either an x or a y coordinate. Fails for bow-ties (pure
+    # diagonals) and still accepts CW/CCW polygons that happen to start
+    # at any corner.
+    for i in range(4):
+        a, b = rounded[i], rounded[(i + 1) % 4]
+        if a[0] != b[0] and a[1] != b[1]:
+            return None
     return (xs[0], ys[0], xs[1] - xs[0], ys[1] - ys[0])
 
 
