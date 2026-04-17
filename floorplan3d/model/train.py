@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -130,22 +131,33 @@ def _filter_oversized_samples(samples, max_length):
     return kept, len(samples) - len(kept), char_budget
 
 
-def _split_eval(samples, eval_split: float) -> tuple[list, list]:
+def _split_eval(samples, eval_split: float, seed: int) -> tuple[list, list]:
     """Deterministic held-out split.
 
-    Takes the first `int(n * eval_split)` samples (post-shuffle, which
-    happens upstream in build_training_set). Shuffling + slicing is
-    equivalent to random-sampling for the split's statistical purpose
-    and avoids introducing a second random source whose seeding would
-    have to be plumbed separately. Floors at 1 sample on any non-empty
-    corpus so the Trainer always has something to evaluate — a zero-
-    sized eval_dataset would silently skip eval instead of training
-    us on a flat signal.
+    Shuffles with an explicit `random.Random(seed)` and takes the first
+    `int(n * eval_split)` samples as eval. Previously the function
+    relied on the shuffle that happens inside `build_training_set`,
+    but that's a fragile cross-function coupling — a refactor that
+    reordered or removed the upstream shuffle would silently make the
+    eval set "the first 10% by load order", which could be all
+    CubiCasa or all one template if the loader batches by directory.
+    Shuffling here pins the invariant locally.
+
+    Floors the eval half at 1 sample on any non-empty corpus so the
+    Trainer always has something to evaluate — a zero-sized
+    eval_dataset silently skips eval and trains blind.
+
+    Returns (train, eval). The train order is whatever the shuffle
+    produced; the Trainer's DataLoader will reshuffle it each epoch,
+    so train-side order inside this function doesn't affect the run.
     """
     if not samples:
         return [], []
-    n_eval = max(1, int(len(samples) * eval_split))
-    return samples[n_eval:], samples[:n_eval]
+    rng = random.Random(seed)
+    shuffled = list(samples)
+    rng.shuffle(shuffled)
+    n_eval = max(1, int(len(shuffled) * eval_split))
+    return shuffled[n_eval:], shuffled[:n_eval]
 
 
 def format_conversation(processor, image, target_json, max_length):
@@ -306,7 +318,7 @@ def main():
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
     samples = build_samples(cfg)
-    train_samples, eval_samples = _split_eval(samples, cfg.eval_split)
+    train_samples, eval_samples = _split_eval(samples, cfg.eval_split, cfg.seed)
     print(f"split: {len(train_samples)} train / {len(eval_samples)} eval "
           f"(eval_split={cfg.eval_split:.2f})")
 

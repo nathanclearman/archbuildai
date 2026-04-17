@@ -188,21 +188,29 @@ class SampleMetrics:
     room_iou_coverage: float
     # IoU precision = sum(matched IoUs) / |pred_rooms|. "Of the rooms I
     # predicted, how well did they overlap with truth." Zero when no pred
-    # rooms. A model that invents rooms drops precision.
+    # rooms. A model that invents rooms drops precision — an unmatched
+    # prediction contributes 0 IoU and 1 to the denominator. The
+    # precision/recall framing is appropriate here because IoU is a
+    # detection-style metric (spatial alignment quality).
     room_iou_precision: float
     # IoU recall = sum(matched IoUs) / |gt_rooms|. "Of the rooms that
     # existed, how well were they captured." Zero when no gt rooms. A
     # model that misses rooms drops recall.
     room_iou_recall: float
-    # Fraction of matched rooms where pred label == gt label. 0 when no
-    # rooms were matched. Same max-denominator semantics as
-    # room_iou_coverage; precision/recall splits below disaggregate.
+    # Fraction of matched rooms where pred label == gt label, measured
+    # two different ways. `_max` divides by max(|pred|, |gt|) and is
+    # retained as the top-line metric for backward compatibility.
+    # `_matched` divides by the number of matched rooms and captures
+    # pure labelling quality — when the model matched a room
+    # geometrically, did it pick the right label? That is categorically
+    # a classification metric, not a detection one, so we name it
+    # "accuracy" and keep it separate from the IoU precision/recall
+    # framing above. An earlier iteration exposed `label_precision` /
+    # `label_recall` computed over |pred| / |gt|; that conflated "you
+    # invented rooms" (a detection error) with "you mislabeled them"
+    # (a classification error) under a name that implied the opposite.
     room_label_accuracy: float
-    # Same split as above applied to label correctness. Label precision =
-    # correct-labelled matches / |pred_rooms|; label recall = correct /
-    # |gt_rooms|.
-    room_label_precision: float
-    room_label_recall: float
+    room_label_accuracy_matched: float
     matched_rooms: int
     # Populated when the predictor raised (valid=False). The first 200
     # chars of the exception — enough to tell apart "JSON parse error",
@@ -248,8 +256,7 @@ def evaluate_sample(slug: str, pred: dict | None, gt: dict,
             room_iou_precision=0.0,
             room_iou_recall=0.0,
             room_label_accuracy=0.0,
-            room_label_precision=0.0,
-            room_label_recall=0.0,
+            room_label_accuracy_matched=0.0,
             matched_rooms=0,
             error=error,
         )
@@ -271,28 +278,31 @@ def evaluate_sample(slug: str, pred: dict | None, gt: dict,
     n_gt = len(gt_rooms)
     denom_cov = max(n_pred, n_gt)
     if matches:
+        # match_rooms returns [] iff either side is empty, so inside this
+        # branch n_pred > 0 AND n_gt > 0 — no zero-division guards needed.
         iou_sum = sum(m[2] for m in matches)
         correct_label = sum(
             1 for i, j, _ in matches if p_rooms[i]["label"] == gt_rooms[j]["label"]
         )
         # Top-line coverage scores retain max-denominator semantics for
         # backward compatibility (existing test baselines were calibrated
-        # against this). Precision and recall disaggregate the same data
-        # so reviewers can tell over- from under-prediction without
+        # against this). IoU precision / recall disaggregate the same
+        # data so reviewers can tell over- from under-prediction without
         # eyeballing the raw counts.
         iou_coverage = iou_sum / denom_cov
+        iou_precision = iou_sum / n_pred
+        iou_recall = iou_sum / n_gt
         label_acc = correct_label / denom_cov
-        iou_precision = iou_sum / n_pred if n_pred else 0.0
-        iou_recall = iou_sum / n_gt if n_gt else 0.0
-        label_precision = correct_label / n_pred if n_pred else 0.0
-        label_recall = correct_label / n_gt if n_gt else 0.0
+        # Pure label-quality metric: when the model DID match a room,
+        # did it pick the correct label? Isolated from the spatial /
+        # detection error modes above.
+        label_acc_matched = correct_label / len(matches)
     else:
         iou_coverage = 0.0
-        label_acc = 0.0
         iou_precision = 0.0
         iou_recall = 0.0
-        label_precision = 0.0
-        label_recall = 0.0
+        label_acc = 0.0
+        label_acc_matched = 0.0
 
     return SampleMetrics(
         slug=slug,
@@ -310,8 +320,7 @@ def evaluate_sample(slug: str, pred: dict | None, gt: dict,
         room_iou_precision=round(iou_precision, 3),
         room_iou_recall=round(iou_recall, 3),
         room_label_accuracy=round(label_acc, 3),
-        room_label_precision=round(label_precision, 3),
-        room_label_recall=round(label_recall, 3),
+        room_label_accuracy_matched=round(label_acc_matched, 3),
         matched_rooms=len(matches),
     )
 
@@ -368,8 +377,7 @@ def aggregate(per_sample: list[SampleMetrics]) -> dict:
         "mean_room_iou_precision": _mean([m.room_iou_precision for m in valid]),
         "mean_room_iou_recall": _mean([m.room_iou_recall for m in valid]),
         "mean_room_label_accuracy": _mean([m.room_label_accuracy for m in valid]),
-        "mean_room_label_precision": _mean([m.room_label_precision for m in valid]),
-        "mean_room_label_recall": _mean([m.room_label_recall for m in valid]),
+        "mean_room_label_accuracy_matched": _mean([m.room_label_accuracy_matched for m in valid]),
         "mean_matched_room_recall": _mean([recall(m) for m in valid]),
     }
 
@@ -501,8 +509,8 @@ def format_report(per_sample: list[SampleMetrics], agg: dict) -> str:
             f"wins={m.window_count_pred}/{m.window_count_gt} "
             f"rooms={m.room_count_pred}/{m.room_count_gt} "
             f"wall_len_ratio={ratio} "
-            f"iou=P{m.room_iou_precision}/R{m.room_iou_recall} "
-            f"label=P{m.room_label_precision}/R{m.room_label_recall}"
+            f"iou_cov={m.room_iou_coverage} (P{m.room_iou_precision}/R{m.room_iou_recall}) "
+            f"label_acc={m.room_label_accuracy} (matched={m.room_label_accuracy_matched})"
         )
         if m.error:
             # Reason lives on its own indented line so the grid columns

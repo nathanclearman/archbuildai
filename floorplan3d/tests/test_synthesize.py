@@ -1271,6 +1271,41 @@ class ValidatePlanDimsTest(unittest.TestCase):
         self.assertAlmostEqual(vw[0][1], 2.0)
 
 
+class ColonialLabelDistributionTest(unittest.TestCase):
+    """The colonial_compartmentalized template relabelled the room
+    stacked under the bathroom from `bedroom` to `office` in the F
+    tuning pass (commit 5d001e7). The slot's dimensions — width capped
+    by bath_w ∈ (2.2, 2.6) m — are categorically not bedroom-sized,
+    and the label now matches the geometry. This test pins the contract
+    so a future refactor can't silently relabel it back.
+    """
+
+    def _make_plan(self, seed: int):
+        import random as _r
+        from synthesize import colonial_compartmentalized  # type: ignore
+        return colonial_compartmentalized(_r.Random(seed))
+
+    def test_one_office_per_plan(self):
+        # The formerly-bedroom slot is now labelled `office`. Every
+        # colonial draw should produce exactly one.
+        for seed in range(20):
+            plan = self._make_plan(seed)
+            offices = [r for r in plan.rooms if r.label == "office"]
+            self.assertEqual(len(offices), 1, msg=f"seed={seed}")
+
+    def test_bedroom_count_matches_architectural_intent(self):
+        # Colonial is a 2-bedroom plan: master + secondary. Third
+        # "bedroom" was the misnamed office. If someone adds a proper
+        # third bedroom later this test goes red intentionally — they
+        # should update the assertion to reflect the new design.
+        for seed in range(20):
+            plan = self._make_plan(seed)
+            n_master = sum(1 for r in plan.rooms if r.label == "master_bedroom")
+            n_bedroom = sum(1 for r in plan.rooms if r.label == "bedroom")
+            self.assertEqual(n_master, 1, msg=f"seed={seed}")
+            self.assertEqual(n_bedroom, 1, msg=f"seed={seed}")
+
+
 class GenerateOneRespectsMinDimsTest(unittest.TestCase):
     """Smoke test: over a swath of seeds, every plan produced by
     generate_one must pass _validate_plan_dims. The retry loop inside

@@ -117,26 +117,32 @@ class TestSplitEval(unittest.TestCase):
     overfitting from generalisation; silently zero-sizing it would
     disable checkpoint selection without a visible error. These tests
     pin the edge-case handling the smoke inside train.main() can't
-    exercise."""
+    exercise.
+    """
 
     def test_empty_input_returns_empty_splits(self):
-        train, evl = _split_eval([], 0.1)
+        train, evl = _split_eval([], 0.1, seed=0)
         self.assertEqual(train, [])
         self.assertEqual(evl, [])
 
     def test_standard_ten_percent_split(self):
         samples = list(range(100))
-        train, evl = _split_eval(samples, 0.1)
+        train, evl = _split_eval(samples, 0.1, seed=0)
         self.assertEqual(len(train), 90)
         self.assertEqual(len(evl), 10)
-        # Held-out is a prefix, so train and eval are disjoint.
+        # Train and eval are disjoint: a sample that lands in eval
+        # should never also land in train (and vice versa). The previous
+        # implementation took a prefix slice off the upstream-shuffled
+        # list and this test still passes under internal-shuffle too.
         self.assertEqual(set(train).intersection(evl), set())
+        # Union covers every input sample — nothing dropped.
+        self.assertEqual(sorted(train + evl), samples)
 
     def test_small_corpus_still_gets_nonzero_eval(self):
         # 5 samples * 0.1 = 0.5 → int(0.5) = 0. Floor to 1 so eval is
         # never empty on a non-empty corpus — otherwise the Trainer
         # silently skips all eval steps.
-        train, evl = _split_eval(list(range(5)), 0.1)
+        train, evl = _split_eval(list(range(5)), 0.1, seed=0)
         self.assertEqual(len(evl), 1)
         self.assertEqual(len(train), 4)
 
@@ -145,9 +151,38 @@ class TestSplitEval(unittest.TestCase):
         # train gets nothing. Documented edge case — build_samples
         # would normally raise long before we got here, but the split
         # shouldn't add its own opaque failure.
-        train, evl = _split_eval([42], 0.1)
+        train, evl = _split_eval([42], 0.1, seed=0)
         self.assertEqual(train, [])
         self.assertEqual(evl, [42])
+
+    def test_same_seed_produces_same_split(self):
+        # The split must be reproducible across runs for checkpoint
+        # resumption to make sense — otherwise resuming a training run
+        # might see a different eval set than the original.
+        samples = list(range(50))
+        a_train, a_eval = _split_eval(samples, 0.1, seed=42)
+        b_train, b_eval = _split_eval(samples, 0.1, seed=42)
+        self.assertEqual(a_train, b_train)
+        self.assertEqual(a_eval, b_eval)
+
+    def test_different_seed_produces_different_split(self):
+        # A smoke check that seeding actually affects the shuffle —
+        # guards against a future refactor that accidentally ignores
+        # the seed kwarg.
+        samples = list(range(50))
+        _, eval_a = _split_eval(samples, 0.1, seed=0)
+        _, eval_b = _split_eval(samples, 0.1, seed=1)
+        self.assertNotEqual(eval_a, eval_b)
+
+    def test_shuffle_does_not_mutate_input(self):
+        # The previous prefix-slice implementation was view-safe by
+        # accident; the new implementation shuffles a copy. Pin it so
+        # a future optimisation that skips the copy doesn't silently
+        # reorder the caller's list.
+        samples = list(range(20))
+        original = list(samples)
+        _split_eval(samples, 0.1, seed=0)
+        self.assertEqual(samples, original)
 
 
 class TestFloorPlanDSPicklable(unittest.TestCase):

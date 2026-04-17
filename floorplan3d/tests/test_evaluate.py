@@ -201,7 +201,7 @@ class EvaluateSampleTest(unittest.TestCase):
         m = evaluate_sample("x", pred, gt)
         self.assertAlmostEqual(m.room_label_accuracy, 0.2, delta=0.02)
 
-    def test_precision_recall_disambiguate_over_prediction(self):
+    def test_iou_precision_recall_disambiguate_over_prediction(self):
         # A predictor that outputs 10 rooms against a 1-room GT gets
         # iou_coverage = 0.1 (max denominator penalizes the 9 extras).
         # Precision is the same 0.1 (sum(IoU=1) / 10 preds), but recall
@@ -222,10 +222,13 @@ class EvaluateSampleTest(unittest.TestCase):
         m = evaluate_sample("x", pred, gt)
         self.assertAlmostEqual(m.room_iou_precision, 0.1, delta=0.02)
         self.assertAlmostEqual(m.room_iou_recall, 1.0, delta=0.02)
-        self.assertAlmostEqual(m.room_label_precision, 0.1, delta=0.02)
-        self.assertAlmostEqual(m.room_label_recall, 1.0, delta=0.02)
+        # Label accuracy (matched) is 1.0: the one room that WAS
+        # matched had the correct label. The over-prediction error is
+        # reflected in the IoU metrics, not the label ones — label
+        # quality is a classification signal, not a detection signal.
+        self.assertAlmostEqual(m.room_label_accuracy_matched, 1.0, delta=0.02)
 
-    def test_precision_recall_disambiguate_under_prediction(self):
+    def test_iou_precision_recall_disambiguate_under_prediction(self):
         # Inverse: 1 predicted room against 10 GT rooms. Precision is
         # 1.0 (the single pred perfectly matched one GT); recall is 0.1
         # (only 1 of 10 GT rooms was captured). The split reveals
@@ -241,8 +244,32 @@ class EvaluateSampleTest(unittest.TestCase):
         m = evaluate_sample("x", pred, gt)
         self.assertAlmostEqual(m.room_iou_precision, 1.0, delta=0.02)
         self.assertAlmostEqual(m.room_iou_recall, 0.1, delta=0.02)
-        self.assertAlmostEqual(m.room_label_precision, 1.0, delta=0.02)
-        self.assertAlmostEqual(m.room_label_recall, 0.1, delta=0.02)
+        # Again, the one room we DID match had the right label →
+        # label_accuracy_matched = 1.0. The overall label_accuracy
+        # is 0.1 (max-denominator), matching iou_coverage semantics.
+        self.assertAlmostEqual(m.room_label_accuracy_matched, 1.0, delta=0.02)
+        self.assertAlmostEqual(m.room_label_accuracy, 0.1, delta=0.02)
+
+    def test_label_accuracy_matched_isolates_labelling_from_detection(self):
+        # Two GT rooms in non-overlapping positions. Prediction: the
+        # first room's polygon matches, but its label is wrong; the
+        # second predicted room is in a disjoint position so it's
+        # unmatched. label_accuracy_matched should be 0.0 (of the ONE
+        # room we matched, label was wrong). label_accuracy (max-denom)
+        # is also 0.0 because no correct labels at all. Test is mostly
+        # to document that label_accuracy_matched can go to 0 even when
+        # IoU precision / recall are nonzero — isolating the error mode.
+        gt_a = {"label": "bedroom", "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]], "area": 1.0}
+        gt_b = {"label": "kitchen", "polygon": [[5, 0], [6, 0], [6, 1], [5, 1]], "area": 1.0}
+        gt = {"scale": {"pixels_per_meter": 50}, "walls": [], "doors": [],
+              "windows": [], "rooms": [gt_a, gt_b]}
+        pred_a_wronglabel = {"label": "bathroom", "polygon": gt_a["polygon"], "area": 1.0}
+        pred_disjoint = {"label": "office", "polygon": [[10, 10], [11, 10], [11, 11], [10, 11]], "area": 1.0}
+        pred = {"scale": {"pixels_per_meter": 50}, "walls": [], "doors": [],
+                "windows": [], "rooms": [pred_a_wronglabel, pred_disjoint]}
+        m = evaluate_sample("x", pred, gt)
+        self.assertGreater(m.room_iou_precision, 0.0)
+        self.assertEqual(m.room_label_accuracy_matched, 0.0)
 
     def test_empty_walls_both_sides_makes_ratio_none(self):
         gt = {"scale": {"pixels_per_meter": 50}, "walls": [], "doors": [],
@@ -266,7 +293,7 @@ class AggregateTest(unittest.TestCase):
             room_count_pred=1, room_count_gt=1,
             wall_length_ratio=1.0,
             room_iou_coverage=1.0, room_iou_precision=1.0, room_iou_recall=1.0,
-            room_label_accuracy=1.0, room_label_precision=1.0, room_label_recall=1.0,
+            room_label_accuracy=1.0, room_label_accuracy_matched=1.0,
             matched_rooms=1,
         )
         invalid = SampleMetrics(
@@ -277,7 +304,7 @@ class AggregateTest(unittest.TestCase):
             room_count_pred=0, room_count_gt=1,
             wall_length_ratio=None,
             room_iou_coverage=0.0, room_iou_precision=0.0, room_iou_recall=0.0,
-            room_label_accuracy=0.0, room_label_precision=0.0, room_label_recall=0.0,
+            room_label_accuracy=0.0, room_label_accuracy_matched=0.0,
             matched_rooms=0,
         )
         agg = aggregate([valid, invalid])

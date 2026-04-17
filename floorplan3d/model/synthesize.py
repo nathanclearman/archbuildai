@@ -3176,13 +3176,13 @@ def _augment_image(img: Image.Image, rng: random.Random,
 
 
 # Up to this many fresh seed offsets are tried before generate_one gives
-# up on producing a dimensionally valid plan. A value much smaller than
-# the inverse of the observed violation rate will fail spuriously; much
-# larger and a genuinely-broken template would loop quietly. 8 is a
-# compromise: covers >99% of observed per-template violation rates in
-# the current template pool while still surfacing a broken template
-# quickly enough to be debuggable.
-GENERATE_ONE_MAX_RETRIES: int = 8
+# up on producing a dimensionally valid plan. Calibrated to the current
+# template pool's ~0.1% aggregate violation rate: P(3 consecutive
+# failures) ≈ 1e-9, negligible. A value much smaller than the observed
+# violation rate fails spuriously; much larger silently covers up a
+# genuinely-broken template that should surface as a raise. If a future
+# template tune raises the aggregate rate above ~1%, bump this back up.
+GENERATE_ONE_MAX_RETRIES: int = 3
 
 
 def _build_plan(seed: int, augment: bool) -> tuple["Plan", random.Random]:
