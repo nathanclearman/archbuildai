@@ -62,6 +62,15 @@ class TrainConfig:
     logging_steps: int = 10
     dataloader_num_workers: int = 2
     seed: int = 0
+    # Fraction of the corpus held out for eval. Computed as
+    # max(1, int(len(samples) * eval_split)) — never zero for non-empty
+    # corpora. 10% is the standard compromise: small enough to keep
+    # most samples in train, large enough to stabilise the eval_loss
+    # signal for checkpoint selection.
+    eval_split: float = 0.10
+    # Eval happens every this many optimizer steps. Must equal save_steps
+    # when load_best_model_at_end=True, so a single knob covers both.
+    eval_steps: int = 500
 
 
 # Coarse char-per-token upper bound for Qwen's BPE on JSON text. JSON is
@@ -119,6 +128,24 @@ def _filter_oversized_samples(samples, max_length):
     char_budget = int(max_length * MAX_TARGET_CHARS_PER_TOKEN)
     kept = [s for s in samples if len(s.target_json) <= char_budget]
     return kept, len(samples) - len(kept), char_budget
+
+
+def _split_eval(samples, eval_split: float) -> tuple[list, list]:
+    """Deterministic held-out split.
+
+    Takes the first `int(n * eval_split)` samples (post-shuffle, which
+    happens upstream in build_training_set). Shuffling + slicing is
+    equivalent to random-sampling for the split's statistical purpose
+    and avoids introducing a second random source whose seeding would
+    have to be plumbed separately. Floors at 1 sample on any non-empty
+    corpus so the Trainer always has something to evaluate — a zero-
+    sized eval_dataset would silently skip eval instead of training
+    us on a flat signal.
+    """
+    if not samples:
+        return [], []
+    n_eval = max(1, int(len(samples) * eval_split))
+    return samples[n_eval:], samples[:n_eval]
 
 
 def format_conversation(processor, image, target_json, max_length):
@@ -279,6 +306,9 @@ def main():
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
     samples = build_samples(cfg)
+    train_samples, eval_samples = _split_eval(samples, cfg.eval_split)
+    print(f"split: {len(train_samples)} train / {len(eval_samples)} eval "
+          f"(eval_split={cfg.eval_split:.2f})")
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -361,8 +391,19 @@ def main():
         learning_rate=cfg.learning_rate,
         warmup_ratio=cfg.warmup_ratio,
         logging_steps=cfg.logging_steps,
+        save_strategy="steps",
         save_steps=cfg.save_steps,
         save_total_limit=3,
+        # Eval cadence matches save cadence so load_best_model_at_end
+        # can pair each checkpoint with the eval_loss from that step.
+        # Using a separate eval_steps would either skip pairings or
+        # duplicate evals — HF requires eval_strategy == save_strategy
+        # for best-checkpoint tracking to work.
+        eval_strategy="steps",
+        eval_steps=cfg.eval_steps,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         bf16=True,
         gradient_checkpointing=True,
         # Recent torch flags the default (reentrant) checkpointing path
@@ -388,7 +429,8 @@ def main():
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=FloorPlanDS(samples, processor, cfg.max_length),
+        train_dataset=FloorPlanDS(train_samples, processor, cfg.max_length),
+        eval_dataset=FloorPlanDS(eval_samples, processor, cfg.max_length) if eval_samples else None,
         data_collator=data_collator,
     )
 

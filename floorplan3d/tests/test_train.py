@@ -20,6 +20,7 @@ from train import (  # type: ignore
     _filter_oversized_samples,
     _find_subseq,
     _mask_prompt_cutoff,
+    _split_eval,
 )
 
 
@@ -109,6 +110,44 @@ class TestFilterOversizedSamples(unittest.TestCase):
         kept, dropped, _ = _filter_oversized_samples([exactly], max_length=100)
         self.assertEqual(len(kept), 1)
         self.assertEqual(dropped, 0)
+
+
+class TestSplitEval(unittest.TestCase):
+    """The eval split is the only way the Trainer distinguishes
+    overfitting from generalisation; silently zero-sizing it would
+    disable checkpoint selection without a visible error. These tests
+    pin the edge-case handling the smoke inside train.main() can't
+    exercise."""
+
+    def test_empty_input_returns_empty_splits(self):
+        train, evl = _split_eval([], 0.1)
+        self.assertEqual(train, [])
+        self.assertEqual(evl, [])
+
+    def test_standard_ten_percent_split(self):
+        samples = list(range(100))
+        train, evl = _split_eval(samples, 0.1)
+        self.assertEqual(len(train), 90)
+        self.assertEqual(len(evl), 10)
+        # Held-out is a prefix, so train and eval are disjoint.
+        self.assertEqual(set(train).intersection(evl), set())
+
+    def test_small_corpus_still_gets_nonzero_eval(self):
+        # 5 samples * 0.1 = 0.5 → int(0.5) = 0. Floor to 1 so eval is
+        # never empty on a non-empty corpus — otherwise the Trainer
+        # silently skips all eval steps.
+        train, evl = _split_eval(list(range(5)), 0.1)
+        self.assertEqual(len(evl), 1)
+        self.assertEqual(len(train), 4)
+
+    def test_single_sample_eval_split_yields_empty_train(self):
+        # Pathological but legal: 1 sample, 0.1 split. Eval gets it,
+        # train gets nothing. Documented edge case — build_samples
+        # would normally raise long before we got here, but the split
+        # shouldn't add its own opaque failure.
+        train, evl = _split_eval([42], 0.1)
+        self.assertEqual(train, [])
+        self.assertEqual(evl, [42])
 
 
 class TestFloorPlanDSPicklable(unittest.TestCase):

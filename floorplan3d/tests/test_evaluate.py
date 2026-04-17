@@ -201,6 +201,49 @@ class EvaluateSampleTest(unittest.TestCase):
         m = evaluate_sample("x", pred, gt)
         self.assertAlmostEqual(m.room_label_accuracy, 0.2, delta=0.02)
 
+    def test_precision_recall_disambiguate_over_prediction(self):
+        # A predictor that outputs 10 rooms against a 1-room GT gets
+        # iou_coverage = 0.1 (max denominator penalizes the 9 extras).
+        # Precision is the same 0.1 (sum(IoU=1) / 10 preds), but recall
+        # is 1.0 (the single GT room was perfectly matched). The split
+        # tells you it's an over-prediction problem, not a miss problem.
+        gt_room = {"label": "r0", "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]], "area": 1.0}
+        gt = {"scale": {"pixels_per_meter": 50}, "walls": [], "doors": [],
+              "windows": [], "rooms": [gt_room]}
+        # 10 predicted rooms: one matches the GT, nine are in disjoint
+        # positions so greedy matching leaves them unmatched.
+        extras = [
+            {"label": f"e{i}", "polygon": [[i + 10, 0], [i + 11, 0],
+                                           [i + 11, 1], [i + 10, 1]], "area": 1.0}
+            for i in range(9)
+        ]
+        pred = {"scale": {"pixels_per_meter": 50}, "walls": [], "doors": [],
+                "windows": [], "rooms": [gt_room] + extras}
+        m = evaluate_sample("x", pred, gt)
+        self.assertAlmostEqual(m.room_iou_precision, 0.1, delta=0.02)
+        self.assertAlmostEqual(m.room_iou_recall, 1.0, delta=0.02)
+        self.assertAlmostEqual(m.room_label_precision, 0.1, delta=0.02)
+        self.assertAlmostEqual(m.room_label_recall, 1.0, delta=0.02)
+
+    def test_precision_recall_disambiguate_under_prediction(self):
+        # Inverse: 1 predicted room against 10 GT rooms. Precision is
+        # 1.0 (the single pred perfectly matched one GT); recall is 0.1
+        # (only 1 of 10 GT rooms was captured). The split reveals
+        # under-prediction.
+        gt_rooms = [
+            {"label": f"r{i}", "polygon": [[i, 0], [i + 1, 0], [i + 1, 1], [i, 1]], "area": 1.0}
+            for i in range(10)
+        ]
+        gt = {"scale": {"pixels_per_meter": 50}, "walls": [], "doors": [],
+              "windows": [], "rooms": gt_rooms}
+        pred = {"scale": {"pixels_per_meter": 50}, "walls": [], "doors": [],
+                "windows": [], "rooms": [gt_rooms[0]]}
+        m = evaluate_sample("x", pred, gt)
+        self.assertAlmostEqual(m.room_iou_precision, 1.0, delta=0.02)
+        self.assertAlmostEqual(m.room_iou_recall, 0.1, delta=0.02)
+        self.assertAlmostEqual(m.room_label_precision, 1.0, delta=0.02)
+        self.assertAlmostEqual(m.room_label_recall, 0.1, delta=0.02)
+
     def test_empty_walls_both_sides_makes_ratio_none(self):
         gt = {"scale": {"pixels_per_meter": 50}, "walls": [], "doors": [],
               "windows": [], "rooms": []}
@@ -221,8 +264,10 @@ class AggregateTest(unittest.TestCase):
             door_count_pred=0, door_count_gt=0,
             window_count_pred=0, window_count_gt=0,
             room_count_pred=1, room_count_gt=1,
-            wall_length_ratio=1.0, room_iou_coverage=1.0,
-            room_label_accuracy=1.0, matched_rooms=1,
+            wall_length_ratio=1.0,
+            room_iou_coverage=1.0, room_iou_precision=1.0, room_iou_recall=1.0,
+            room_label_accuracy=1.0, room_label_precision=1.0, room_label_recall=1.0,
+            matched_rooms=1,
         )
         invalid = SampleMetrics(
             slug="b", valid=False,
@@ -230,8 +275,10 @@ class AggregateTest(unittest.TestCase):
             door_count_pred=0, door_count_gt=0,
             window_count_pred=0, window_count_gt=0,
             room_count_pred=0, room_count_gt=1,
-            wall_length_ratio=None, room_iou_coverage=0.0,
-            room_label_accuracy=0.0, matched_rooms=0,
+            wall_length_ratio=None,
+            room_iou_coverage=0.0, room_iou_precision=0.0, room_iou_recall=0.0,
+            room_label_accuracy=0.0, room_label_precision=0.0, room_label_recall=0.0,
+            matched_rooms=0,
         )
         agg = aggregate([valid, invalid])
         self.assertEqual(agg["n"], 2)

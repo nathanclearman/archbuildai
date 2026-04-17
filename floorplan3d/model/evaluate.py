@@ -181,11 +181,28 @@ class SampleMetrics:
     wall_length_ratio: float | None
     # Sum of matched-pair IoUs divided by max(|pred_rooms|, |gt_rooms|), so
     # unmatched rooms on either side drag the score down. 0 when both sides
-    # are empty.
+    # are empty. Retained for backward compatibility; for diagnosis use the
+    # split precision/recall fields below — iou_coverage collapses two
+    # very different failure modes (over-prediction vs under-prediction)
+    # into one scalar.
     room_iou_coverage: float
+    # IoU precision = sum(matched IoUs) / |pred_rooms|. "Of the rooms I
+    # predicted, how well did they overlap with truth." Zero when no pred
+    # rooms. A model that invents rooms drops precision.
+    room_iou_precision: float
+    # IoU recall = sum(matched IoUs) / |gt_rooms|. "Of the rooms that
+    # existed, how well were they captured." Zero when no gt rooms. A
+    # model that misses rooms drops recall.
+    room_iou_recall: float
     # Fraction of matched rooms where pred label == gt label. 0 when no
-    # rooms were matched.
+    # rooms were matched. Same max-denominator semantics as
+    # room_iou_coverage; precision/recall splits below disaggregate.
     room_label_accuracy: float
+    # Same split as above applied to label correctness. Label precision =
+    # correct-labelled matches / |pred_rooms|; label recall = correct /
+    # |gt_rooms|.
+    room_label_precision: float
+    room_label_recall: float
     matched_rooms: int
     # Populated when the predictor raised (valid=False). The first 200
     # chars of the exception — enough to tell apart "JSON parse error",
@@ -228,7 +245,11 @@ def evaluate_sample(slug: str, pred: dict | None, gt: dict,
             room_count_gt=len(gt_rooms),
             wall_length_ratio=None,
             room_iou_coverage=0.0,
+            room_iou_precision=0.0,
+            room_iou_recall=0.0,
             room_label_accuracy=0.0,
+            room_label_precision=0.0,
+            room_label_recall=0.0,
             matched_rooms=0,
             error=error,
         )
@@ -246,22 +267,32 @@ def evaluate_sample(slug: str, pred: dict | None, gt: dict,
     wall_ratio = (pred_len / gt_len) if (gt_len > 0 and pred_len > 0) else None
 
     matches = match_rooms(p_rooms, gt_rooms)
-    denom = max(len(p_rooms), len(gt_rooms))
+    n_pred = len(p_rooms)
+    n_gt = len(gt_rooms)
+    denom_cov = max(n_pred, n_gt)
     if matches:
-        iou_coverage = sum(m[2] for m in matches) / denom
+        iou_sum = sum(m[2] for m in matches)
         correct_label = sum(
             1 for i, j, _ in matches if p_rooms[i]["label"] == gt_rooms[j]["label"]
         )
-        # Same denominator as iou_coverage. Dividing by len(matches)
-        # (the old behaviour) let a predictor that matched 1 of 10 rooms
-        # with the right label report label_acc=1.0, which reads as
-        # perfect when the predictor is nearly blind. Using max(|pred|,
-        # |gt|) instead penalizes both under-prediction and
-        # over-prediction, matching the coverage semantics.
-        label_acc = correct_label / denom
+        # Top-line coverage scores retain max-denominator semantics for
+        # backward compatibility (existing test baselines were calibrated
+        # against this). Precision and recall disaggregate the same data
+        # so reviewers can tell over- from under-prediction without
+        # eyeballing the raw counts.
+        iou_coverage = iou_sum / denom_cov
+        label_acc = correct_label / denom_cov
+        iou_precision = iou_sum / n_pred if n_pred else 0.0
+        iou_recall = iou_sum / n_gt if n_gt else 0.0
+        label_precision = correct_label / n_pred if n_pred else 0.0
+        label_recall = correct_label / n_gt if n_gt else 0.0
     else:
         iou_coverage = 0.0
         label_acc = 0.0
+        iou_precision = 0.0
+        iou_recall = 0.0
+        label_precision = 0.0
+        label_recall = 0.0
 
     return SampleMetrics(
         slug=slug,
@@ -272,11 +303,15 @@ def evaluate_sample(slug: str, pred: dict | None, gt: dict,
         door_count_gt=len(gt_doors),
         window_count_pred=len(p_windows),
         window_count_gt=len(gt_windows),
-        room_count_pred=len(p_rooms),
-        room_count_gt=len(gt_rooms),
+        room_count_pred=n_pred,
+        room_count_gt=n_gt,
         wall_length_ratio=(round(wall_ratio, 3) if wall_ratio is not None else None),
         room_iou_coverage=round(iou_coverage, 3),
+        room_iou_precision=round(iou_precision, 3),
+        room_iou_recall=round(iou_recall, 3),
         room_label_accuracy=round(label_acc, 3),
+        room_label_precision=round(label_precision, 3),
+        room_label_recall=round(label_recall, 3),
         matched_rooms=len(matches),
     )
 
@@ -330,7 +365,11 @@ def aggregate(per_sample: list[SampleMetrics]) -> dict:
         "mean_wall_length_ratio": _mean(wall_ratios),
         "wall_length_ratio_defined_n": len(wall_ratios),
         "mean_room_iou_coverage": _mean([m.room_iou_coverage for m in valid]),
+        "mean_room_iou_precision": _mean([m.room_iou_precision for m in valid]),
+        "mean_room_iou_recall": _mean([m.room_iou_recall for m in valid]),
         "mean_room_label_accuracy": _mean([m.room_label_accuracy for m in valid]),
+        "mean_room_label_precision": _mean([m.room_label_precision for m in valid]),
+        "mean_room_label_recall": _mean([m.room_label_recall for m in valid]),
         "mean_matched_room_recall": _mean([recall(m) for m in valid]),
     }
 
@@ -462,8 +501,8 @@ def format_report(per_sample: list[SampleMetrics], agg: dict) -> str:
             f"wins={m.window_count_pred}/{m.window_count_gt} "
             f"rooms={m.room_count_pred}/{m.room_count_gt} "
             f"wall_len_ratio={ratio} "
-            f"room_iou_cov={m.room_iou_coverage} "
-            f"label_acc={m.room_label_accuracy}"
+            f"iou=P{m.room_iou_precision}/R{m.room_iou_recall} "
+            f"label=P{m.room_label_precision}/R{m.room_label_recall}"
         )
         if m.error:
             # Reason lives on its own indented line so the grid columns
