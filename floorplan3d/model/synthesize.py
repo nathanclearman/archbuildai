@@ -958,6 +958,15 @@ def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
             area += 0.5 * (b.base_width + top) * b.depth
         rooms_out.append({"label": r.label, "polygon": polygon, "area": round(area, 2)})
 
+    # Studio_apartment (and any future template needing a non-rectangular
+    # room) emits the room as multiple same-label abutting rectangles
+    # because the Room data model only supports axis-aligned rects. The
+    # canonical JSON the model trains against should describe the user-
+    # visible reality — one room — not the template's internal
+    # decomposition. Merge here, before _apply_augmentation, so both the
+    # JSON ground truth and the rendered label (one per room dict) match.
+    rooms_out = _merge_same_label_adjacent(rooms_out)
+
     return FloorPlan(
         walls=walls,
         doors=doors,
@@ -965,6 +974,271 @@ def plan_to_schema(plan: Plan, rng: random.Random) -> dict:
         rooms=rooms_out,
         scale={"pixels_per_meter": 40},
     ).to_dict()
+
+
+# ---------- same-label adjacent rectangle merging ----------
+#
+# Templates that need a non-axis-aligned room (the studio_apartment
+# L-shape; future templates may follow) decompose it into multiple
+# same-label abutting rectangles so the Room dataclass — which only
+# stores axis-aligned rects — can express it. The decomposition is an
+# implementation detail of the data model and shouldn't leak into the
+# canonical JSON or the rendered label layer. These helpers collapse
+# each connected same-label group into a single record with a
+# rectilinear polygon.
+
+_RECT_EDGE_EPS: float = 1e-6
+# Shared coord-rounding precision for both the rect-extraction and the
+# grid-cell construction. Must be the same on both sides — a polygon
+# vertex that round-trips at one precision but not another would land in
+# a different cell and silently break the merge. 9 dp ≈ nanometer, well
+# below any physical scale we care about.
+_MERGE_COORD_PRECISION: int = 9
+
+
+def _rects_share_edge(a: tuple[float, float, float, float],
+                      b: tuple[float, float, float, float]) -> bool:
+    """True iff axis-aligned rects A and B share a non-degenerate edge.
+
+    "Non-degenerate" means a 1-D overlap, not a 0-D corner touch — two
+    rects that meet at a single point are not edge-connected and
+    shouldn't be merged into a single room.
+
+    The 1e-6 m (=1 µm) tolerance is safe given upstream rect construction:
+    template rects come from rng.uniform() and edge coords are computed
+    by simple subtraction, so identical edges agree exactly in float
+    arithmetic. Tolerance exists to absorb rotations introduced by
+    _apply_augmentation if the merger ever runs post-aug.
+    """
+    xa, ya, wa, ha = a
+    xb, yb, wb, hb = b
+
+    # Vertical shared edge: A's right meets B's left, or vice versa.
+    if abs((xa + wa) - xb) < _RECT_EDGE_EPS or abs((xb + wb) - xa) < _RECT_EDGE_EPS:
+        y_lo = max(ya, yb)
+        y_hi = min(ya + ha, yb + hb)
+        return (y_hi - y_lo) > _RECT_EDGE_EPS
+
+    # Horizontal shared edge: A's bottom meets B's top, or vice versa.
+    if abs((ya + ha) - yb) < _RECT_EDGE_EPS or abs((yb + hb) - ya) < _RECT_EDGE_EPS:
+        x_lo = max(xa, xb)
+        x_hi = min(xa + wa, xb + wb)
+        return (x_hi - x_lo) > _RECT_EDGE_EPS
+
+    return False
+
+
+def _polygon_to_rect(polygon: list[list[float]]) -> tuple[float, float, float, float] | None:
+    """If `polygon` is a 4-vertex axis-aligned rectangle, return its
+    (x, y, w, h). Otherwise None — bay windows and previously merged
+    L-shapes return None and are skipped by the merger."""
+    if len(polygon) != 4:
+        return None
+    xs = sorted({round(p[0], _MERGE_COORD_PRECISION) for p in polygon})
+    ys = sorted({round(p[1], _MERGE_COORD_PRECISION) for p in polygon})
+    if len(xs) != 2 or len(ys) != 2:
+        return None
+    return (xs[0], ys[0], xs[1] - xs[0], ys[1] - ys[0])
+
+
+def _union_polygon_axis_aligned(rects: list[tuple[float, float, float, float]]) -> list[list[float]]:
+    """Boundary polygon of the union of N axis-aligned rectangles.
+
+    Algorithm: rasterize onto a sub-pixel grid whose cell boundaries are
+    the unique x and y coordinates of the input rect corners; mark cells
+    that any rect covers; collect grid edges that border exactly one
+    covered cell (the perimeter); walk the perimeter and emit corner
+    vertices in clockwise order.
+
+    Returns a list of [x, y] vertex pairs, no closing vertex repeated.
+    Raises ValueError if the union is not simply connected — that case
+    (a hole inside the union) doesn't arise from current templates and
+    failing loudly is preferable to emitting a polygon downstream code
+    can't reason about.
+
+    Cost: O(N⁴) — N rects produce up to 2N unique coords each axis
+    (4N² cells), each tested against N rects in occupancy fill. Fine
+    for the small N templates currently produce (≤4); revisit if a
+    template needs more.
+    """
+    p = _MERGE_COORD_PRECISION
+    xs = sorted({round(r[0], p) for r in rects} | {round(r[0] + r[2], p) for r in rects})
+    ys = sorted({round(r[1], p) for r in rects} | {round(r[1] + r[3], p) for r in rects})
+    nx = len(xs) - 1
+    ny = len(ys) - 1
+    occ = [[False] * ny for _ in range(nx)]
+    for (x, y, w, h) in rects:
+        x0, y0 = round(x, p), round(y, p)
+        x1, y1 = round(x + w, p), round(y + h, p)
+        for i in range(nx):
+            if xs[i] >= x0 and xs[i + 1] <= x1:
+                for j in range(ny):
+                    if ys[j] >= y0 and ys[j + 1] <= y1:
+                        occ[i][j] = True
+
+    # Perimeter edges: an edge separates two cells iff exactly one is
+    # covered. Cells outside the grid are treated as uncovered.
+    edges: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    # Horizontal edges, indexed by row j and column i.
+    for j in range(ny + 1):
+        for i in range(nx):
+            below = occ[i][j - 1] if j > 0 else False
+            above = occ[i][j] if j < ny else False
+            if below != above:
+                edges.append(((xs[i], ys[j]), (xs[i + 1], ys[j])))
+    for i in range(nx + 1):
+        for j in range(ny):
+            left = occ[i - 1][j] if i > 0 else False
+            right = occ[i][j] if i < nx else False
+            if left != right:
+                edges.append(((xs[i], ys[j]), (xs[i], ys[j + 1])))
+
+    # Build vertex -> neighbours adjacency. Perimeter on a rectilinear
+    # union has exactly two edges meeting at each vertex; more than two
+    # means the boundary has a self-touch (a "pinch point"), which
+    # current templates don't produce.
+    vertex_edges: dict[tuple[float, float], list[tuple[float, float]]] = {}
+    for v0, v1 in edges:
+        vertex_edges.setdefault(v0, []).append(v1)
+        vertex_edges.setdefault(v1, []).append(v0)
+    if not vertex_edges:
+        raise ValueError("Empty rectangle union — caller passed no rects or zero-area rects.")
+    if any(len(nbrs) != 2 for nbrs in vertex_edges.values()):
+        raise ValueError(
+            "Rectilinear union has a self-touching boundary (pinch point). "
+            "No current template produces this; if you hit it, add a test "
+            "case and extend _union_polygon_axis_aligned."
+        )
+
+    # Walk the boundary. Start at the lex-smallest vertex (top-left in
+    # screen coords with y south) so the output is deterministic. The
+    # max-iter guard is defensive — the pinch-point check above
+    # guarantees termination, but a future bug in either check would
+    # otherwise hang the generator.
+    start = min(vertex_edges)
+    walk: list[tuple[float, float]] = [start]
+    prev: tuple[float, float] | None = None
+    cur = start
+    max_steps = len(vertex_edges) + 1
+    for _ in range(max_steps):
+        n0, n1 = vertex_edges[cur]
+        nxt = n0 if n0 != prev else n1
+        if nxt == start:
+            break
+        walk.append(nxt)
+        prev = cur
+        cur = nxt
+    else:
+        raise RuntimeError(
+            "Boundary walk exceeded vertex count without closing — "
+            "_union_polygon_axis_aligned has a bug."
+        )
+
+    # Drop collinear interior points: the cell-based trace records every
+    # cell-corner the boundary passes through, but the polygon only
+    # needs the corners where direction changes. Keeping the collinear
+    # points is technically valid but inflates the JSON and clutters
+    # eval IoU rasterization.
+    simplified: list[list[float]] = []
+    n = len(walk)
+    for k in range(n):
+        prev_v = walk[(k - 1) % n]
+        cur_v = walk[k]
+        next_v = walk[(k + 1) % n]
+        d1x, d1y = cur_v[0] - prev_v[0], cur_v[1] - prev_v[1]
+        d2x, d2y = next_v[0] - cur_v[0], next_v[1] - cur_v[1]
+        # Collinear iff the 2-D cross product is zero (parallel direction).
+        if d1x * d2y - d1y * d2x == 0:
+            continue
+        simplified.append([cur_v[0], cur_v[1]])
+    return simplified
+
+
+def _merge_same_label_adjacent(rooms_out: list[dict]) -> list[dict]:
+    """Collapse same-label edge-adjacent room records into single records.
+
+    Walks `rooms_out` once, groups by label, finds connected components
+    via edge-adjacency on the rect bboxes, and rewrites each multi-rect
+    component as one room with a rectilinear union polygon and the sum
+    of its constituent areas. First-occurrence label order is preserved
+    so existing fixtures stay diff-stable.
+
+    Polygons that aren't axis-aligned 4-vertex rectangles (e.g. bay-
+    window protrusions, polygons already merged by an earlier pass) are
+    passed through unchanged — they wouldn't survive the rect bbox
+    round-trip the merger needs to detect adjacency. Templates that
+    intentionally emit two non-adjacent same-label rooms (two
+    "bedroom"s in different parts of the house) also pass through
+    untouched: the adjacency check rejects them so each stays its own
+    record.
+    """
+    by_label: dict[str, list[int]] = {}
+    label_order: list[str] = []
+    for i, r in enumerate(rooms_out):
+        if r["label"] not in by_label:
+            label_order.append(r["label"])
+        by_label.setdefault(r["label"], []).append(i)
+
+    out: list[dict] = []
+    for label in label_order:
+        indices = by_label[label]
+        if len(indices) == 1:
+            out.append(rooms_out[indices[0]])
+            continue
+
+        # Try to convert each polygon to a rect; non-rect polygons (bays,
+        # prior merges) are excluded from adjacency and pass through.
+        # Storing the rect-only ones in a parallel non-Optional list
+        # avoids `# type: ignore` and reads more straightforwardly than
+        # filtering by index.
+        rect_only: list[tuple[int, tuple[float, float, float, float]]] = []
+        passthrough: list[int] = []
+        for i in indices:
+            r = _polygon_to_rect(rooms_out[i]["polygon"])
+            if r is None:
+                passthrough.append(i)
+            else:
+                rect_only.append((i, r))
+
+        # Connected components on the rect-only subset.
+        n = len(rect_only)
+        adj = [[False] * n for _ in range(n)]
+        for a in range(n):
+            for b in range(a + 1, n):
+                if _rects_share_edge(rect_only[a][1], rect_only[b][1]):
+                    adj[a][b] = adj[b][a] = True
+        seen_local: set[int] = set()
+        for start_a in range(n):
+            if start_a in seen_local:
+                continue
+            comp: list[int] = []
+            queue = [start_a]
+            while queue:
+                k = queue.pop(0)
+                if k in seen_local:
+                    continue
+                seen_local.add(k)
+                comp.append(k)
+                for m in range(n):
+                    if adj[k][m] and m not in seen_local:
+                        queue.append(m)
+            if len(comp) == 1:
+                out.append(rooms_out[rect_only[comp[0]][0]])
+            else:
+                comp_rects = [rect_only[c][1] for c in comp]
+                comp_areas = [rooms_out[rect_only[c][0]]["area"] for c in comp]
+                polygon = _union_polygon_axis_aligned(comp_rects)
+                out.append({
+                    "label": label,
+                    "polygon": polygon,
+                    "area": round(sum(comp_areas), 2),
+                })
+
+        # Pass-through (non-rect) polygons keep their original record.
+        for i in passthrough:
+            out.append(rooms_out[i])
+
+    return out
 
 
 def _build_walls(plan: Plan, thickness: float = 0.15, coord_precision: int = 3) -> list[dict]:

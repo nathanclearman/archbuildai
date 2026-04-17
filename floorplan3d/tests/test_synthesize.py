@@ -34,10 +34,14 @@ from synthesize import (  # type: ignore
     _filter_internal_walls,
     _fixture_rect,
     _maybe_attach_bay,
+    _merge_same_label_adjacent,
     _pick_swing_target,
+    _polygon_to_rect,
+    _rects_share_edge,
     _room_polygon_with_bays,
     _snap_door_to_wall,
     _swing_vector_into_room,
+    _union_polygon_axis_aligned,
     _wall_unit_vector,
 )
 
@@ -915,6 +919,210 @@ class MaybeAttachBayTest(unittest.TestCase):
                 # 8-vertex polygon (4 rect + 4 bay) should survive
                 # rotation without losing any vertices.
                 self.assertEqual(len(out["rooms"][0]["polygon"]), 8)
+
+
+# ---------- same-label adjacent rect merging ----------
+
+class RectsShareEdgeTest(unittest.TestCase):
+    def test_full_shared_vertical_edge(self):
+        # Two unit rects flush along x=1.
+        self.assertTrue(_rects_share_edge((0, 0, 1, 1), (1, 0, 1, 1)))
+
+    def test_partial_shared_vertical_edge(self):
+        # b's left edge overlaps the lower half of a's right edge.
+        self.assertTrue(_rects_share_edge((0, 0, 1, 4), (1, 0, 1, 2)))
+
+    def test_corner_touch_is_not_shared_edge(self):
+        # Two rects meeting at a single point — 0-D contact, not 1-D.
+        self.assertFalse(_rects_share_edge((0, 0, 1, 1), (1, 1, 1, 1)))
+
+    def test_disjoint_rects(self):
+        self.assertFalse(_rects_share_edge((0, 0, 1, 1), (3, 3, 1, 1)))
+
+    def test_shared_horizontal_edge(self):
+        self.assertTrue(_rects_share_edge((0, 0, 4, 2), (0, 2, 4, 2)))
+
+
+class PolygonToRectTest(unittest.TestCase):
+    def test_axis_aligned_square_round_trips(self):
+        rect = _polygon_to_rect([[0, 0], [2, 0], [2, 3], [0, 3]])
+        self.assertEqual(rect, (0, 0, 2, 3))
+
+    def test_l_shape_polygon_returns_none(self):
+        # 6-vertex L-shape should not be mistaken for a rect.
+        l = [[0, 0], [2, 0], [2, 1], [3, 1], [3, 3], [0, 3]]
+        self.assertIsNone(_polygon_to_rect(l))
+
+    def test_three_distinct_x_coords_returns_none(self):
+        # 4-vertex polygon but not axis-aligned (a parallelogram-ish).
+        skew = [[0, 0], [2, 0], [3, 2], [1, 2]]
+        self.assertIsNone(_polygon_to_rect(skew))
+
+
+class UnionPolygonAxisAlignedTest(unittest.TestCase):
+    def test_two_rects_make_an_l_shape(self):
+        # Studio_apartment shape: tall left column + right strip below
+        # the bath. Expect a 6-vertex L-polygon.
+        poly = _union_polygon_axis_aligned([
+            (0.0, 0.0, 5.64, 8.02),
+            (5.64, 2.3, 2.2, 5.72),
+        ])
+        self.assertEqual(len(poly), 6)
+        # Bounding box covers both rects.
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        self.assertEqual(min(xs), 0.0)
+        self.assertEqual(max(xs), 7.84)
+        self.assertEqual(min(ys), 0.0)
+        self.assertEqual(max(ys), 8.02)
+
+    def test_two_rects_tile_full_rectangle(self):
+        # Two rects exactly tiling a 4x2 → output simplifies to a 4-vertex rect.
+        poly = _union_polygon_axis_aligned([
+            (0, 0, 2, 2),
+            (2, 0, 2, 2),
+        ])
+        self.assertEqual(len(poly), 4)
+        xs = sorted({p[0] for p in poly})
+        ys = sorted({p[1] for p in poly})
+        self.assertEqual(xs, [0, 4])
+        self.assertEqual(ys, [0, 2])
+
+    def test_three_rects_t_shape(self):
+        # Bottom band (4 wide) + top stub (1 wide centered above) →
+        # T-shape with 8 vertices.
+        poly = _union_polygon_axis_aligned([
+            (0, 1, 4, 1),
+            (1.5, 0, 1, 1),
+        ])
+        self.assertEqual(len(poly), 8)
+
+    def test_pinch_point_raises(self):
+        # Two unit squares meeting at a single corner. The cell-grid
+        # vertex at (1,1) is touched by 4 perimeter edges (degree 4),
+        # which is the pinch-point signal — algorithm correctly refuses.
+        # Note: this is also why corner-touching rects shouldn't be
+        # adjacency-merged in the first place; both layers defend.
+        with self.assertRaises(ValueError) as ctx:
+            _union_polygon_axis_aligned([
+                (0, 0, 1, 1),
+                (1, 1, 1, 1),
+            ])
+        self.assertIn("pinch", str(ctx.exception))
+
+
+class MergeSameLabelAdjacentTest(unittest.TestCase):
+    def test_studio_main_room_collapses_to_one_record(self):
+        rooms = [
+            {"label": "main_room",
+             "polygon": [[0, 0], [5.64, 0], [5.64, 8.02], [0, 8.02]],
+             "area": 45.23},
+            {"label": "main_room",
+             "polygon": [[5.64, 2.3], [7.84, 2.3], [7.84, 8.02], [5.64, 8.02]],
+             "area": 12.58},
+            {"label": "bathroom",
+             "polygon": [[5.64, 0], [7.84, 0], [7.84, 2.3], [5.64, 2.3]],
+             "area": 5.06},
+        ]
+        out = _merge_same_label_adjacent(rooms)
+        self.assertEqual(len(out), 2)
+        labels = sorted(r["label"] for r in out)
+        self.assertEqual(labels, ["bathroom", "main_room"])
+        merged = next(r for r in out if r["label"] == "main_room")
+        # Areas summed.
+        self.assertAlmostEqual(merged["area"], 57.81, places=2)
+        # 6-vertex L (or simplified equivalent).
+        self.assertEqual(len(merged["polygon"]), 6)
+
+    def test_two_non_adjacent_bedrooms_stay_separate(self):
+        # Templates emit multiple `bedroom` records on opposite sides of
+        # the house. They share a label but no edge — must not be
+        # merged or the user-visible JSON loses information.
+        rooms = [
+            {"label": "bedroom",
+             "polygon": [[0, 0], [3, 0], [3, 3], [0, 3]], "area": 9.0},
+            {"label": "bedroom",
+             "polygon": [[10, 0], [13, 0], [13, 3], [10, 3]], "area": 9.0},
+        ]
+        out = _merge_same_label_adjacent(rooms)
+        self.assertEqual(len(out), 2)
+        self.assertTrue(all(r["label"] == "bedroom" for r in out))
+
+    def test_corner_touching_same_label_rooms_stay_separate(self):
+        # Two rooms that meet only at a corner are NOT edge-adjacent.
+        rooms = [
+            {"label": "x", "polygon": [[0, 0], [2, 0], [2, 2], [0, 2]], "area": 4.0},
+            {"label": "x", "polygon": [[2, 2], [4, 2], [4, 4], [2, 4]], "area": 4.0},
+        ]
+        out = _merge_same_label_adjacent(rooms)
+        self.assertEqual(len(out), 2)
+
+    def test_non_rect_polygon_passes_through(self):
+        # A bay-attached polygon (8 vertices) shouldn't be touched by
+        # the merger, even if it shares a label with a rectangle.
+        bay_poly = [[0, 0], [4, 0], [4, 1], [5, 1], [5, 2], [4, 2], [4, 3], [0, 3]]
+        rooms = [
+            {"label": "great_room", "polygon": bay_poly, "area": 13.0},
+            {"label": "great_room",
+             "polygon": [[100, 0], [102, 0], [102, 2], [100, 2]], "area": 4.0},
+        ]
+        out = _merge_same_label_adjacent(rooms)
+        # Both pass through unchanged: the bay polygon isn't a rect, and
+        # the second rect isn't edge-adjacent to it anyway.
+        self.assertEqual(len(out), 2)
+
+    def test_first_occurrence_label_groups_together(self):
+        # The merger groups all records of the same label together,
+        # ordered by first-occurrence of the label in the input. Two
+        # non-adjacent "a" rooms end up adjacent in the OUTPUT despite
+        # "b" sitting between them in the input — `a` came first, so
+        # all `a`s are emitted before any `b`.
+        rooms = [
+            {"label": "a", "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]], "area": 1.0},
+            {"label": "b", "polygon": [[2, 0], [3, 0], [3, 1], [2, 1]], "area": 1.0},
+            {"label": "a", "polygon": [[4, 0], [5, 0], [5, 1], [4, 1]], "area": 1.0},
+        ]
+        out = _merge_same_label_adjacent(rooms)
+        self.assertEqual([r["label"] for r in out], ["a", "a", "b"])
+
+    def test_three_rect_chain_merges_transitively(self):
+        # A-B-C where A-B share an edge and B-C share an edge but A-C
+        # don't. BFS must walk through B to connect A and C.
+        rooms = [
+            {"label": "x", "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]], "area": 1.0},
+            {"label": "x", "polygon": [[1, 0], [2, 0], [2, 1], [1, 1]], "area": 1.0},
+            {"label": "x", "polygon": [[2, 0], [3, 0], [3, 1], [2, 1]], "area": 1.0},
+        ]
+        out = _merge_same_label_adjacent(rooms)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["label"], "x")
+        self.assertAlmostEqual(out[0]["area"], 3.0, places=6)
+
+
+class StudioApartmentIntegrationTest(unittest.TestCase):
+    """End-to-end pin: studio_apartment → plan_to_schema → exactly one
+    `main_room` in the canonical JSON. Locks the integration that the
+    helper unit tests miss — if someone removes the merger call from
+    plan_to_schema, all helper tests still pass but this fails."""
+
+    def test_studio_apartment_emits_single_main_room(self):
+        from synthesize import plan_to_schema, studio_apartment  # type: ignore
+        for seed in range(5):
+            rng = random.Random(seed)
+            plan = studio_apartment(rng)
+            # Sanity: template intentionally produces 2 main_room rects.
+            template_main_rooms = [r for r in plan.rooms if r.label == "main_room"]
+            self.assertEqual(len(template_main_rooms), 2,
+                             f"seed={seed}: template should still emit 2 rects")
+
+            # Schema output should collapse them to 1.
+            out = plan_to_schema(plan, rng)
+            schema_main_rooms = [r for r in out["rooms"] if r["label"] == "main_room"]
+            self.assertEqual(len(schema_main_rooms), 1,
+                             f"seed={seed}: merger failed to collapse to 1 record")
+            # And the merged polygon should have 6 vertices (L-shape).
+            self.assertEqual(len(schema_main_rooms[0]["polygon"]), 6,
+                             f"seed={seed}: expected 6-vertex L-shape")
 
 
 if __name__ == "__main__":
