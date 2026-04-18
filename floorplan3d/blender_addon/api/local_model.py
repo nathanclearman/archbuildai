@@ -179,7 +179,7 @@ class LocalModelClient:
         self.python_bin = python_bin if python_bin else _resolve_python_bin()
         self.timeout = timeout
 
-    def predict(self, image_path, cv_only=False, refine=False):
+    def predict(self, image_path, cv_only=False, refine=False, quantize=False):
         """Run inference on a floor plan image.
 
         Args:
@@ -188,6 +188,11 @@ class LocalModelClient:
                      Useful for testing without trained weights.
             refine: If True, run the optional Claude Opus refinement pass.
                     Requires ANTHROPIC_API_KEY in the environment.
+            quantize: If True, load the VLM in 4-bit NF4 so the ~14 GB
+                      bfloat16 model fits on 16 GB GPUs (5070 Ti, 4090).
+                      Default False — the primary target (M4 Max, 128 GB
+                      unified) doesn't need it and quality is ~5-10%
+                      better without it.
 
         Returns:
             dict: Parsed floor plan data in the canonical JSON schema
@@ -215,6 +220,8 @@ class LocalModelClient:
             cmd.append("--cv-only")
         if refine:
             cmd.append("--refine")
+        if quantize:
+            cmd.append("--quantize")
 
         result = subprocess.run(
             cmd,

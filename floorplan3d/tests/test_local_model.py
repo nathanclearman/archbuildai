@@ -24,6 +24,7 @@ from local_model import (  # type: ignore
     _FALLBACK_PYTHON_CANDIDATES,
     _is_blender_python,
     _resolve_python_bin,
+    LocalModelClient,
 )
 
 
@@ -231,6 +232,71 @@ class TestResolverCache(unittest.TestCase):
         with patch.dict("os.environ", {"FP3D_PYTHON": "/custom/py"}):
             _resolve_python_bin()
         self.assertFalse(local_model._RESOLVED_PYTHON_CACHE)
+
+
+class TestPredictForwardsFlags(unittest.TestCase):
+    """LocalModelClient.predict assembles a subprocess command. The
+    specific flags it forwards (--cv-only, --refine, --quantize) are
+    the user-facing contract between the Blender add-on panel and
+    inference.py. A regression that drops a flag (e.g. --quantize not
+    being wired through) would silently OOM on a 16 GB GPU with the
+    Blender user having no way to fix it from the UI.
+    """
+
+    def _run_predict_with_mocked_subprocess(self, **kwargs):
+        """Invoke predict() with subprocess.run faked to capture the
+        command. Returns the cmd list and the fake client (for path
+        assertions). Uses a tmp file to satisfy the isfile check and
+        a stub returning empty JSON so no real inference runs."""
+        import tempfile
+        from unittest.mock import MagicMock
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            img_path = f.name
+
+        # Weights dir and inference script must exist for predict() to
+        # proceed past its guard clauses; use the real in-repo paths.
+        client = LocalModelClient(
+            weights_dir=local_model.DEFAULT_WEIGHTS_DIR,
+            python_bin="/dev/null/fake-python",
+        )
+
+        captured: dict = {}
+
+        def fake_run(cmd, **_):
+            captured["cmd"] = cmd
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "{}"
+            result.stderr = ""
+            return result
+
+        with patch("local_model.subprocess.run", side_effect=fake_run), \
+                patch("local_model.INFERENCE_SCRIPT") as script:
+            script.exists.return_value = True
+            script.__str__ = lambda self: "/fake/inference.py"
+            client.predict(img_path, **kwargs)
+
+        return captured["cmd"]
+
+    def test_quantize_flag_forwarded(self):
+        cmd = self._run_predict_with_mocked_subprocess(quantize=True)
+        self.assertIn("--quantize", cmd)
+
+    def test_quantize_default_is_false(self):
+        # quantize=False is the important default: the primary inference
+        # target (M4 Max) both doesn't need it and measurably loses
+        # quality with it. A silent default of True would degrade every
+        # Blender-initiated predict.
+        cmd = self._run_predict_with_mocked_subprocess()
+        self.assertNotIn("--quantize", cmd)
+
+    def test_cv_only_and_refine_still_forwarded(self):
+        # Regression guard: when adding --quantize we re-ran the flag
+        # routing. Confirm the older flags still land in the command.
+        cmd = self._run_predict_with_mocked_subprocess(cv_only=True, refine=True)
+        self.assertIn("--cv-only", cmd)
+        self.assertIn("--refine", cmd)
 
 
 if __name__ == "__main__":

@@ -25,7 +25,18 @@ from prompts import SYSTEM_PROMPT, USER_PROMPT  # type: ignore  # noqa: E402
 from schema import serialize  # type: ignore  # noqa: E402
 
 
-def run_vlm(image_path: str, weights_dir: Path, max_new_tokens: int = 4096) -> dict:
+def run_vlm(image_path: str, weights_dir: Path, max_new_tokens: int = 4096,
+            quantize: bool = False) -> dict:
+    """Run the fine-tuned VLM on one image.
+
+    `quantize=True` loads the base model with the same 4-bit NF4 config
+    training used, dropping the memory footprint from ~14 GB (bfloat16)
+    to ~4 GB at a ~5-10% quality cost. Needed to fit on 16 GB GPUs
+    (5070 Ti, 4090) but unnecessary — and net-worse — on the M4 Max's
+    128 GB unified memory where full-precision load-and-go beats the
+    extra bnb dequantize cost per token. Default off to prefer quality
+    on the primary inference target.
+    """
     import torch
     from PIL import Image
     from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
@@ -43,12 +54,25 @@ def run_vlm(image_path: str, weights_dir: Path, max_new_tokens: int = 4096) -> d
         str(processor_dir) if processor_dir.exists() else base,
         trust_remote_code=True,
     )
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        base,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+
+    # Match the training-time bnb config exactly when quantize=True.
+    # Using a different quant layout (e.g. fp4 here vs nf4 in train.py)
+    # would silently change the weight distribution the LoRA was
+    # calibrated against, degrading output without raising.
+    load_kwargs: dict = {
+        "torch_dtype": torch.bfloat16,
+        "device_map": "auto",
+        "trust_remote_code": True,
+    }
+    if quantize:
+        from transformers import BitsAndBytesConfig
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(base, **load_kwargs)
     if adapter_dir.exists():
         model = PeftModel.from_pretrained(model, str(adapter_dir))
     model.eval()
@@ -105,6 +129,11 @@ def main():
                         help="Skip the VLM and use only the CV fallback.")
     parser.add_argument("--refine", action="store_true",
                         help="Run the Claude refiner on low-confidence regions.")
+    parser.add_argument("--quantize", action="store_true",
+                        help="Load the VLM in 4-bit NF4 to fit 16 GB GPUs "
+                             "(5070 Ti, 4090). Not needed on Apple Silicon "
+                             "unified memory or H100; costs ~5-10%% output "
+                             "quality for ~3.5x lower peak VRAM.")
     args = parser.parse_args()
 
     weights_dir = Path(args.weights)
@@ -116,7 +145,7 @@ def main():
 
     if use_vlm:
         try:
-            result = run_vlm(args.image, weights_dir)
+            result = run_vlm(args.image, weights_dir, quantize=args.quantize)
         except Exception as e:
             print(f"[warn] VLM failed, falling back to CV: {e}", file=sys.stderr)
             result = run_cv_only(args.image, args.ppm)
