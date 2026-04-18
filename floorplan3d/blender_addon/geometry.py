@@ -43,6 +43,43 @@ def _perpendicular_2d(direction):
     return Vector((-direction.y, direction.x))
 
 
+def _signed_polygon_area(polygon):
+    """Signed shoelace area of a 2D polygon. Positive means CCW winding in
+    a standard math frame (y-up). Blender's world XY is the same frame
+    so a CCW polygon gets a +Z face normal when built with `bm.faces.new`.
+    Degenerate / <3-vertex inputs return 0."""
+    n = len(polygon)
+    if n < 3:
+        return 0.0
+    a = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        a += polygon[i][0] * polygon[j][1]
+        a -= polygon[j][0] * polygon[i][1]
+    return a / 2.0
+
+
+def _ensure_ccw(polygon):
+    """Return `polygon` in CCW winding, reversing if it came in CW.
+
+    Why this matters: `bm.faces.new(verts)` computes the face normal
+    from vertex order — CCW → +Z (face looks up), CW → -Z (face looks
+    down). For a floor polygon we want +Z so the floor is visible from
+    above. synthesize.py's `_apply_augmentation` flips the winding of
+    every polygon whenever `flip_x=True`, which hits ~50% of samples,
+    so we can't rely on a consistent winding from upstream JSON.
+
+    Without this normalization, roughly half of all loaded plans
+    produced invisible floors (and ceilings flipped the WRONG way after
+    `face.normal_flip()`, which assumes a CCW input). Bug was silent
+    in all 16 prior geometry tests because the sample fixtures
+    happened to be CCW.
+    """
+    if _signed_polygon_area(polygon) < 0:
+        return list(reversed(polygon))
+    return polygon
+
+
 def generate_walls(floor_plan_data, collection, wall_height):
     """Generate wall meshes from floor plan data.
 
@@ -113,7 +150,12 @@ def generate_door_openings(floor_plan_data, collection, wall_height):
 
     for i, door_data in enumerate(doors):
         wall_idx = door_data.get("wall_index", 0)
-        if wall_idx >= len(walls):
+        # Skip doors with `wall_index=-1` (schema's "no wall attached"
+        # sentinel). Python's `-1 >= len(walls)` is False, so the old
+        # single-sided check let -1 slip through — walls[-1] then silently
+        # picked the LAST wall in the list and cut a door through it at
+        # the wrong position.
+        if wall_idx < 0 or wall_idx >= len(walls):
             continue
 
         wall_data = walls[wall_idx]
@@ -215,7 +257,9 @@ def generate_window_openings(floor_plan_data, collection, wall_height):
 
     for i, win_data in enumerate(windows):
         wall_idx = win_data.get("wall_index", 0)
-        if wall_idx >= len(walls):
+        # Same negative-index guard as generate_door_openings; -1 is the
+        # schema sentinel for "not attached to a wall".
+        if wall_idx < 0 or wall_idx >= len(walls):
             continue
 
         wall_data = walls[wall_idx]
@@ -304,6 +348,10 @@ def generate_floors(floor_plan_data, collection):
         polygon = room_data.get("polygon", [])
         if len(polygon) < 3:
             continue
+        # Normalize to CCW so bm.faces.new gives the floor a +Z normal
+        # regardless of the winding the upstream JSON landed in. See
+        # _ensure_ccw docstring for the augmentation-flip story.
+        polygon = _ensure_ccw(polygon)
 
         label = room_data.get("label", f"Room_{i}")
 
@@ -343,6 +391,13 @@ def generate_ceilings(floor_plan_data, collection, wall_height):
         polygon = room_data.get("polygon", [])
         if len(polygon) < 3:
             continue
+        # Same CCW normalization as the floor. The `face.normal_flip()`
+        # below flips +Z to -Z so the ceiling faces down (visible from
+        # inside the room). Before normalization, a CW polygon produced
+        # a -Z normal that the flip bumped BACK to +Z — ceiling then
+        # looked up instead of down, wrong from any viewing angle inside
+        # the house.
+        polygon = _ensure_ccw(polygon)
 
         label = room_data.get("label", f"Room_{i}")
 

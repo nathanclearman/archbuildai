@@ -196,5 +196,145 @@ class TestMockModelOutput(unittest.TestCase):
             self.assertLess(window["wall_index"], len(mock_data["walls"]))
 
 
+class TestSignedPolygonArea(unittest.TestCase):
+    """Shoelace signed-area helper used by _ensure_ccw. Positive means
+    CCW in a standard math frame (y-up); Blender's world XY is the
+    same frame so a CCW polygon gets a +Z face normal."""
+
+    def setUp(self):
+        # Lazy import after the bpy mocks at the top of this file are
+        # in place — geometry.py imports bpy at module scope.
+        sys.path.insert(0, str(PROJECT_DIR / "blender_addon"))
+        import geometry  # type: ignore
+        self.geometry = geometry
+
+    def test_ccw_unit_square_has_positive_area(self):
+        ccw = [[0, 0], [1, 0], [1, 1], [0, 1]]
+        self.assertGreater(self.geometry._signed_polygon_area(ccw), 0)
+
+    def test_cw_unit_square_has_negative_area(self):
+        cw = [[0, 0], [0, 1], [1, 1], [1, 0]]
+        self.assertLess(self.geometry._signed_polygon_area(cw), 0)
+
+    def test_degenerate_polygon_has_zero_area(self):
+        self.assertEqual(self.geometry._signed_polygon_area([]), 0.0)
+        self.assertEqual(self.geometry._signed_polygon_area([[0, 0], [1, 1]]), 0.0)
+
+    def test_magnitude_matches_unsigned_area(self):
+        # 4x3 rect: signed area ±12 depending on winding; magnitude 12.
+        ccw = [[0, 0], [4, 0], [4, 3], [0, 3]]
+        cw = [[0, 0], [0, 3], [4, 3], [4, 0]]
+        self.assertAlmostEqual(self.geometry._signed_polygon_area(ccw), 12.0)
+        self.assertAlmostEqual(self.geometry._signed_polygon_area(cw), -12.0)
+
+
+class TestEnsureCcw(unittest.TestCase):
+    """Regression guard for the augmentation-flip winding bug: CW
+    polygons from `flip_x=True` synth samples produced invisible floors
+    and wrong-facing ceilings. _ensure_ccw normalizes the winding; this
+    class pins the contract."""
+
+    def setUp(self):
+        sys.path.insert(0, str(PROJECT_DIR / "blender_addon"))
+        import geometry  # type: ignore
+        self.geometry = geometry
+
+    def test_ccw_polygon_is_unchanged(self):
+        ccw = [[0, 0], [1, 0], [1, 1], [0, 1]]
+        self.assertEqual(self.geometry._ensure_ccw(ccw), ccw)
+
+    def test_cw_polygon_is_reversed_to_ccw(self):
+        cw = [[0, 0], [0, 1], [1, 1], [1, 0]]
+        out = self.geometry._ensure_ccw(cw)
+        # Output must be CCW (positive signed area).
+        self.assertGreater(self.geometry._signed_polygon_area(out), 0)
+        # Reversal, not a mutation of the input list.
+        self.assertEqual(cw, [[0, 0], [0, 1], [1, 1], [1, 0]])
+
+    def test_l_shape_cw_gets_reversed(self):
+        # A 6-vertex L in CW order, the shape colonial_compartmentalized
+        # and studio_apartment produce after the plan_to_schema merge
+        # plus a horizontal-flip aug.
+        cw_l = [[0, 0], [0, 4], [2, 4], [2, 2], [4, 2], [4, 0]]
+        self.assertLess(self.geometry._signed_polygon_area(cw_l), 0)
+        out = self.geometry._ensure_ccw(cw_l)
+        self.assertGreater(self.geometry._signed_polygon_area(out), 0)
+
+
+class TestWallIndexGuard(unittest.TestCase):
+    """Doors and windows accept the schema's `wall_index=-1` sentinel
+    (meaning "not attached to a wall") but the geometry layer must
+    skip those, not silently route them through `walls[-1]` and cut
+    the last wall in the list at a random position.
+    """
+
+    def test_negative_wall_index_skips_door(self):
+        # Build a plan with one valid wall and one door that points at
+        # wall_index=-1 (schema "no wall"). Running generate_door_
+        # openings should produce 0 doors, not 1 cut through walls[-1].
+        sys.path.insert(0, str(PROJECT_DIR / "blender_addon"))
+        # geometry imports trigger the bpy mock; patch the bits that
+        # would error on a mock call before we exercise the guard.
+        import geometry  # type: ignore
+
+        plan = {
+            "walls": [
+                {"start": [0, 0], "end": [10, 0], "thickness": 0.15},
+            ],
+            "doors": [
+                {"position": [5, 0], "width": 0.9, "wall_index": -1},
+            ],
+            "windows": [],
+            "rooms": [],
+        }
+        collection = MagicMock()
+        # bpy.data.objects.get returns None → the modifier-apply branch
+        # is skipped, so the guard is the only thing gating `count`.
+        with patch.object(geometry.bpy.data.objects, "get", return_value=None):
+            count = geometry.generate_door_openings(plan, collection, wall_height=2.7)
+        self.assertEqual(count, 0)
+
+    def test_negative_wall_index_skips_window(self):
+        sys.path.insert(0, str(PROJECT_DIR / "blender_addon"))
+        import geometry  # type: ignore
+
+        plan = {
+            "walls": [
+                {"start": [0, 0], "end": [10, 0], "thickness": 0.15},
+            ],
+            "doors": [],
+            "windows": [
+                {"position": [5, 0], "width": 1.2, "wall_index": -1},
+            ],
+            "rooms": [],
+        }
+        collection = MagicMock()
+        with patch.object(geometry.bpy.data.objects, "get", return_value=None):
+            count = geometry.generate_window_openings(plan, collection, wall_height=2.7)
+        self.assertEqual(count, 0)
+
+    def test_out_of_range_wall_index_still_skipped(self):
+        # Regression guard: the pre-fix check `wall_idx >= len(walls)`
+        # also needs to hold. Don't let a refactor that rewrites the
+        # guard drop the upper bound.
+        sys.path.insert(0, str(PROJECT_DIR / "blender_addon"))
+        import geometry  # type: ignore
+
+        plan = {
+            "walls": [
+                {"start": [0, 0], "end": [10, 0], "thickness": 0.15},
+            ],
+            "doors": [
+                {"position": [5, 0], "width": 0.9, "wall_index": 99},
+            ],
+            "windows": [],
+            "rooms": [],
+        }
+        collection = MagicMock()
+        with patch.object(geometry.bpy.data.objects, "get", return_value=None):
+            count = geometry.generate_door_openings(plan, collection, wall_height=2.7)
+        self.assertEqual(count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
