@@ -22,6 +22,7 @@ from pathlib import Path
 # only after a full run. See prompts.py.
 sys.path.insert(0, str(Path(__file__).parent))
 from prompts import SYSTEM_PROMPT, USER_PROMPT  # type: ignore  # noqa: E402
+from schema import serialize  # type: ignore  # noqa: E402
 
 
 def run_vlm(image_path: str, weights_dir: Path, max_new_tokens: int = 4096) -> dict:
@@ -130,7 +131,13 @@ def main():
         except Exception as e:
             print(f"[warn] refiner failed, using unrefined output: {e}", file=sys.stderr)
 
-    text = json.dumps(result)
+    # Use the canonical serializer, not plain json.dumps, so the output
+    # matches the exact key order, rounding precision, and compact
+    # format the VLM was trained against. Anything that pattern-matches
+    # on the output (the Blender add-on, downstream eval, diffing two
+    # runs) would otherwise see spurious changes from dict insertion
+    # order or numeric-precision drift.
+    text = serialize(result)
     if args.output == "json":
         print(text)
     else:

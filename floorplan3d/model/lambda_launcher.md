@@ -45,10 +45,17 @@ SSH into the pod from Windows PowerShell:
 ssh ubuntu@<your-pod-ip>
 ```
 
-On the pod, run the bootstrap in one line:
+**Start in tmux.** Training runs for 20+ hours; if your SSH connection
+drops (laptop sleeps, WiFi blips), bash dies with it and so does
+training. `tmux` keeps the session alive on the pod so you can
+reconnect later. This is not optional for a real run.
 
 ```bash
+tmux new -s train
 curl -sSL https://raw.githubusercontent.com/nathanclearman/archbuildai/claude/debug-detection-issues-1zk7j/floorplan3d/model/bootstrap.sh | bash
+# Training is now running. Press Ctrl+B then D to detach — you can
+# close the SSH session (or your laptop) and training keeps going on
+# the pod.
 ```
 
 That script will:
@@ -67,29 +74,30 @@ From PowerShell, re-SSH in any time to check progress:
 
 ```powershell
 ssh ubuntu@<your-pod-ip>
-tmux attach    # if you started in tmux, otherwise tail the log file
+tmux attach -t train    # re-attach to the running training session
 ```
 
-Pro tip: wrap the bootstrap in `tmux` so you can close your laptop without
-interrupting training:
-
-```bash
-tmux new -s train
-curl -sSL https://raw.githubusercontent.com/nathanclearman/archbuildai/claude/debug-detection-issues-1zk7j/floorplan3d/model/bootstrap.sh | bash
-# Ctrl+B then D to detach; come back later with `tmux attach -t train`
-```
+Inside tmux, scroll back with `Ctrl+B` then `[` (arrow keys to scroll,
+`q` to exit scroll mode). Detach again with `Ctrl+B D`.
 
 ## 5. Pull the adapter back to your Windows desktop
 
-When training finishes, from PowerShell on your desktop:
+When training finishes, the bootstrap script prints the exact `scp`
+command with the correct path. Copy it literally from the pod's stdout
+— the script inserts the right username (`ubuntu` on Lambda, `root`
+on RunPod) and the right `WORKDIR` (`$HOME` or `/workspace` depending
+on whether a persistent filesystem was attached).
+
+The command looks like this, from PowerShell on your desktop:
 
 ```powershell
 cd C:\path\to\archbuildai
 scp -r ubuntu@<your-pod-ip>:~/archbuildai/floorplan3d/model/weights floorplan3d\model\
 ```
 
-Then commit and push the weights from your local repo (or store them
-elsewhere — LoRA adapters are ~200 MB).
+LoRA adapters are ~200–300 MB; keep them local or stash them in
+cloud storage. **Do not `git push` them** — they'll bloat the repo
+and break the 100 MB file limit without LFS setup.
 
 ## 6. Terminate the instance
 
@@ -107,7 +115,12 @@ for a second training run without re-downloading the dataset.
 | Bootstrap (deps, dataset, synth) | 0.5  | $1.25            |
 | QLoRA training, 2 epochs, 7B | 20–24     | $50–$60          |
 | Smoke tests + buffer         | 2         | $5               |
-| **Total**                    | ~25       | **$55–$65**      |
+| **Per-attempt total**        | ~25       | **$55–$65**      |
+
+**Budget for a reroll.** First-time cloud training often needs one
+retry — OOM on a specific sample, network blip during CubiCasa
+download, an unnoticed config bug. Plan **$100–$150** for the whole
+"get a working 7B adapter" milestone, not the per-attempt number.
 
 Persistent filesystem (200 GB × $0.20/mo) adds $40/month if you leave it —
 delete it after you're done if you don't plan another run soon.

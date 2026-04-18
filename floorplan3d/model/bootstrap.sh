@@ -31,6 +31,12 @@ EPOCHS="${EPOCHS:-2}"
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}"
 SKIP_TRAIN="${SKIP_TRAIN:-0}"
 
+# Ubuntu 22.04 ships `python3` but not a `python` symlink by default.
+# Prefer python3 so cloud images without the python-is-python3 package
+# still work. Users can override with PYTHON=/path/to/venv/python for
+# a specific env.
+PYTHON="${PYTHON:-python3}"
+
 echo "=== FloorPlan3D bootstrap ==="
 echo "repo:    $REPO_URL"
 echo "branch:  $BRANCH"
@@ -74,8 +80,8 @@ git pull --ff-only origin "$BRANCH"
 
 # --- 3. Python deps --------------------------------------------------------
 echo "--- installing Python packages (this takes a few minutes)"
-pip install --upgrade pip > /dev/null
-pip install -r floorplan3d/model/requirements.txt
+$PYTHON -m pip install --upgrade pip > /dev/null
+$PYTHON -m pip install -r floorplan3d/model/requirements.txt
 
 # --- 4. Download CubiCasa5k (~2GB) ----------------------------------------
 # Zenodo publishes the md5 for every file inside the record's JSON metadata.
@@ -134,9 +140,18 @@ else
 fi
 
 # --- 5. Generate US-style synthetic data ----------------------------------
-if [ ! -d data/synthetic ] || [ "$(ls -1 data/synthetic 2>/dev/null | wc -l)" -lt "$((SYNTH_COUNT / 2))" ]; then
+# Each sample produces two files (.png + .json), so a complete corpus
+# has exactly 2 * SYNTH_COUNT files. We require >= 95% of that before
+# skipping regeneration: a partial run (process killed, disk full) that
+# left e.g. 20000 files out of an expected 30000 would previously pass
+# the old SYNTH_COUNT/2 threshold (7500) and silently train on a
+# truncated corpus. 95% gives a tiny slack for fs noise without
+# accepting a genuinely incomplete set.
+SYNTH_TARGET_FILES=$((2 * SYNTH_COUNT))
+SYNTH_MIN_FILES=$(((SYNTH_TARGET_FILES * 95) / 100))
+if [ ! -d data/synthetic ] || [ "$(ls -1 data/synthetic 2>/dev/null | wc -l)" -lt "$SYNTH_MIN_FILES" ]; then
     echo "--- generating $SYNTH_COUNT synthetic US plans (~5-15 min on CPU)"
-    python synthesize.py --out data/synthetic --count "$SYNTH_COUNT"
+    $PYTHON synthesize.py --out data/synthetic --count "$SYNTH_COUNT"
 else
     echo "--- synthetic set already present, skipping"
 fi
@@ -153,7 +168,7 @@ fi
 
 mkdir -p weights
 echo "--- starting training (~20 GPU-hours on 1x H100)"
-python train.py \
+$PYTHON train.py \
     --base "$BASE_MODEL" \
     --cubicasa data/cubicasa5k \
     --synthetic data/synthetic \
@@ -169,5 +184,8 @@ echo
 echo "Adapter + processor saved to:"
 echo "  $WORKDIR/archbuildai/floorplan3d/model/weights/"
 echo
+# Lambda pods run as `ubuntu`, RunPod pods as `root`. Print the user
+# that invoked the script rather than hardcoding — users who
+# copy-paste a hardcoded `ubuntu@` on RunPod hit a silent auth failure.
 echo "To copy back to your desktop, from your desktop run:"
-echo "  scp -r ubuntu@<pod-ip>:$WORKDIR/archbuildai/floorplan3d/model/weights ./floorplan3d/model/"
+echo "  scp -r $(id -un)@<pod-ip>:$WORKDIR/archbuildai/floorplan3d/model/weights ./floorplan3d/model/"

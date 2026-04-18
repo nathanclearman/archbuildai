@@ -155,7 +155,20 @@ def _resolve_python_bin(probe=None) -> str:
 class LocalModelClient:
     """Client for the fine-tuned floor plan VLM."""
 
-    def __init__(self, weights_dir=None, python_bin=None, timeout=120):
+    def __init__(self, weights_dir=None, python_bin=None, timeout=300):
+        # Default timeout bumped from 120s to 300s. The first invocation
+        # after a fresh Blender launch pays:
+        #   Python subprocess start      ~1 s
+        #   torch import                 ~1-3 s
+        #   transformers import          ~2-5 s
+        #   Qwen2.5-VL weights load      20-40 s (disk-bound, worse on
+        #                                 external drives)
+        #   CUDA / MPS context init      2-10 s
+        #   Model generate               5-30 s
+        # Total cold-call budget: 30-90 s typically, up to 120 s under
+        # swap pressure on an M4 Max loading a 14 GB bf16 model. 300 s
+        # covers that without letting a genuinely hung subprocess (stuck
+        # on a corrupt weights file, OOM in MPS) freeze the UI forever.
         self.weights_dir = Path(weights_dir) if weights_dir else DEFAULT_WEIGHTS_DIR
         # Resolve lazily-but-eagerly: if caller passed an explicit path,
         # trust it. Otherwise probe for a torch-capable interpreter and

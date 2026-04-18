@@ -4,10 +4,14 @@
 
 # Core
 torch>=2.3
-transformers>=4.45       # Qwen2.5-VL support landed in 4.45
+# Qwen2.5-VL support landed in 4.45 but the first two patch releases
+# had known instability around the processor's image-grid metadata;
+# 4.46+ is where VLM training becomes reliable under bnb + PEFT. Pin
+# at 4.46 so a cloud pod's fresh install doesn't land on a flaky patch.
+transformers>=4.46
 accelerate>=0.33
 peft>=0.12               # LoRA / QLoRA
-bitsandbytes>=0.43       # 4-bit quantization
+bitsandbytes>=0.43       # 4-bit quantization (Linux+CUDA only)
 datasets>=2.20
 Pillow>=10.0
 numpy>=1.24
