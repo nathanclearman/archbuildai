@@ -70,11 +70,16 @@ def run_vlm(image_path: str, weights_dir: Path, max_new_tokens: int = 4096) -> d
     inputs = processor(text=[text], images=[image], return_tensors="pt").to(model.device)
 
     with torch.no_grad():
+        # Greedy decoding: do_sample=False. Do NOT set temperature here —
+        # temperature only applies to sampling, and transformers >= 4.45
+        # raises / warns when you pair do_sample=False with an explicit
+        # temperature (the value is a no-op but the config looks
+        # contradictory). Passing only do_sample=False is the clean
+        # greedy-decode contract.
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            temperature=0.0,
         )
     generated = output_ids[0, inputs["input_ids"].shape[1] :]
     text_out = processor.tokenizer.decode(generated, skip_special_tokens=True)

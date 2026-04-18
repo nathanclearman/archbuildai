@@ -47,7 +47,29 @@ CUBI_CLASS_MAP = {
 }
 
 # CubiCasa room-class names → our canonical room label vocabulary.
-CUBI_ROOM_LABELS = {
+#
+# Every value here MUST appear in synthesize.US_ROOM_LABELS, otherwise
+# the training target JSON contains labels the VLM emits but that the
+# refiner's in-vocab normalizer and MIN_ROOM_DIMS don't recognize —
+# vocabulary drift, the bug Cluster E partially fixed. Previous version
+# leaked "storage", "balcony", and "room" into training targets.
+#
+# Remapping rationale:
+#   "Storage" → "closet"   (closet is the US-vocab analog of a small
+#                           enclosed storage room)
+#   "Outdoor" → None       (balconies aren't interior floor-plan rooms;
+#   "Balcony" → None        dropping them yields a cleaner interior
+#                           footprint than mis-mapping)
+#   "Undefined" → None     (genuinely unknown is best signalled by
+#                           absence — forcing a generic "room" label
+#                           poisons the vocabulary with a catchall the
+#                           model would then reproduce at inference)
+#
+# Entries mapping to None cause the walker in _parse_svg to skip that
+# room entirely — the walls and doors around it are still emitted, so
+# the room boundary shows up geometrically but isn't labelled as a
+# ghost category.
+CUBI_ROOM_LABELS: dict[str, str | None] = {
     "LivingRoom": "living_room",
     "Kitchen": "kitchen",
     "Bedroom": "bedroom",
@@ -56,12 +78,12 @@ CUBI_ROOM_LABELS = {
     "Corridor": "hallway",
     "Entry": "foyer",
     "DiningRoom": "dining_room",
-    "Storage": "storage",
+    "Storage": "closet",
     "Garage": "garage",
     "Closet": "closet",
-    "Outdoor": "balcony",
-    "Balcony": "balcony",
-    "Undefined": "room",
+    "Outdoor": None,
+    "Balcony": None,
+    "Undefined": None,
 }
 
 
@@ -152,14 +174,22 @@ class CubiCasaLoader:
                     )
                 elif kind == "room":
                     label = _room_label_from_class(cls)
-                    metric_poly = [[p[0] / self.ppm, p[1] / self.ppm] for p in polygon]
-                    rooms.append(
-                        {
-                            "label": label,
-                            "polygon": metric_poly,
-                            "area": _polygon_area(metric_poly),
-                        }
-                    )
+                    if label is None:
+                        # Skip categories that don't map into our US
+                        # vocabulary (Outdoor / Balcony / Undefined).
+                        # Walls and doors around the skipped polygon
+                        # are still emitted — the boundary stays
+                        # geometrically present, just unlabeled.
+                        pass
+                    else:
+                        metric_poly = [[p[0] / self.ppm, p[1] / self.ppm] for p in polygon]
+                        rooms.append(
+                            {
+                                "label": label,
+                                "polygon": metric_poly,
+                                "area": _polygon_area(metric_poly),
+                            }
+                        )
             for child in elem:
                 walk(child, ctm)
 
@@ -314,11 +344,19 @@ def _polygon_bbox_center(polygon):
     return (sum(xs) / len(xs), sum(ys) / len(ys), width)
 
 
-def _room_label_from_class(class_attr: str) -> str:
+def _room_label_from_class(class_attr: str) -> str | None:
+    """Return the canonical US_ROOM_LABELS value for a CubiCasa svg class
+    string, or None if the class either matches a None-mapped CubiCasa
+    category (Outdoor, Balcony, Undefined — not interior rooms) or
+    doesn't match anything in CUBI_ROOM_LABELS at all. Callers must
+    skip the room when None is returned — previously this returned a
+    literal "room" string that leaked an out-of-vocabulary label into
+    the training target.
+    """
     for key, label in CUBI_ROOM_LABELS.items():
         if key in class_attr:
             return label
-    return "room"
+    return None
 
 
 def _polygon_area(polygon) -> float:

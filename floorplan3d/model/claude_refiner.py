@@ -21,12 +21,27 @@ from pathlib import Path
 
 # Local schema validation.
 sys.path.insert(0, str(Path(__file__).parent))
-from schema import serialize, deserialize, validate  # type: ignore
+from schema import deserialize, serialize  # type: ignore
+from synthesize import US_ROOM_LABELS  # type: ignore
 
 
-MODEL = "claude-opus-4-6"
+# Latest Opus generation at knowledge-cutoff. Claude 4.7 is the current
+# top-of-line Opus; 4.6 (the previous default) still works but doesn't
+# benefit from the reasoning improvements that matter most for the
+# refiner's "correct geometric inconsistencies from pixel evidence"
+# task. Cost per image is fractional cents either way.
+MODEL = "claude-opus-4-7"
 
-REFINER_PROMPT = """You are a floor plan refiner. You will receive:
+
+# Built once from US_ROOM_LABELS so the refiner prompt and the training
+# target vocabulary can never drift. Previously inline-listed, which
+# went stale the moment Cluster E added `study`, `stairs`, and
+# `main_room` without updating the prompt — the refiner would "fix"
+# those labels back to a generic bedroom/office.
+_VOCAB_STR = ", ".join(US_ROOM_LABELS)
+
+
+REFINER_PROMPT = f"""You are a floor plan refiner. You will receive:
   1. A raster floor plan image.
   2. A candidate JSON parse of that floor plan.
 
@@ -41,10 +56,7 @@ Specifically:
 - Correct wall_index references on doors/windows to point at the actual
   wall they lie on.
 - Normalize room labels to snake_case from this US-focused vocabulary:
-  great_room, living_room, family_room, dining_room, kitchen,
-  master_bedroom, bedroom, en_suite, bathroom, powder_room,
-  walk_in_closet, closet, foyer, hallway, mudroom, laundry_room,
-  pantry, garage, office, den.
+  {_VOCAB_STR}.
   Prefer master_bedroom over bedroom if it is attached to an en_suite
   and/or a walk_in_closet. Prefer great_room when living, dining, and
   kitchen are one contiguous open space.
@@ -98,9 +110,10 @@ def refine(image_path: str, candidate: dict) -> dict:
         text = "".join(
             block.text for block in msg.content if getattr(block, "type", None) == "text"
         )
-        refined = deserialize(text)
-        validate(refined)
-        return refined
+        # deserialize() runs schema.validate() internally, so a separate
+        # validate(refined) afterward was a redundant re-check that
+        # would never catch anything deserialize() hadn't already caught.
+        return deserialize(text)
     except Exception as e:
         print(f"[refiner] refinement failed, keeping candidate: {e}", file=sys.stderr)
         return candidate

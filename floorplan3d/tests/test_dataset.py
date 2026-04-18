@@ -27,15 +27,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "model"))
 
 import schema  # type: ignore
 from dataset import (  # type: ignore
+    CUBI_ROOM_LABELS,
     CubiCasaLoader,
     RealMLSLoader,
     _apply,
     _compose,
     _IDENTITY,
     _parse_transform,
+    _room_label_from_class,
     build_eval_set,
     build_training_set,
 )
+from synthesize import US_ROOM_LABELS  # type: ignore
 
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "cubicasa_mini"
@@ -225,6 +228,65 @@ class TransformMathTest(unittest.TestCase):
         x, y = _apply(m, (1, 0))
         self.assertAlmostEqual(x, 0.0, places=5)
         self.assertAlmostEqual(y, 1.0, places=5)
+
+
+class CubicasaVocabularyTest(unittest.TestCase):
+    """Training-target labels must all be in-vocabulary. Previously
+    CUBI_ROOM_LABELS mapped CubiCasa's `Storage`, `Outdoor`, `Balcony`,
+    and `Undefined` categories to values (`storage`, `balcony`, `room`)
+    that weren't in US_ROOM_LABELS — those labels leaked into every
+    CubiCasa sample's target JSON and taught the VLM to emit tokens
+    the refiner / MIN_ROOM_DIMS then rejected. These tests pin the
+    contract that CUBI_ROOM_LABELS either maps into US_ROOM_LABELS or
+    maps to None (skip the room)."""
+
+    def test_every_mapping_value_is_in_us_vocab_or_none(self):
+        vocab = set(US_ROOM_LABELS)
+        for key, value in CUBI_ROOM_LABELS.items():
+            self.assertTrue(
+                value is None or value in vocab,
+                msg=f"CUBI_ROOM_LABELS[{key!r}] = {value!r} is not in "
+                    f"US_ROOM_LABELS and is not None",
+            )
+
+    def test_none_mapping_returns_none_from_label_resolver(self):
+        # _room_label_from_class must propagate the None so callers
+        # know to skip the room, not emit an empty or generic label.
+        self.assertIsNone(_room_label_from_class("Outdoor"))
+        self.assertIsNone(_room_label_from_class("Balcony"))
+        self.assertIsNone(_room_label_from_class("Undefined"))
+
+    def test_unmatched_class_returns_none_not_generic_room(self):
+        # Previously the fallback returned "room" — an out-of-vocab
+        # catch-all that poisoned training. Now None so the caller
+        # skips.
+        self.assertIsNone(_room_label_from_class("SomethingNovel"))
+        self.assertIsNone(_room_label_from_class(""))
+
+    def test_known_class_resolves_to_us_vocab(self):
+        self.assertEqual(_room_label_from_class("LivingRoom"), "living_room")
+        self.assertEqual(_room_label_from_class("Kitchen"), "kitchen")
+        # Storage now maps to closet (was "storage" — not in vocab).
+        self.assertEqual(_room_label_from_class("Storage"), "closet")
+
+
+class RefinerVocabSyncTest(unittest.TestCase):
+    """The refiner prompt lists the room vocabulary Claude should
+    normalise labels to. If that list drifts from US_ROOM_LABELS,
+    Claude will "correct" in-vocab labels back to legacy ones on
+    some queries, then the model retraining on refiner output sees
+    drifted targets. This test rebuilds the prompt-embedded vocab
+    and asserts it's the exact US_ROOM_LABELS set."""
+
+    def test_refiner_prompt_includes_full_us_vocab(self):
+        from claude_refiner import REFINER_PROMPT  # type: ignore
+        for label in US_ROOM_LABELS:
+            self.assertIn(
+                label, REFINER_PROMPT,
+                msg=f"{label!r} is in US_ROOM_LABELS but missing from "
+                    f"the refiner prompt — the refiner will normalise "
+                    f"it back to a legacy label.",
+            )
 
 
 if __name__ == "__main__":
