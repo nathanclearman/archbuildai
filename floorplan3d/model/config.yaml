@@ -27,8 +27,8 @@ training:
 
   # Training hyperparameters
   epochs: 100
-  batch_size: 16
-  learning_rate: 0.001
+  batch_size: 128       # GH200 H100 96GB HBM3 — yolov8m at 640px fits easily
+  learning_rate: 0.002  # Linear scale with larger batch
   weight_decay: 0.0005
   warmup_epochs: 3
   patience: 15  # Early stopping patience
@@ -47,7 +47,7 @@ training:
 
   # Hardware
   device: "auto"  # auto-detect GPU/MPS/CPU
-  workers: 8
+  workers: 16     # GH200 Grace CPU has 72 Neoverse V2 cores — plenty of dataloader headroom
 
 inference:
   confidence_threshold: 0.5
