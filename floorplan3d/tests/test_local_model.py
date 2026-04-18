@@ -19,6 +19,7 @@ sys.path.insert(
     str(Path(__file__).resolve().parent.parent / "blender_addon" / "api"),
 )
 
+import local_model  # type: ignore
 from local_model import (  # type: ignore
     _FALLBACK_PYTHON_CANDIDATES,
     _is_blender_python,
@@ -63,6 +64,16 @@ class TestIsBlenderPython(unittest.TestCase):
 
 class TestResolvePythonBin(unittest.TestCase):
     """Resolution order: FP3D_PYTHON → sys.executable → python3 → python."""
+
+    def setUp(self):
+        # The module-level cache persists across calls; tests that inject
+        # a custom probe bypass the cache by design, but we still clear
+        # it in setUp so a prior test that somehow triggered the default
+        # path can't leak a cached result into the next test.
+        local_model._RESOLVED_PYTHON_CACHE.clear()
+
+    def tearDown(self):
+        local_model._RESOLVED_PYTHON_CACHE.clear()
 
     def test_env_var_wins_without_probing(self):
         # Explicit opt-in is trusted — no subprocess spawned. User took
@@ -117,23 +128,109 @@ class TestResolvePythonBin(unittest.TestCase):
             resolved = _resolve_python_bin(probe=probe)
         self.assertEqual(resolved, "python")
 
-    def test_raises_when_no_candidate_works(self):
-        # The old silent behaviour returned sys.executable and produced
-        # an opaque "returncode=1" at predict time. The new contract is
-        # a loud RuntimeError that names FP3D_PYTHON so the fix is
-        # one env-var assignment away.
+    def test_raises_with_blender_diagnosis_when_sys_exec_is_blender(self):
+        # When sys.executable is Blender's bundled python, the error
+        # message should name Blender so the user knows the default
+        # won't work and to point FP3D_PYTHON at their ML env.
         env_empty = {k: v for k, v in __import__("os").environ.items()
                      if k != "FP3D_PYTHON"}
         with patch.dict("os.environ", env_empty, clear=True), \
              patch("local_model._is_blender_python", return_value=True):
             with self.assertRaises(RuntimeError) as cm:
                 _resolve_python_bin(probe=lambda _: False)
-        self.assertIn("FP3D_PYTHON", str(cm.exception))
+        msg = str(cm.exception)
+        self.assertIn("FP3D_PYTHON", msg)
+        self.assertIn("Blender", msg)
+
+    def test_raises_with_path_diagnosis_when_sys_exec_is_not_blender(self):
+        # When sys.executable is a regular system python that just
+        # happens to lack torch, the message must NOT accuse it of
+        # being Blender's — that would send the user hunting for a
+        # problem they don't have. It should name "PATH" / "ML env"
+        # so the user knows to install or activate one.
+        env_empty = {k: v for k, v in __import__("os").environ.items()
+                     if k != "FP3D_PYTHON"}
+        with patch.dict("os.environ", env_empty, clear=True), \
+             patch("local_model._is_blender_python", return_value=False):
+            with self.assertRaises(RuntimeError) as cm:
+                _resolve_python_bin(probe=lambda _: False)
+        msg = str(cm.exception)
+        self.assertIn("FP3D_PYTHON", msg)
+        self.assertNotIn("Blender", msg)
+        self.assertIn("PATH", msg)
 
     def test_fallback_candidates_order(self):
         # python3 before python — Ubuntu 22.04 / macOS default; `python`
         # on some older distros still points at 2.x.
         self.assertEqual(_FALLBACK_PYTHON_CANDIDATES, ("python3", "python"))
+
+
+class TestResolverCache(unittest.TestCase):
+    """The resolver memoizes the default-probe path to avoid re-probing on
+    every LocalModelClient() construction — the operator builds a fresh
+    client per Generate click, so without the cache the user eats 15-45 s
+    of `import torch` probe time on every click."""
+
+    def setUp(self):
+        local_model._RESOLVED_PYTHON_CACHE.clear()
+
+    def tearDown(self):
+        local_model._RESOLVED_PYTHON_CACHE.clear()
+
+    def test_default_probe_is_memoized(self):
+        env_empty = {k: v for k, v in __import__("os").environ.items()
+                     if k != "FP3D_PYTHON"}
+        calls = [0]
+
+        def probe(_):
+            calls[0] += 1
+            return True
+
+        # Monkey-patch the module's default probe so the function signature
+        # default picks it up — `probe is _probe_python` is the cache gate.
+        with patch.dict("os.environ", env_empty, clear=True), \
+             patch("local_model._is_blender_python", return_value=False), \
+             patch("local_model._probe_python", side_effect=probe):
+            # Call twice with no explicit probe arg → uses the (patched)
+            # module default → qualifies for caching.
+            r1 = _resolve_python_bin()
+            r2 = _resolve_python_bin()
+
+        self.assertEqual(r1, r2)
+        self.assertEqual(
+            calls[0], 1,
+            "resolver must probe only once under repeated default-probe calls",
+        )
+
+    def test_injected_probe_bypasses_cache(self):
+        # Injected probes are test seams — every call must see a fresh
+        # resolution. If the cache swallowed the second call, a test that
+        # flips probe behaviour between calls would get a stale answer.
+        env_empty = {k: v for k, v in __import__("os").environ.items()
+                     if k != "FP3D_PYTHON"}
+        calls = [0]
+
+        def probe(_):
+            calls[0] += 1
+            return True
+
+        with patch.dict("os.environ", env_empty, clear=True), \
+             patch("local_model._is_blender_python", return_value=False):
+            _resolve_python_bin(probe=probe)
+            _resolve_python_bin(probe=probe)
+
+        self.assertEqual(calls[0], 2)
+        # And nothing should have leaked into the cache.
+        self.assertFalse(local_model._RESOLVED_PYTHON_CACHE)
+
+    def test_env_var_path_does_not_populate_cache(self):
+        # FP3D_PYTHON is trusted; there's nothing to memoize on that
+        # path (no probe was performed). Writing into the cache would
+        # also tie the cached value to env=None, which is not what the
+        # env-var branch returns.
+        with patch.dict("os.environ", {"FP3D_PYTHON": "/custom/py"}):
+            _resolve_python_bin()
+        self.assertFalse(local_model._RESOLVED_PYTHON_CACHE)
 
 
 if __name__ == "__main__":

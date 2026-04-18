@@ -70,7 +70,16 @@ def _probe_python(candidate: str) -> bool:
 _FALLBACK_PYTHON_CANDIDATES: tuple[str, ...] = ("python3", "python")
 
 
-def _resolve_python_bin(probe=_probe_python) -> str:
+# Memoized resolution keyed on the FP3D_PYTHON env value. The resolver
+# spawns up to 3 `import torch` subprocesses (15 s timeout each) on a
+# cold miss; without this cache, every `LocalModelClient()` in the
+# Blender operator re-probes on every Generate click. Keyed on env so a
+# user who sets FP3D_PYTHON mid-session gets a fresh resolution.
+# Injected probes (test seams) bypass the cache — see _resolve_python_bin.
+_RESOLVED_PYTHON_CACHE: dict[str | None, str] = {}
+
+
+def _resolve_python_bin(probe=None) -> str:
     """Find a Python interpreter with `torch` installed.
 
     Resolution order:
@@ -81,32 +90,65 @@ def _resolve_python_bin(probe=_probe_python) -> str:
     Every candidate past (1) is probed with `_probe_python` so we don't
     hand the user a silent `subprocess returncode=1` when the chosen
     interpreter can't import torch. `probe` is an injection seam so tests
-    don't spawn real subprocesses.
+    don't spawn real subprocesses; injecting a probe also bypasses the
+    module-level cache so tests get deterministic behaviour.
 
-    Raises RuntimeError with a message pointing at FP3D_PYTHON when none
-    of the candidates work — much better UX than the previous default of
-    `sys.executable` which, inside Blender, is guaranteed to fail.
+    `probe=None` resolves to the module-level `_probe_python` AT CALL TIME
+    rather than at def-time, so tests can `patch('local_model._probe_python',
+    ...)` and see the patch take effect. A default-argument binding
+    (`probe=_probe_python`) would capture the original reference when
+    this module was first imported and defeat the patch.
+
+    Raises RuntimeError with a message tailored to the actual failure
+    mode: Blender-bundled-python diagnosis when `sys.executable` is
+    Blender's, plain "torch not found on PATH" otherwise. Accusing a
+    user's system python of being Blender's would send them hunting
+    for a problem that isn't theirs.
     """
+    is_default_probe = probe is None
+    if is_default_probe:
+        probe = _probe_python
+
     env = os.environ.get("FP3D_PYTHON")
     if env:
         return env
 
+    # Cache only when using the default probe. Injected probes belong to
+    # tests, which must see a fresh resolution every call.
+    if is_default_probe and env in _RESOLVED_PYTHON_CACHE:
+        return _RESOLVED_PYTHON_CACHE[env]
+
+    blender_python = _is_blender_python(sys.executable)
     candidates: list[str] = []
-    if not _is_blender_python(sys.executable):
+    if not blender_python:
         candidates.append(sys.executable)
     candidates.extend(_FALLBACK_PYTHON_CANDIDATES)
 
     for candidate in candidates:
         if probe(candidate):
+            if is_default_probe:
+                _RESOLVED_PYTHON_CACHE[env] = candidate
             return candidate
 
+    # Tailor the diagnosis so a non-Blender user isn't told their
+    # /usr/bin/python3 is Blender's bundled interpreter.
+    if blender_python:
+        diagnosis = (
+            f"sys.executable is {sys.executable!r} — Blender's bundled "
+            "interpreter, which does not carry ML dependencies, and "
+            "'python3' / 'python' on PATH could not import torch either."
+        )
+    else:
+        diagnosis = (
+            f"Tried {sys.executable!r}, 'python3', and 'python'; none "
+            "could import torch. Your ML environment may not be "
+            "installed, or it may not be on PATH."
+        )
     raise RuntimeError(
         "Could not find a Python interpreter with `torch` installed. "
         "Set the FP3D_PYTHON environment variable to the path of a "
         "Python that has the model dependencies (see "
-        "floorplan3d/model/requirements.txt). sys.executable is "
-        f"{sys.executable!r} — which is Blender's bundled interpreter "
-        "and does not carry ML dependencies."
+        f"floorplan3d/model/requirements.txt). {diagnosis}"
     )
 
 
