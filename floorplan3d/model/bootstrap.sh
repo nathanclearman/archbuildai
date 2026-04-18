@@ -26,7 +26,7 @@ if [ -z "${WORKDIR:-}" ]; then
         WORKDIR="$HOME"
     fi
 fi
-SYNTH_COUNT="${SYNTH_COUNT:-10000}"
+SYNTH_COUNT="${SYNTH_COUNT:-15000}"  # matches the 7B QLoRA corpus size target
 EPOCHS="${EPOCHS:-2}"
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}"
 SKIP_TRAIN="${SKIP_TRAIN:-0}"
@@ -56,6 +56,11 @@ $SUDO apt-get install -y --no-install-recommends \
 git lfs install --skip-smudge > /dev/null
 
 # --- 2. Clone --------------------------------------------------------------
+# fetch + checkout + pull must succeed. Previously `git pull ... || true`
+# masked network failures so a stale checkout silently trained on a
+# stale branch head — a debug nightmare on a $60/run pod. Fast-forward-
+# only makes "already up-to-date" succeed without a merge prompt; a
+# real divergence fails loudly.
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
 if [ ! -d archbuildai ]; then
@@ -63,9 +68,9 @@ if [ ! -d archbuildai ]; then
     git clone "$REPO_URL"
 fi
 cd archbuildai
-git fetch origin
+git fetch origin "$BRANCH"
 git checkout "$BRANCH"
-git pull origin "$BRANCH" || true
+git pull --ff-only origin "$BRANCH"
 
 # --- 3. Python deps --------------------------------------------------------
 echo "--- installing Python packages (this takes a few minutes)"

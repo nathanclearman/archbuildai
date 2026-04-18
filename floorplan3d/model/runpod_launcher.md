@@ -3,6 +3,12 @@
 End-to-end recipe to fine-tune the floor plan VLM on a single H100 (80GB)
 for roughly **$50–80 of compute**.
 
+> **Prefer `bootstrap.sh`.** The one-liner in `lambda_launcher.md` runs
+> everything in this doc automatically (deps + checksum-verified dataset
+> download + synth + train). This doc is the manual walk-through kept
+> for debugging and for users who want to step through it on RunPod.
+> The two should stay in sync; if they drift, `bootstrap.sh` wins.
+
 ## 1. Launch the pod
 
 - Provider: RunPod or Lambda (RunPod recommended for lower cost + persistent volumes)
@@ -27,15 +33,21 @@ pip install -r floorplan3d/model/requirements.txt
 ```bash
 cd floorplan3d/model
 
-# CubiCasa5k (~2 GB)
+# CubiCasa5k (~2 GB).
+# NOTE: this manual recipe skips the md5 verification that bootstrap.sh
+# performs. If you want it, copy the CUBICASA_RECORD_ID + EXPECTED_MD5
+# stanza from bootstrap.sh. A silent partial/corrupt download here
+# trains on a fraction of the intended corpus.
 mkdir -p data
 wget -O data/cubicasa5k.zip \
   https://zenodo.org/records/2613548/files/cubicasa5k.zip
 unzip -q data/cubicasa5k.zip -d data/cubicasa5k
 rm data/cubicasa5k.zip
 
-# Synthetic augmentation (CPU, ~10 min for 5k samples)
-python synthesize.py --out data/synthetic --count 5000
+# Synthetic augmentation (CPU, ~18-20 min for 15k samples at seed 0).
+# 15k matches the count in bootstrap.sh's SYNTH_COUNT default and the
+# corpus size used for the 7B QLoRA plan.
+python synthesize.py --out data/synthetic --count 15000 --seed 0
 ```
 
 ResPlan and CFP are optional — add them later if you want to push accuracy

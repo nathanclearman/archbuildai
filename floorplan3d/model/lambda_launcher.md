@@ -56,7 +56,7 @@ That script will:
 2. Clone this repo at the right branch
 3. Install all Python ML dependencies
 4. Download CubiCasa5k (~2 GB)
-5. Generate 10,000 US-style synthetic floor plans
+5. Generate 15,000 US-style synthetic floor plans
 6. Start training on the attached H100
 
 **Expected wall-clock:** 20–30 hours for training, plus ~15 min of setup.
@@ -119,7 +119,7 @@ Environment variables you can set before running bootstrap.sh:
 | Var            | Default                             | What it does |
 |----------------|-------------------------------------|--------------|
 | `BRANCH`       | `claude/debug-detection-issues-1zk7j` | Git branch to check out |
-| `SYNTH_COUNT`  | `10000`                             | Number of synthetic plans |
+| `SYNTH_COUNT`  | `15000`                             | Number of synthetic plans |
 | `EPOCHS`       | `2`                                 | Training epochs |
 | `BASE_MODEL`   | `Qwen/Qwen2.5-VL-7B-Instruct`       | Base model (try `Qwen/Qwen2.5-VL-3B-Instruct` for a cheaper smoke test) |
 | `SKIP_TRAIN`   | `0`                                 | Set to `1` to prep data only, skip training |
