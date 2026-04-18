@@ -33,15 +33,14 @@ from PIL import Image
 # a hard project dep, so it lives at module scope — FloorPlanDS needs it
 # to be importable by multiprocessing workers under `spawn` start method.
 
-
-SYSTEM_PROMPT = (
-    "You are a floor plan vectorization model. Given a raster floor plan "
-    "image, emit a JSON object with keys 'scale', 'walls', 'doors', "
-    "'windows', 'rooms' matching the canonical schema. Respond with JSON "
-    "only — no prose, no code fences."
-)
-
-USER_PROMPT = "Vectorize this floor plan."
+# Shared with inference.py. The training target distribution is conditioned
+# on this exact prefix; any drift between here and inference-time silently
+# degrades eval. The constants live in a dep-free sibling module so both
+# train (heavy deps) and inference (subprocess-invoked from Blender) can
+# import without pulling torch / transformers through the import chain.
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).parent))
+from prompts import SYSTEM_PROMPT, USER_PROMPT  # type: ignore  # noqa: E402
 
 
 @dataclass

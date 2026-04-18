@@ -15,15 +15,13 @@ import json
 import sys
 from pathlib import Path
 
-
-SYSTEM_PROMPT = (
-    "You are a floor plan vectorization model. Given a raster floor plan "
-    "image, emit a JSON object with keys 'scale', 'walls', 'doors', "
-    "'windows', 'rooms' matching the canonical schema. Respond with JSON "
-    "only — no prose, no code fences."
-)
-
-USER_PROMPT = "Vectorize this floor plan."
+# Shared with train.py. Any divergence between the two is a silent
+# training/inference drift bug: the model conditions on this prefix at
+# sampling time but was supervised against it at train time, so a change
+# here without a retrain produces degraded output that eval picks up
+# only after a full run. See prompts.py.
+sys.path.insert(0, str(Path(__file__).parent))
+from prompts import SYSTEM_PROMPT, USER_PROMPT  # type: ignore  # noqa: E402
 
 
 def run_vlm(image_path: str, weights_dir: Path, max_new_tokens: int = 4096) -> dict:
