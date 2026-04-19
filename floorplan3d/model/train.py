@@ -56,9 +56,9 @@ class TrainConfig:
     lora_r: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.05
-    max_length: int = 4096
+    max_length: int = 6144
     warmup_ratio: float = 0.03
-    save_steps: int = 500
+    save_steps: int = 100
     logging_steps: int = 10
     dataloader_num_workers: int = 2
     seed: int = 0
@@ -70,17 +70,33 @@ class TrainConfig:
     eval_split: float = 0.10
     # Eval happens every this many optimizer steps. Must equal save_steps
     # when load_best_model_at_end=True, so a single knob covers both.
-    eval_steps: int = 500
+    eval_steps: int = 100
+    # Hard cap on eval set size. A full 10% split of a 15k corpus is
+    # ~1500 samples; at ~3 s / eval sample, the first eval_loss pause
+    # is 75 min and the user would reasonably suspect a hang and kill
+    # the run. 100 is enough for a stable eval_loss signal without
+    # holding the training loop hostage.
+    eval_max_samples: int = 100
 
 
-# Coarse char-per-token upper bound for Qwen's BPE on JSON text. JSON is
-# dense in short tokens (punctuation, digit runs) and averages ~2.5-3.2
-# chars/token in practice; 4.0 is a conservative ceiling — any target
-# whose raw chars exceed max_length * this factor cannot possibly fit
-# after tokenization, regardless of prompt overhead. Borderline samples
-# (over max_length*2 but under max_length*4) still reach training and
-# get a precise token-count check inside format_conversation.
-MAX_TARGET_CHARS_PER_TOKEN = 4.0
+# Prompt-side token budget the pre-filter has to subtract BEFORE
+# computing the char budget. Qwen2.5-VL's image encoder emits up to
+# ~1024 tokens per 900px image, plus ~100 tokens for the system +
+# user prompts + role markers. 1500 is a conservative upper bound
+# that leaves margin for image-token variance. Under-estimating here
+# is how the 4101-token crash at step 496 slipped past the previous
+# pre-filter.
+PROMPT_OVERHEAD_TOKENS = 1500
+
+# Tighter chars-per-token floor (was 4.0). 3.0 is the lower end of
+# observed BPE ratios on dense floor-plan JSON — tokens are mostly
+# single-char punctuation and short digit runs. Using the floor as
+# the filter estimate means we OVER-reject borderline samples rather
+# than UNDER-reject them, which is the safer trade at $3-4/hr pod
+# cost: dropping ~50 samples from a 15k corpus is free, but a single
+# mid-run crash from an under-filtered sample is up to $15 of lost
+# pod time (bounded by save_steps cadence).
+MAX_TARGET_CHARS_PER_TOKEN = 3.0
 
 
 def build_samples(cfg: TrainConfig):
@@ -122,10 +138,22 @@ def build_samples(cfg: TrainConfig):
 def _filter_oversized_samples(samples, max_length):
     """Drop samples whose raw target JSON exceeds the char budget.
 
+    The budget accounts for both the per-sample prompt overhead
+    (PROMPT_OVERHEAD_TOKENS: system prompt + image tokens + role
+    markers — 1100-1500 tokens in practice for a 900px Qwen2.5-VL
+    input) and the conservative chars-per-token floor. The previous
+    version of this filter multiplied `max_length * 4.0` against the
+    raw target, ignoring prompt overhead entirely — a target with
+    ~12k chars passed the filter, tokenized to ~3000 target tokens +
+    ~1100 overhead = 4100 total, and crashed format_conversation
+    mid-training at step 496 (after ~4 hours of pod clock, no
+    checkpoint, full restart).
+
     Returns (kept, dropped_count, char_budget). Pure function so it's
     unit-testable without a dataset on disk.
     """
-    char_budget = int(max_length * MAX_TARGET_CHARS_PER_TOKEN)
+    available = max(0, max_length - PROMPT_OVERHEAD_TOKENS)
+    char_budget = int(available * MAX_TARGET_CHARS_PER_TOKEN)
     kept = [s for s in samples if len(s.target_json) <= char_budget]
     return kept, len(samples) - len(kept), char_budget
 
@@ -287,9 +315,38 @@ def main():
     parser.add_argument("--lr", type=float, default=TrainConfig.learning_rate)
     parser.add_argument("--lora-r", type=int, default=TrainConfig.lora_r)
     parser.add_argument("--max-length", type=int, default=TrainConfig.max_length)
+    parser.add_argument("--save-steps", type=int, default=TrainConfig.save_steps,
+                        help="Checkpoint every N optimizer steps. Smaller = "
+                             "less pod-clock lost on crash, more disk IO.")
+    parser.add_argument("--eval-steps", type=int, default=TrainConfig.eval_steps,
+                        help="Run eval every N steps. Must equal --save-steps "
+                             "when load_best_model_at_end is on (HF requirement). "
+                             "A single shared value is the simplest config.")
+    parser.add_argument("--eval-max-samples", type=int,
+                        default=TrainConfig.eval_max_samples,
+                        help="Hard cap on eval set size. 100-200 is plenty for "
+                             "a stable eval_loss; anything larger just makes "
+                             "each eval pause longer without improving signal.")
     parser.add_argument("--seed", type=int, default=TrainConfig.seed)
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
+
+    # save_steps and eval_steps MUST be equal for HF's
+    # load_best_model_at_end tracking to work — each save step needs
+    # a paired eval_loss to pick from. If the user passes only
+    # --save-steps, mirror it into eval_steps (and vice-versa) so a
+    # single flag is enough for the common case.
+    if args.save_steps != TrainConfig.save_steps and args.eval_steps == TrainConfig.eval_steps:
+        args.eval_steps = args.save_steps
+    elif args.eval_steps != TrainConfig.eval_steps and args.save_steps == TrainConfig.save_steps:
+        args.save_steps = args.eval_steps
+    if args.save_steps != args.eval_steps:
+        raise SystemExit(
+            f"--save-steps ({args.save_steps}) must equal --eval-steps "
+            f"({args.eval_steps}) when load_best_model_at_end is on "
+            f"(HF Trainer requirement). Pass only one flag and the other "
+            f"is mirrored, or pass both with the same value."
+        )
 
     cfg = TrainConfig(
         base_model=args.base,
@@ -302,6 +359,9 @@ def main():
         learning_rate=args.lr,
         lora_r=args.lora_r,
         max_length=args.max_length,
+        save_steps=args.save_steps,
+        eval_steps=args.eval_steps,
+        eval_max_samples=args.eval_max_samples,
         seed=args.seed,
     )
 
@@ -318,6 +378,17 @@ def main():
 
     samples = build_samples(cfg)
     train_samples, eval_samples = _split_eval(samples, cfg.eval_split, cfg.seed)
+    # Cap the eval set. A raw 10% split of a 15k corpus is ~1500 samples;
+    # at ~3 s/sample on an H100-class GPU the first eval_loss pause is
+    # 75 minutes and a user reasonably suspects a hang and Ctrl+C's the
+    # run — killing the last checkpoint. Cap keeps eval pauses sub-10-min.
+    if cfg.eval_max_samples and len(eval_samples) > cfg.eval_max_samples:
+        print(
+            f"eval cap: {len(eval_samples)} -> {cfg.eval_max_samples} samples "
+            f"(stable eval_loss doesn't need the full split; first eval "
+            f"pause stays short)."
+        )
+        eval_samples = eval_samples[: cfg.eval_max_samples]
     print(f"split: {len(train_samples)} train / {len(eval_samples)} eval "
           f"(eval_split={cfg.eval_split:.2f})")
 

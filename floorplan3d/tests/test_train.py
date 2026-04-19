@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "model"))
 from train import (  # type: ignore
     FloorPlanDS,
     MAX_TARGET_CHARS_PER_TOKEN,
+    PROMPT_OVERHEAD_TOKENS,
     _filter_oversized_samples,
     _find_subseq,
     _mask_prompt_cutoff,
@@ -86,30 +87,66 @@ class _FakeSample:
 
 
 class TestFilterOversizedSamples(unittest.TestCase):
+    """The filter budget now subtracts PROMPT_OVERHEAD_TOKENS before
+    multiplying by the chars-per-token floor. This is the fix for the
+    step-496 crash: the previous formula `max_length * 4.0` ignored
+    ~1500 tokens of prompt overhead (system + user + image tokens),
+    admitting samples that tokenized over budget.
+    """
+
+    def _expected_budget(self, max_length):
+        return int(max(0, max_length - PROMPT_OVERHEAD_TOKENS) * MAX_TARGET_CHARS_PER_TOKEN)
+
     def test_keeps_short_samples(self):
+        # max_length = 6144 (new default); overhead 1500 → 4644 avail ×
+        # 3.0 chars/token = 13,932 char budget. 100-char samples pass.
         samples = [_FakeSample("x" * 100) for _ in range(3)]
-        kept, dropped, budget = _filter_oversized_samples(samples, max_length=1024)
+        kept, dropped, budget = _filter_oversized_samples(samples, max_length=6144)
         self.assertEqual(len(kept), 3)
         self.assertEqual(dropped, 0)
-        self.assertEqual(budget, int(1024 * MAX_TARGET_CHARS_PER_TOKEN))
+        self.assertEqual(budget, self._expected_budget(6144))
 
     def test_drops_oversized_samples(self):
-        # budget = 100 * 4.0 = 400 chars.
+        # Budget at max_length=4000: (4000-1500)*3.0 = 7500 chars.
         short = _FakeSample("x" * 100)
-        big = _FakeSample("x" * 500)
-        kept, dropped, budget = _filter_oversized_samples([short, big], max_length=100)
+        big = _FakeSample("x" * 8000)
+        kept, dropped, budget = _filter_oversized_samples([short, big], max_length=4000)
         self.assertEqual(len(kept), 1)
         self.assertEqual(dropped, 1)
-        self.assertEqual(budget, 400)
+        self.assertEqual(budget, 7500)
         self.assertIs(kept[0], short)
 
     def test_boundary_sample_is_kept(self):
-        # Exactly at the char budget is inclusive. Predictable behaviour
-        # matters more than the specific choice here.
-        exactly = _FakeSample("x" * 400)
-        kept, dropped, _ = _filter_oversized_samples([exactly], max_length=100)
+        # Exactly at the char budget is inclusive.
+        budget = self._expected_budget(4000)  # 7500
+        exactly = _FakeSample("x" * budget)
+        kept, dropped, _ = _filter_oversized_samples([exactly], max_length=4000)
         self.assertEqual(len(kept), 1)
         self.assertEqual(dropped, 0)
+
+    def test_max_length_below_overhead_rejects_everything(self):
+        # Pathological but defined: if someone sets max_length below
+        # the prompt overhead, available tokens is clamped to 0 and
+        # the char budget is 0 — every sample is rejected. The previous
+        # formula would have accepted samples up to (max_length * 4)
+        # chars even though there was no room for the target at all.
+        tiny = _FakeSample("x")
+        kept, dropped, budget = _filter_oversized_samples([tiny], max_length=500)
+        self.assertEqual(len(kept), 0)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(budget, 0)
+
+    def test_regression_step_496_crash(self):
+        # The exact scenario that crashed the user's 4-hour run: a 9500-
+        # char target that the old filter (max_length*4 = 16384) admitted,
+        # but that tokenized to 4101 total tokens under the 4096 budget.
+        # Under the new filter with max_length=4096, overhead=1500:
+        # available = 2596 tokens × 3.0 chars = 7788 char budget.
+        # 9500 > 7788 → correctly rejected pre-flight.
+        borderline = _FakeSample("x" * 9500)
+        kept, dropped, _ = _filter_oversized_samples([borderline], max_length=4096)
+        self.assertEqual(len(kept), 0, msg="regression: old formula admitted this")
+        self.assertEqual(dropped, 1)
 
 
 class TestSplitEval(unittest.TestCase):
