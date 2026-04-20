@@ -101,10 +101,19 @@ def run_vlm(image_path: str, weights_dir: Path, max_new_tokens: int = 4096,
         # temperature (the value is a no-op but the config looks
         # contradictory). Passing only do_sample=False is the clean
         # greedy-decode contract.
+        # repetition_penalty=1.05 is the anti-loop guard. Greedy decoding
+        # on dense JSON output collapses into pivot-point loops on the
+        # most complex plans (~25+ walls), emitting near-duplicate wall
+        # entries until max_new_tokens. 1.05 is gentle enough not to
+        # disturb the structural JSON repetition (`{"start":..."end":...}`
+        # template recurs once per wall); anything >=1.10 starts harming
+        # the well-behaved samples by skewing legitimate coordinate digit
+        # repetition (numbers like 4.18 sharing tokens with 4.16 etc.).
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
+            repetition_penalty=1.05,
         )
     generated = output_ids[0, inputs["input_ids"].shape[1] :]
     text_out = processor.tokenizer.decode(generated, skip_special_tokens=True)
