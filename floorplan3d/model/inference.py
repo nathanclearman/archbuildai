@@ -117,7 +117,50 @@ def run_vlm(image_path: str, weights_dir: Path, max_new_tokens: int = 4096,
         )
     generated = output_ids[0, inputs["input_ids"].shape[1] :]
     text_out = processor.tokenizer.decode(generated, skip_special_tokens=True)
-    return deserialize(text_out)
+    return _deserialize_with_drift_repair(text_out)
+
+
+def _deserialize_with_drift_repair(text_out: str) -> dict:
+    """Parse VLM output, clamping out-of-range wall_index references.
+
+    On long structured outputs the model occasionally drifts in its wall
+    count, leaving doors/windows pointing at a wall_index that wasn't
+    emitted. The strict validator rejects the whole output, which then
+    triggers a CV fallback whose 1000+ over-segmented walls are far worse
+    than the VLM's mostly-correct output minus a stale reference. Clamp
+    bad indices to -1 (the existing "unassigned" sentinel; the geometry
+    layer falls back to position-based snapping for those entries).
+    """
+    from schema import SchemaError, validate  # type: ignore  # noqa: E402
+    try:
+        return deserialize(text_out)
+    except SchemaError as e:
+        if "wall_index" not in str(e):
+            raise
+    # Re-parse with the same permissive logic as deserialize, then clamp.
+    import json as _json
+    s = text_out.strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s.lower().startswith("json"):
+            s = s[4:]
+        s = s.strip()
+    start, end = s.find("{"), s.rfind("}")
+    if start == -1 or end == -1:
+        raise SchemaError("no JSON object found in model output")
+    data = _json.loads(s[start : end + 1])
+    for key in ("walls", "doors", "windows", "rooms"):
+        data.setdefault(key, [])
+    data.setdefault("scale", {"pixels_per_meter": 50})
+    n_walls = len(data["walls"])
+    for x in data["doors"]:
+        if isinstance(x.get("wall_index"), int) and x["wall_index"] >= n_walls:
+            x["wall_index"] = -1
+    for x in data["windows"]:
+        if isinstance(x.get("wall_index"), int) and x["wall_index"] >= n_walls:
+            x["wall_index"] = -1
+    validate(data)
+    return data
 
 
 def run_cv_only(image_path: str, ppm: float = 50.0) -> dict:
