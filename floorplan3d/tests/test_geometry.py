@@ -336,5 +336,248 @@ class TestWallIndexGuard(unittest.TestCase):
         self.assertEqual(count, 0)
 
 
+class TestClampAlongWall(unittest.TestCase):
+    """Regression guard for GEO-3. A door/window `position` that projects
+    to a `dist_along` past either end of the wall must be clamped so the
+    cutter fits inside [0, wall_length]. Without clamp, the boolean
+    succeeds but cuts nothing — visibly silent failure."""
+
+    def setUp(self):
+        sys.path.insert(0, str(PROJECT_DIR / "blender_addon"))
+        import geometry  # type: ignore
+        self.geometry = geometry
+
+    def test_in_range_passes_through(self):
+        # door at 2.5m into a 5m wall, width 0.9 → half_w 0.45. Well inside.
+        self.assertAlmostEqual(
+            self.geometry._clamp_along_wall(2.5, 5.0, 0.45), 2.5
+        )
+
+    def test_overshoot_past_end_clamps_to_hi(self):
+        # Projected 7m into a 5m wall, door half-width 0.45 → clamp to 4.55.
+        self.assertAlmostEqual(
+            self.geometry._clamp_along_wall(7.0, 5.0, 0.45), 4.55
+        )
+
+    def test_undershoot_before_start_clamps_to_lo(self):
+        # Projected -1m → clamp to 0.45 (so cutter's leading edge is at 0).
+        self.assertAlmostEqual(
+            self.geometry._clamp_along_wall(-1.0, 5.0, 0.45), 0.45
+        )
+
+    def test_degenerate_wall_shorter_than_door_collapses(self):
+        # 0.5m wall, 0.9m door → half_w 0.45, hi = max(0.45, 0.05) = 0.45,
+        # range collapses to [0.45, 0.45]. Cutter will overshoot but still
+        # at least intersect the wall — caller may pick to skip via
+        # `dist_along > wall_length` check if stricter behaviour needed.
+        self.assertAlmostEqual(
+            self.geometry._clamp_along_wall(2.0, 0.5, 0.45), 0.45
+        )
+
+
+class TestProjectPositionToWall(unittest.TestCase):
+    """Both the canonical `[x, y]` position form and the legacy scalar
+    distance-along-wall form must be supported. The schema serializer
+    always emits [x, y] but older sample fixtures use the scalar form.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(PROJECT_DIR / "blender_addon"))
+        import geometry  # type: ignore
+        self.geometry = geometry
+        # The helper uses `mathutils.Vector`; the top-of-file mock makes
+        # `Vector(p) - Vector(q)` return a MagicMock. To test the real
+        # arithmetic, patch in a vector stand-in that supports subtraction
+        # and `.dot`. A namedtuple-ish shim keeps the test readable.
+        self._install_real_vector()
+
+    def _install_real_vector(self):
+        import geometry as geom  # type: ignore
+
+        class V:
+            def __init__(self, p):
+                self.x, self.y = float(p[0]), float(p[1])
+
+            def __sub__(self, o):
+                return V((self.x - o.x, self.y - o.y))
+
+            def dot(self, o):
+                return self.x * o.x + self.y * o.y
+
+        self._saved_vector = geom.Vector
+        geom.Vector = V
+
+    def tearDown(self):
+        import geometry as geom  # type: ignore
+        geom.Vector = self._saved_vector
+
+    def test_xy_position_on_wall_returns_projection(self):
+        # Wall from (0,0) along +x, position (3, 0) → dist 3.
+        start = (0.0, 0.0)
+        direction = self.geometry.Vector((1.0, 0.0))
+        self.assertAlmostEqual(
+            self.geometry._project_position_to_wall(start, direction, [3.0, 0.0]),
+            3.0,
+        )
+
+    def test_xy_position_off_wall_projects(self):
+        # Position (3, 2) on a +x wall projects to 3. Caller is expected
+        # to clamp this; this helper only does the projection.
+        start = (0.0, 0.0)
+        direction = self.geometry.Vector((1.0, 0.0))
+        self.assertAlmostEqual(
+            self.geometry._project_position_to_wall(start, direction, [3.0, 2.0]),
+            3.0,
+        )
+
+    def test_scalar_position_passes_through(self):
+        start = (0.0, 0.0)
+        direction = self.geometry.Vector((1.0, 0.0))
+        self.assertAlmostEqual(
+            self.geometry._project_position_to_wall(start, direction, 2.5),
+            2.5,
+        )
+
+    def test_xy_position_on_offset_wall(self):
+        # Wall from (5, 5) along +y, door at (5, 8) → dist 3 along wall.
+        start = (5.0, 5.0)
+        direction = self.geometry.Vector((0.0, 1.0))
+        self.assertAlmostEqual(
+            self.geometry._project_position_to_wall(start, direction, [5.0, 8.0]),
+            3.0,
+        )
+
+
+class TestLabelSizeForPolygon(unittest.TestCase):
+    """GEO-8: font size must scale with the room bbox so a 0.3m hardcode
+    doesn't make labels illegible in a great room or overflow a
+    hallway."""
+
+    def setUp(self):
+        sys.path.insert(0, str(PROJECT_DIR / "blender_addon"))
+        import geometry  # type: ignore
+        self.geometry = geometry
+
+    def test_medium_room_returns_scaled_size(self):
+        # 4x4 bedroom → minor 4m × ratio 0.12 = 0.48m. In-range, no clamp.
+        poly = [[0, 0], [4, 0], [4, 4], [0, 4]]
+        self.assertAlmostEqual(
+            self.geometry._label_size_for_polygon(poly), 0.48
+        )
+
+    def test_huge_room_clamps_to_max(self):
+        # 20x20 great room → 20 * 0.12 = 2.4m, clamped to max_size=1.0.
+        poly = [[0, 0], [20, 0], [20, 20], [0, 20]]
+        self.assertAlmostEqual(
+            self.geometry._label_size_for_polygon(poly), 1.0
+        )
+
+    def test_tiny_room_clamps_to_min(self):
+        # 1m hallway → 0.12m, clamped to min_size=0.2.
+        poly = [[0, 0], [1, 0], [1, 5], [0, 5]]
+        self.assertAlmostEqual(
+            self.geometry._label_size_for_polygon(poly), 0.2
+        )
+
+    def test_nonrect_polygon_uses_bbox_minor_axis(self):
+        # L-shape: bbox is 4 × 4, minor = 4 → 0.48m.
+        poly = [[0, 0], [4, 0], [4, 2], [2, 2], [2, 4], [0, 4]]
+        self.assertAlmostEqual(
+            self.geometry._label_size_for_polygon(poly), 0.48
+        )
+
+    def test_empty_polygon_returns_min_size(self):
+        self.assertEqual(self.geometry._label_size_for_polygon([]), 0.2)
+
+    def test_custom_clamp_override(self):
+        poly = [[0, 0], [4, 0], [4, 4], [0, 4]]
+        # Override ratio so we can verify clamp + ratio independently.
+        self.assertAlmostEqual(
+            self.geometry._label_size_for_polygon(poly, ratio=0.5),
+            1.0,  # 4*0.5 = 2.0, clamped to max_size=1.0
+        )
+
+
+class TestApplyCutterBoolean(unittest.TestCase):
+    """GEO-4/5/6 regression guards. The helper must:
+      - use `temp_override` (context override, not view_layer mutation)
+      - remove the cutter on success
+      - remove modifier AND cutter on modifier_apply failure (don't leak
+        orphaned cutters, don't leave a corrupt modifier stack for the
+        next cutter on the same wall)
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(PROJECT_DIR / "blender_addon"))
+        import geometry  # type: ignore
+        self.geometry = geometry
+
+    def _make_wall_and_cutter(self):
+        """Build a pair of MagicMocks that look like wall + cutter objects
+        the same way the generate_door_openings path creates them."""
+        wall_obj = MagicMock(name="wall_obj")
+        modifier = MagicMock(name="modifier")
+        modifier.name = "Door_0"
+        wall_obj.modifiers.new.return_value = modifier
+        cutter_obj = MagicMock(name="cutter_obj")
+        return wall_obj, cutter_obj, modifier
+
+    def test_success_path_removes_cutter_returns_true(self):
+        wall_obj, cutter_obj, modifier = self._make_wall_and_cutter()
+
+        with patch.object(self.geometry.bpy.ops.object, "modifier_apply") as apply_op:
+            apply_op.return_value = None
+            # temp_override returns a context manager — the default
+            # MagicMock supports __enter__/__exit__, so no extra patch.
+            result = self.geometry._apply_cutter_boolean(wall_obj, cutter_obj, "Door_0")
+
+        self.assertTrue(result)
+        wall_obj.modifiers.new.assert_called_once_with(name="Door_0", type='BOOLEAN')
+        apply_op.assert_called_once()
+        self.geometry.bpy.data.objects.remove.assert_called_with(
+            cutter_obj, do_unlink=True
+        )
+
+    def test_failure_path_rolls_back_modifier_and_cutter(self):
+        wall_obj, cutter_obj, modifier = self._make_wall_and_cutter()
+
+        # Reset the remove mock so we can assert on this call specifically.
+        self.geometry.bpy.data.objects.remove.reset_mock()
+
+        with patch.object(self.geometry.bpy.ops.object, "modifier_apply") as apply_op:
+            apply_op.side_effect = RuntimeError("boolean solver failed")
+            result = self.geometry._apply_cutter_boolean(wall_obj, cutter_obj, "Door_0")
+
+        self.assertFalse(result)
+        wall_obj.modifiers.remove.assert_called_once_with(modifier)
+        # Cutter is still removed so the scene isn't cluttered with
+        # orphaned cutter boxes referencing a removed modifier.
+        self.geometry.bpy.data.objects.remove.assert_called_with(
+            cutter_obj, do_unlink=True
+        )
+
+    def test_uses_temp_override_not_view_layer_mutation(self):
+        """Guard against a refactor that drops `temp_override` and reverts
+        to `bpy.context.view_layer.objects.active = wall_obj`. The
+        mutation idiom is what GEO-4 is about: it leaks scene state."""
+        wall_obj, cutter_obj, _ = self._make_wall_and_cutter()
+
+        with patch.object(
+            self.geometry.bpy.context, "temp_override"
+        ) as temp_override:
+            with patch.object(self.geometry.bpy.ops.object, "modifier_apply"):
+                self.geometry._apply_cutter_boolean(wall_obj, cutter_obj, "Door_0")
+
+        temp_override.assert_called_once()
+        # The call should pass active_object — the operator key that
+        # modifier_apply reads. `object=` is also accepted; assert at
+        # least one of the expected kwargs appears.
+        kwargs = temp_override.call_args.kwargs
+        self.assertTrue(
+            "active_object" in kwargs or "object" in kwargs,
+            f"temp_override called without object context: {kwargs}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

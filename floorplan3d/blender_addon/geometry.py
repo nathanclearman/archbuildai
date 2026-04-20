@@ -80,6 +80,114 @@ def _ensure_ccw(polygon):
     return polygon
 
 
+def _clamp_along_wall(dist_along, wall_length, half_width):
+    """Clamp `dist_along` so a door/window of total width `2*half_width`
+    fits entirely inside the [0, wall_length] wall span.
+
+    Why: the VLM sometimes emits a door `position=[x, y]` that sits
+    slightly off the wall line. Projecting onto the wall axis (see
+    `_project_position_to_wall`) gives a `dist_along` that may land
+    past either end of the wall segment. The boolean cutter then sits
+    outside the wall — the modifier succeeds but cuts nothing visible,
+    producing a "door didn't open" failure with no error message.
+
+    Clamping keeps the cutter inside the wall. If `wall_length <
+    2*half_width` (door wider than wall), clamp collapses to a single
+    centered point; the cutter will overshoot both ends but at least
+    hit the wall. Caller may choose to skip instead via the returned
+    value vs wall_length comparison.
+    """
+    lo = half_width
+    hi = max(half_width, wall_length - half_width)
+    return max(lo, min(hi, dist_along))
+
+
+def _project_position_to_wall(wall_start, wall_direction, position):
+    """Return distance along wall from `wall_start` for a door/window.
+
+    Accepts either [x, y] absolute coordinates (canonical schema — see
+    `schema.serialize`) or a scalar distance-along-wall (legacy format
+    some older sample fixtures use). The [x, y] case dot-products onto
+    the wall direction; the scalar case passes through.
+    """
+    if isinstance(position, (list, tuple)) and len(position) == 2:
+        dp = Vector(position) - Vector(wall_start)
+        return dp.dot(wall_direction)
+    return float(position)
+
+
+def _label_size_for_polygon(polygon, min_size=0.2, max_size=1.0, ratio=0.12):
+    """Return a font size for a room label, scaled to the room's smaller
+    bounding-box dimension.
+
+    The previous hardcoded 0.3m was illegible in a 20m great room (text
+    disappears at that camera distance) and overflowed the width of a
+    1.2m hallway (text spilled out into adjacent rooms). Scaling by the
+    polygon's minor axis keeps labels proportional to what they label.
+
+    Clamped so:
+      - a degenerate / zero-area polygon can't produce a 0m label
+        (font_curve.size=0 is a Blender error)
+      - an outsize polygon can't produce a 5m label that dominates the
+        viewport
+    """
+    if not polygon:
+        return min_size
+    xs = [p[0] for p in polygon]
+    ys = [p[1] for p in polygon]
+    minor = min(max(xs) - min(xs), max(ys) - min(ys))
+    size = minor * ratio
+    return max(min_size, min(max_size, size))
+
+
+def _apply_cutter_boolean(wall_obj, cutter_obj, modifier_name):
+    """Attach `cutter_obj` to `wall_obj` as a DIFFERENCE boolean and apply.
+
+    Returns True if the modifier applied cleanly, False if apply failed.
+
+    On failure: removes the modifier and deletes the cutter so the wall
+    is left in its pre-call state and the scene has no orphaned cutter
+    boxes. Leaving a half-applied modifier stack on the wall corrupts
+    later cutter applies on the same wall (GEO-6 from the code review).
+
+    Uses `bpy.context.temp_override` to set the active object rather than
+    mutating `view_layer.objects.active`. The mutation idiom:
+      - leaks scene state (the user's selection and active object stay
+        changed after the operator returns)
+      - fails silently in some modal-operator contexts where the view
+        layer's active setter is a no-op
+    `temp_override` restores state automatically and is the documented
+    Blender 3.2+ / 4.x way to run an op on a specific object.
+    """
+    mod = wall_obj.modifiers.new(name=modifier_name, type='BOOLEAN')
+    mod.operation = 'DIFFERENCE'
+    mod.object = cutter_obj
+    mod.solver = 'FLOAT'
+
+    try:
+        with bpy.context.temp_override(object=wall_obj, active_object=wall_obj):
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+    except (RuntimeError, AttributeError) as e:
+        # RuntimeError: modifier_apply refused (non-manifold input, bad
+        #   context, solver failure). AttributeError: temp_override
+        #   missing on very old Blender — we target 4.x but be defensive.
+        # Either way, roll back so subsequent cutters on this wall
+        # don't inherit a broken modifier stack.
+        print(f"FloorPlan3D: modifier_apply failed for {modifier_name}: {e}")
+        try:
+            wall_obj.modifiers.remove(mod)
+        except Exception:
+            pass
+        try:
+            bpy.data.objects.remove(cutter_obj, do_unlink=True)
+        except Exception:
+            pass
+        return False
+
+    bpy.data.objects.remove(cutter_obj, do_unlink=True)
+    return True
+
+
 def generate_walls(floor_plan_data, collection, wall_height):
     """Generate wall meshes from floor plan data.
 
@@ -167,25 +275,17 @@ def generate_door_openings(floor_plan_data, collection, wall_height):
         if wall_length < 1e-6:
             continue
 
-        perp = _perpendicular_2d(direction)
         half_t = thickness / 2.0
-
-        # Door position along wall (distance from start)
-        door_pos = door_data.get("position", [0, 0])
-        # Position can be [x, y] absolute or a distance along the wall
-        if isinstance(door_pos, (list, tuple)) and len(door_pos) == 2:
-            # Calculate distance along wall from start
-            dp = Vector(door_pos) - start
-            dist_along = dp.dot(direction)
-        else:
-            dist_along = float(door_pos)
 
         door_width = door_data.get("width", 0.9)
         door_height = door_data.get("height", 2.1)
-
-        # Center of door along the wall
-        center_along = dist_along
         half_w = door_width / 2.0
+
+        # Door position along wall. See _project_position_to_wall + _clamp_along_wall
+        # for the off-wall-projection and overshoot story (GEO-3).
+        door_pos = door_data.get("position", [0, 0])
+        dist_along = _project_position_to_wall(start, direction, door_pos)
+        center_along = _clamp_along_wall(dist_along, wall_length, half_w)
 
         # Create cutter box
         cutter_center = (
@@ -224,21 +324,8 @@ def generate_door_openings(floor_plan_data, collection, wall_height):
 
         _link_to_collection(cutter_obj, collection)
 
-        # Apply boolean modifier to the wall
-        wall_obj_name = f"Wall_{wall_idx}"
-        wall_obj = bpy.data.objects.get(wall_obj_name)
-        if wall_obj:
-            mod = wall_obj.modifiers.new(name=f"Door_{i}", type='BOOLEAN')
-            mod.operation = 'DIFFERENCE'
-            mod.object = cutter_obj
-            mod.solver = 'FLOAT'
-
-            # Apply the modifier
-            bpy.context.view_layer.objects.active = wall_obj
-            bpy.ops.object.modifier_apply(modifier=mod.name)
-
-            # Hide/remove cutter
-            bpy.data.objects.remove(cutter_obj, do_unlink=True)
+        wall_obj = bpy.data.objects.get(f"Wall_{wall_idx}")
+        if wall_obj and _apply_cutter_boolean(wall_obj, cutter_obj, f"Door_{i}"):
             count += 1
 
     return count
@@ -271,21 +358,15 @@ def generate_window_openings(floor_plan_data, collection, wall_height):
         if wall_length < 1e-6:
             continue
 
-        perp = _perpendicular_2d(direction)
-
-        win_pos = win_data.get("position", [0, 0])
-        if isinstance(win_pos, (list, tuple)) and len(win_pos) == 2:
-            dp = Vector(win_pos) - start
-            dist_along = dp.dot(direction)
-        else:
-            dist_along = float(win_pos)
-
         win_width = win_data.get("width", 1.2)
         win_height = win_data.get("height", 1.2)
         sill_height = win_data.get("sill_height", 0.9)
-
-        center_along = dist_along
         half_w = win_width / 2.0
+
+        # Same off-wall-projection + overshoot guard as doors.
+        win_pos = win_data.get("position", [0, 0])
+        dist_along = _project_position_to_wall(start, direction, win_pos)
+        center_along = _clamp_along_wall(dist_along, wall_length, half_w)
 
         cutter_center = (
             start.x + direction.x * center_along,
@@ -321,18 +402,8 @@ def generate_window_openings(floor_plan_data, collection, wall_height):
 
         _link_to_collection(cutter_obj, collection)
 
-        wall_obj_name = f"Wall_{wall_idx}"
-        wall_obj = bpy.data.objects.get(wall_obj_name)
-        if wall_obj:
-            mod = wall_obj.modifiers.new(name=f"Window_{i}", type='BOOLEAN')
-            mod.operation = 'DIFFERENCE'
-            mod.object = cutter_obj
-            mod.solver = 'FLOAT'
-
-            bpy.context.view_layer.objects.active = wall_obj
-            bpy.ops.object.modifier_apply(modifier=mod.name)
-
-            bpy.data.objects.remove(cutter_obj, do_unlink=True)
+        wall_obj = bpy.data.objects.get(f"Wall_{wall_idx}")
+        if wall_obj and _apply_cutter_boolean(wall_obj, cutter_obj, f"Window_{i}"):
             count += 1
 
     return count
@@ -444,10 +515,12 @@ def generate_room_labels(floor_plan_data, collection):
         cx = sum(p[0] for p in polygon) / len(polygon)
         cy = sum(p[1] for p in polygon) / len(polygon)
 
-        # Create text object
+        # Create text object. Font size scales with room bbox so labels
+        # are legible in both 1m hallways and 20m great rooms — see
+        # _label_size_for_polygon for the sizing heuristic (GEO-8).
         font_curve = bpy.data.curves.new(name=f"Label_{label}_{i}", type='FONT')
         font_curve.body = label.replace("_", " ").title()
-        font_curve.size = 0.3
+        font_curve.size = _label_size_for_polygon(polygon)
         font_curve.align_x = 'CENTER'
         font_curve.align_y = 'CENTER'
 
