@@ -131,7 +131,7 @@ def _deserialize_with_drift_repair(text_out: str) -> dict:
     bad indices to -1 (the existing "unassigned" sentinel; the geometry
     layer falls back to position-based snapping for those entries).
     """
-    from schema import SchemaError, validate  # type: ignore  # noqa: E402
+    from schema import SchemaError, validate, deserialize  # type: ignore  # noqa: E402
     try:
         return deserialize(text_out)
     except SchemaError as e:
