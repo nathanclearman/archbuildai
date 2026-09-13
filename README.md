@@ -8,9 +8,11 @@ objects you can edit, render, or export. Everything runs locally on your machine
 Optional "Premium" features (furniture placement, exterior generation, layout critique,
 natural-language edits) use the Claude API with your own key.
 
-| Floor plan → parsed rooms | Generated Blender model |
-|---|---|
-| <img src="docs/example_plan.jpg" width="420"> | <img src="docs/example_model.jpg" width="420"> |
+Floor plan in, parsed walls, doors, windows and named rooms out:
+
+<img src="docs/example_plan_2.png" width="820">
+
+<img src="docs/example_plan.jpg" width="820">
 
 ## How it works
 
