@@ -8,6 +8,10 @@ objects you can edit, render, or export. Everything runs locally on your machine
 Optional "Premium" features (furniture placement, exterior generation, layout critique,
 natural-language edits) use the Claude API with your own key.
 
+| Floor plan → parsed rooms | Generated Blender model |
+|---|---|
+| <img src="docs/example_plan.jpg" width="420"> | <img src="docs/example_model.jpg" width="420"> |
+
 ## How it works
 
 ArchbuildAI is a hybrid of two local models, chosen because each is good at exactly one half of the job:
@@ -67,6 +71,7 @@ floorplan3d/blender_addon/   the Blender extension (UI, geometry, correction mod
 floorplan3d/model/           Qwen2.5-VL runtime and training pipeline (inference.py is bundled into the zip)
 floorplan3d/tests/           pytest suite (+ a real-Blender geometry test)
 floorplan3d/package.py       builds the extension zip
+docs/                        example images
 ```
 
 Development: `pip install -r floorplan3d/model/requirements.txt`, then
