@@ -269,7 +269,7 @@ class YOLOModelClient:
 
     def _build_output(self, det_results, seg_results, pixels_per_meter,
                       img_w, img_h):
-        """Convert YOLO predictions to the standard FloorPlan3D JSON format."""
+        """Convert YOLO predictions to the standard ArchbuildAI JSON format."""
         walls = []
         doors = []
         windows = []

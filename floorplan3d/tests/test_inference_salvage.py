@@ -137,3 +137,30 @@ class TestTiledOcr(unittest.TestCase):
         self.assertEqual(len(out), 4)
         xs = sorted(b["bbox_px"][0] for b in out)
         self.assertGreater(xs[-1], 1200)     # tiles on the right report right-hand pixels
+
+
+class TestPerimeterStrips(unittest.TestCase):
+    def test_four_strips_hug_the_outline_and_stay_in_image(self):
+        strips = inference._perimeter_strips(2776, 1788, [200, 100, 2600, 1700])
+        self.assertGreaterEqual(len(strips), 4)
+        for x1, y1, x2, y2 in strips:
+            self.assertTrue(0 <= x1 < x2 <= 2776 and 0 <= y1 < y2 <= 1788)
+            self.assertLessEqual((x2 - x1) * (y2 - y1), inference.TILE_MAX_PIXELS * 1.15)
+        self.assertTrue([s for s in strips if s[1] == 0])   # top strip reaches the image edge
+
+    def test_regions_driver_uses_given_regions(self):
+        import tempfile
+        from PIL import Image
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            Image.new("RGB", (2776, 1788), "white").save(f.name)
+            calls = []
+            out = inference._grounded_ocr_regions(
+                lambda pil, p, n: (calls.append(pil.size) or '[{"bbox_2d":[1,1,5,5],"text_content":"A"}]'),
+                f.name, "p", 10, regions=[(0, 0, 100, 50), (2000, 1000, 2776, 1788)])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(out[1]["bbox_px"][0], 2001.0)
+
+    def test_loop_detector(self):
+        one = '[{"bbox_2d":[1,2,3,4],"text_content":"24\'5\""}'
+        self.assertFalse(inference._loop_detected(one * 2))
+        self.assertTrue(inference._loop_detected(one * 3))

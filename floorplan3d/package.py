@@ -1,8 +1,8 @@
 """
-Package the FloorPlan3D add-on as a Blender extension zip (Blender 4.2+).
+Package the ArchbuildAI add-on as a Blender extension zip (Blender 4.2+).
 
 Usage:
-    python package.py                  # floorplan3d_addon.zip, no YOLO weights
+    python package.py                  # archbuildai_addon.zip, no YOLO weights
     python package.py --with-weights   # also bundle blender_addon/weights/*.pt (~100 MB)
     python package.py --output my.zip
 
@@ -69,12 +69,12 @@ def package_addon(output_path, with_weights=False):
     print(f"Extension packaged: {output_path}  ({n_files} files, "
           f"{output_path.stat().st_size / 1024 / 1024:.1f} MB)")
     print("Install in Blender 4.2+: Edit > Preferences > Get Extensions > v > Install from Disk")
-    print("Then: Preferences > Add-ons > FloorPlan3D > install packages / download base model")
+    print("Then: Preferences > Add-ons > ArchbuildAI > install packages / download base model")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Package the FloorPlan3D Blender extension")
-    parser.add_argument("--output", "-o", default="floorplan3d_addon.zip", help="Output zip path")
+    parser = argparse.ArgumentParser(description="Package the ArchbuildAI Blender extension")
+    parser.add_argument("--output", "-o", default="archbuildai_addon.zip", help="Output zip path")
     parser.add_argument("--with-weights", action="store_true",
                         help="Bundle blender_addon/weights/*.pt (YOLO geometry backend) into the zip")
     args = parser.parse_args()

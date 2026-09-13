@@ -280,7 +280,7 @@ def _resolve_python_bin(probe=None) -> str:
     raise RuntimeError(
         "Could not find a Python interpreter with the VLM stack "
         "(torch, transformers, peft) installed. Open Edit > Preferences > "
-        "Add-ons > FloorPlan3D and click 'Install VLM dependencies', or set "
+        "Add-ons > ArchbuildAI and click 'Install VLM dependencies', or set "
         "FP3D_PYTHON to a Python that has them (see requirements.txt). "
         f"{diagnosis}"
     )
@@ -452,16 +452,21 @@ class LocalModelClient:
         return self._request_via_daemon({"op": "ocr_labels", "image": image_path},
                                         quantize=quantize)
 
-    def ocr_dimensions(self, image_path, quantize=False):
+    def ocr_dimensions(self, image_path, footprint_px=None, quantize=False):
         """Dimension strings + pixel boxes off a plan (auto-scale pass).
+        `footprint_px` = [x1, y1, x2, y2] of the building in image pixels:
+        with it the daemon only reads the strips along the outline (the
+        long exterior dimensions), which is both faster and better evidence.
         Same daemon, same return shape as ocr_labels()."""
         image_path = str(image_path)
         if not os.path.isfile(image_path):
             raise FileNotFoundError(f"Image not found: {image_path}")
         if not INFERENCE_SCRIPT.exists():
             raise FileNotFoundError(f"Inference script not found at {INFERENCE_SCRIPT}.")
-        return self._request_via_daemon({"op": "ocr_dimensions", "image": image_path},
-                                        quantize=quantize)
+        req = {"op": "ocr_dimensions", "image": image_path}
+        if footprint_px:
+            req["footprint_px"] = [float(v) for v in footprint_px]
+        return self._request_via_daemon(req, quantize=quantize)
 
     def ocr_crop(self, image_path, bbox_px, quantize=False):
         """Room name printed inside one pixel box of the plan ("" if none)."""

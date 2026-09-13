@@ -1,4 +1,4 @@
-# FloorPlan3D — floor plan image → editable 3D model in Blender
+# ArchbuildAI — floor plan image → editable 3D model in Blender
 
 Drop in a floor plan image (MLS listing, CAD export, scan), press **Generate**, get walls,
 door and window openings, floors, ceilings and named rooms as editable Blender objects.
@@ -14,19 +14,19 @@ use the Claude API with your own key.
 
 ## Install
 
-1. Build or download the extension zip:
+1. Build or download the extension zip (`archbuildai-<version>.zip` on the releases page):
    ```bash
    python floorplan3d/package.py --with-weights
    ```
 2. Blender: **Edit > Preferences > Get Extensions > (v) > Install from Disk** and pick the zip.
-3. Open **Preferences > Add-ons > FloorPlan3D** and click, in order:
+3. Open **Preferences > Add-ons > ArchbuildAI** and click, in order:
    - **Install geometry packages** (YOLO, OpenCV, Shapely into Blender's Python)
    - **Install VLM packages** (torch, transformers, peft into Blender's Python)
    - **Download base model (15 GB)**
 
    The panel shows what is still missing. Everything installs into Blender's user
    site-packages and the Hugging Face cache; nothing touches the Blender app bundle.
-4. In the 3D Viewport press **N** → **FloorPlan3D** tab.
+4. In the 3D Viewport press **N** → **ArchbuildAI** tab.
 
 ## Use
 
@@ -35,7 +35,8 @@ use the Claude API with your own key.
    starting guess (a typical 2500 px-wide MLS plan is 40–60) and is used as-is when Auto is off or no
    dimensions are found.
 3. Model: **Hybrid (recommended)** — YOLO reads the geometry, Qwen2.5-VL reads the printed
-   room names and dimensions. On Apple Silicon the label passes run on MLX (8-bit model, ~8 GB).
+   room names and dimensions. On Apple Silicon the label and scale passes run on MLX (8-bit
+   model, ~8 GB): about 2 minutes per plan end to end, most of it the dimension pass.
 4. **Generate 3D Model**. With **Review Before 3D** on, you get a 2D correction pass first
    (move wall endpoints, add/delete doors and windows) before the mesh is built.
 
@@ -58,7 +59,7 @@ Backends:
 
 ## Licensing
 
-FloorPlan3D's own code is **MIT** (see `LICENSE`). Third-party pieces it uses:
+ArchbuildAI's own code is **MIT** (see `LICENSE`). Third-party pieces it uses:
 
 | Component | License | Effect |
 |---|---|---|

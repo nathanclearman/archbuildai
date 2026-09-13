@@ -1,9 +1,9 @@
 bl_info = {
-    "name": "FloorPlan3D",
-    "author": "FloorPlan3D Team",
+    "name": "ArchbuildAI",
+    "author": "Nathan Clearman",
     "version": (1, 1, 0),
     "blender": (4, 0, 0),
-    "location": "View3D > Sidebar > FloorPlan3D",
+    "location": "View3D > Sidebar > ArchbuildAI",
     "description": "Generate 3D architectural models from 2D floor plan images",
     "category": "3D View",
 }

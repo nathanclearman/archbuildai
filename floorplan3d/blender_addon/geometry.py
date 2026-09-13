@@ -32,20 +32,20 @@ def _recursive_remove_collection(collection):
 
 
 def create_floorplan_collection(context):
-    """Create or clear the FloorPlan3D collection (including story sub-collections).
+    """Create or clear the ArchbuildAI collection (including story sub-collections).
 
     Performs a thorough cleanup: recursively removes all child collections,
     objects, and orphaned mesh data blocks to prevent stale `.001` suffixes
     from breaking name-based lookups (e.g. boolean modifiers).
     """
-    collection = bpy.data.collections.get("FloorPlan3D")
+    collection = bpy.data.collections.get("ArchbuildAI")
     if collection:
         _recursive_remove_collection(collection)
     else:
-        collection = bpy.data.collections.new("FloorPlan3D")
+        collection = bpy.data.collections.new("ArchbuildAI")
         context.scene.collection.children.link(collection)
 
-    # Also clean up any orphaned Story_ collections not under FloorPlan3D
+    # Also clean up any orphaned Story_ collections not under ArchbuildAI
     # (can happen if a previous run crashed or was interrupted).
     for col in list(bpy.data.collections):
         if col.name.startswith("Story_") and col != collection:
@@ -5147,7 +5147,7 @@ def generate_exterior(floor_plan_data, exterior_config, collection, wall_height,
     Args:
         floor_plan_data: the floor plan JSON dict (ground floor / primary).
         exterior_config: AI-returned exterior configuration (merged with defaults).
-        collection: parent FloorPlan3D collection.
+        collection: parent ArchbuildAI collection.
         wall_height: total building height in metres (wall_height × num_stories).
         story_data: optional dict mapping story_index → floor plan dict.
                     When provided, the roof follows the TOP story's footprint

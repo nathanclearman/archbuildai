@@ -86,8 +86,12 @@ def auto_scale(image_path, plan, ppm_guess, client=None):
     `ppm_guess`) to the scale they imply. Returns (plan, report); the plan
     is returned unchanged when too few dimensions agree."""
     client = client if client is not None else _get_shared_client()
-    texts = [(t["text"], t["bbox_px"]) for t in client.ocr_dimensions(str(image_path))
-             if t.get("text") and t.get("bbox_px")]
+    footprint = autoscale.footprint_px(plan, ppm_guess)
+    try:
+        found = client.ocr_dimensions(str(image_path), footprint_px=footprint)
+    except TypeError:  # test doubles / older clients without the keyword
+        found = client.ocr_dimensions(str(image_path))
+    texts = [(t["text"], t["bbox_px"]) for t in found if t.get("text") and t.get("bbox_px")]
     return autoscale.apply_auto_scale(plan, ppm_guess, texts)
 
 

@@ -442,7 +442,7 @@ def _select_backend(requested: str = "auto") -> str:
 
 # ── torch backend ─────────────────────────────────────────────────────────
 
-DIM_MAX_TOKENS = 900   # dense tiles list 25+ strings; 450 truncated them and starved auto-scale
+DIM_MAX_TOKENS = 700   # dense tiles list 25+ strings; 450 truncated them and starved auto-scale
 DIM_REPETITION_PENALTY = 1.1
 
 
@@ -659,6 +659,8 @@ def _run_serve(weights_dir: Path, quantize: bool = False, backend: str = "auto")
                 # Hybrid / auto-scale passes: base model on the fast backend.
                 if op == "ocr_crop":
                     result = primary.ocr_crop(image_path, req["bbox_px"])
+                elif op == "ocr_dimensions":
+                    result = primary.ocr_dimensions(image_path, footprint_px=req.get("footprint_px"))
                 else:
                     result = getattr(primary, op)(image_path)
                 sys.stdout.write(json.dumps({"ok": True, "result": result}) + "\n")

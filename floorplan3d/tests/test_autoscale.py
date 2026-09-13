@@ -91,3 +91,10 @@ class TestRescale(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFootprint(unittest.TestCase):
+    def test_footprint_in_pixels(self):
+        plan = {"rooms": _rooms_px_to_m(50), "walls": []}
+        self.assertEqual(autoscale.footprint_px(plan, 50), [0.0, 0.0, 900.0, 400.0])
+        self.assertIsNone(autoscale.footprint_px({"rooms": [], "walls": []}, 50))

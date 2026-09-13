@@ -36,8 +36,8 @@ def clear_scene():
     bpy.ops.object.select_all(action='SELECT')
     bpy.ops.object.delete(use_global=False)
 
-    # Remove FloorPlan3D collection if it exists
-    col = bpy.data.collections.get("FloorPlan3D")
+    # Remove ArchbuildAI collection if it exists
+    col = bpy.data.collections.get("ArchbuildAI")
     if col:
         bpy.data.collections.remove(col)
 

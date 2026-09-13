@@ -782,9 +782,9 @@ class FP3D_OT_AdjustWallHeight(bpy.types.Operator):
         scene = context.scene
         target_height = scene.fp3d_wall_height
 
-        collection = bpy.data.collections.get("FloorPlan3D")
+        collection = bpy.data.collections.get("ArchbuildAI")
         if not collection:
-            self.report({'WARNING'}, "No FloorPlan3D model found")
+            self.report({'WARNING'}, "No ArchbuildAI model found")
             return {'CANCELLED'}
 
         adjusted = 0
@@ -910,10 +910,10 @@ class FP3D_OT_SuggestFurniture(bpy.types.Operator):
         # Generate furniture geometry
         from . import geometry
 
-        collection = bpy.data.collections.get("FloorPlan3D")
+        collection = bpy.data.collections.get("ArchbuildAI")
         if not collection:
-            context.scene.fp3d_status = "Error: No FloorPlan3D collection"
-            self.report({'ERROR'}, "No FloorPlan3D collection found")
+            context.scene.fp3d_status = "Error: No ArchbuildAI collection"
+            self.report({'ERROR'}, "No ArchbuildAI collection found")
             return {'CANCELLED'}
 
         # Remove existing furniture first
@@ -947,9 +947,9 @@ class FP3D_OT_RemoveFurniture(bpy.types.Operator):
     def execute(self, context):
         from . import geometry
 
-        collection = bpy.data.collections.get("FloorPlan3D")
+        collection = bpy.data.collections.get("ArchbuildAI")
         if not collection:
-            self.report({'WARNING'}, "No FloorPlan3D model found")
+            self.report({'WARNING'}, "No ArchbuildAI model found")
             return {'CANCELLED'}
 
         removed = geometry.remove_furniture(collection)
@@ -1049,10 +1049,10 @@ class FP3D_OT_GenerateExterior(bpy.types.Operator):
         from . import geometry
 
         floor_plan = _load_floor_plan_data()
-        collection = bpy.data.collections.get("FloorPlan3D")
+        collection = bpy.data.collections.get("ArchbuildAI")
         if not collection:
-            context.scene.fp3d_status = "Error: No FloorPlan3D collection"
-            self.report({'ERROR'}, "No FloorPlan3D collection found")
+            context.scene.fp3d_status = "Error: No ArchbuildAI collection"
+            self.report({'ERROR'}, "No ArchbuildAI collection found")
             return {'CANCELLED'}
 
         wall_height = context.scene.fp3d_wall_height
@@ -1112,9 +1112,9 @@ class FP3D_OT_RemoveExterior(bpy.types.Operator):
     def execute(self, context):
         from . import geometry
 
-        collection = bpy.data.collections.get("FloorPlan3D")
+        collection = bpy.data.collections.get("ArchbuildAI")
         if not collection:
-            self.report({'WARNING'}, "No FloorPlan3D model found")
+            self.report({'WARNING'}, "No ArchbuildAI model found")
             return {'CANCELLED'}
 
         removed = geometry.remove_exterior(collection)
@@ -1202,7 +1202,7 @@ class FP3D_OT_CritiqueLayout(bpy.types.Operator):
 
         # Write critique to a Blender text block
         critique = self._result
-        text_name = "FloorPlan3D Critique"
+        text_name = "ArchbuildAI Critique"
         text_block = bpy.data.texts.get(text_name)
         if text_block:
             text_block.clear()
@@ -1211,7 +1211,7 @@ class FP3D_OT_CritiqueLayout(bpy.types.Operator):
 
         lines = []
         score = critique.get("score", "N/A")
-        lines.append("=== FloorPlan3D Layout Critique ===")
+        lines.append("=== ArchbuildAI Layout Critique ===")
         lines.append(f"Overall Score: {score}/10")
         lines.append("")
 

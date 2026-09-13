@@ -93,19 +93,23 @@ def _axis_lines(rooms: list[dict], walls: list[dict], ppm_guess: float):
     return vertical, horizontal
 
 
-def _nearest_line(lines, coord: float, along: float, tol: float, reach: float):
-    """Nearest line (by perpendicular coordinate) to `coord` whose extent
-    comes within `reach` of `along`. Returns its coordinate or None."""
-    best = None
-    for c, lo, hi in lines:
-        if abs(c - coord) > tol:
-            continue
-        gap = max(lo - along, along - hi, 0.0)
-        if gap > reach:
-            continue
-        if best is None or abs(c - coord) < abs(best - coord):
-            best = c
-    return best
+def _facing_spans(lines, min_overlap_frac: float = 0.5):
+    """Pairs of parallel lines that face each other (their extents overlap
+    along the line direction), as (coord_lo, coord_hi, along_lo, along_hi).
+    A dimension line always measures between two such facing walls."""
+    spans = []
+    n = len(lines)
+    for i in range(n):
+        ci, lo_i, hi_i = lines[i]
+        for j in range(i + 1, n):
+            cj, lo_j, hi_j = lines[j]
+            overlap = min(hi_i, hi_j) - max(lo_i, lo_j)
+            if overlap <= min_overlap_frac * max(1e-6, min(hi_i - lo_i, hi_j - lo_j)):
+                continue
+            if abs(ci - cj) < 1e-6:
+                continue
+            spans.append((min(ci, cj), max(ci, cj), max(lo_i, lo_j), min(hi_i, hi_j)))
+    return spans
 
 
 def estimate_pixels_per_meter(rooms: list[dict], ppm_guess: float,
@@ -118,18 +122,20 @@ def estimate_pixels_per_meter(rooms: list[dict], ppm_guess: float,
     rooms/walls: YOLO output in metres at `ppm_guess` (metres = px / ppm_guess).
     dimension_texts: [(text, [x1, y1, x2, y2] in original image pixels)].
 
-    A dimension string sits at the midpoint of the span it measures, and the
-    span runs parallel to the text between two extension lines that end on
-    walls. So for a candidate scale p, a string of value v metres centred at
-    c predicts perpendicular walls at c ± v·p/2 along the text axis. We
-    score every candidate p on a fine log grid by how many strings find a
-    wall (or room edge) at BOTH predicted ends, take the best, and return
-    the median of the scales implied by the matched wall positions. This
-    never depends on any single polygon edge being whole, which YOLO's
-    fragmented rooms cannot guarantee.
+    A dimension line measures the distance between two facing walls, and
+    its string sits somewhere along that span. For a candidate scale p we
+    look, for each string of value v, for a facing wall pair whose pixel
+    span matches v·p (within a tolerance) and which reaches the string's
+    position; the string's own box only has to lie within the span (padded
+    by a quarter, since OCR boxes for rotated text drift). Strong evidence
+    = such positioned matches; weak evidence = a value that matches SOME
+    facing span anywhere on the plan (used at half weight, for the big
+    exterior dimensions whose boxes the OCR mislocates). The best-scoring p
+    on a fine log grid wins; the returned scale is the median of the pixel
+    spans over the matched values.
 
     Returns (ppm or None, report). None when fewer than max(min_pairs,
-    min_frac × parsed) strings are consistent with the winning scale.
+    min(8, min_frac × candidates)) distinct values agree.
     """
     report = {"parsed": 0, "used": 0, "estimates": []}
     polys = [r for r in (rooms or []) if len(r.get("polygon") or []) >= 3]
@@ -139,8 +145,11 @@ def estimate_pixels_per_meter(rooms: list[dict], ppm_guess: float,
     ys = [q[1] for r in polys for q in r["polygon"]] + [p[1] for w in (walls or []) for p in (w["start"], w["end"])]
     fp_short_px = max(1e-6, min(max(xs) - min(xs), max(ys) - min(ys))) * ppm_guess
     fp_long_px = max(max(xs) - min(xs), max(ys) - min(ys)) * ppm_guess
-    tol = 0.025 * fp_short_px                      # wall-position tolerance
-    vertical, horizontal = _axis_lines(polys, walls or [], ppm_guess)
+    tol = 0.03 * fp_short_px
+    vertical, horizontal = _axis_lines(polys if not walls else [], walls or [], ppm_guess)
+    # horizontal spans (between vertical lines) measure horizontal strings, and vice versa
+    h_spans = [sp for sp in _facing_spans(vertical) if sp[1] - sp[0] > 2 * tol]
+    v_spans = [sp for sp in _facing_spans(horizontal) if sp[1] - sp[0] > 2 * tol]
 
     dims = []
     for text, box in dimension_texts:
@@ -151,8 +160,6 @@ def estimate_pixels_per_meter(rooms: list[dict], ppm_guess: float,
         horizontal_text = (box[2] - box[0]) >= (box[3] - box[1])
         dims.append((metres, cx, cy, horizontal_text))
     report["parsed"] = len(dims)
-    # Closet-sized strings (under 1.5 m) are the ones OCR misplaces and that
-    # fit between any two wall fragments; they add noise, not evidence.
     big = [d for d in dims if d[0] >= 1.5]
     if len(big) >= min_pairs:
         dims = big
@@ -160,58 +167,75 @@ def estimate_pixels_per_meter(rooms: list[dict], ppm_guess: float,
     if len(dims) < min_pairs:
         return None, report
 
-    def matches(p: float):
-        """(count, implied ppm list) for candidate scale p. Matches are
-        counted once per (wall pair, value): OCR loops emit the same string
-        many times with shifted boxes, and letting each copy vote would let
-        one hallucinated repeat outvote ten distinct real dimensions."""
-        seen = set()
-        implied = []
+    def evaluate(p: float):
+        """(score, strong implied ppm list, weak implied ppm list) for scale p.
+        One vote per string: the single facing span that best fits it."""
+        strong = []
+        strong_values = set()
+        strong_values_list = []
+        weak: dict = {}
         for metres, cx, cy, horiz in dims:
-            half = metres * p / 2.0
-            reach = max(tol * 2, 0.5 * metres * p)
-            if horiz:
-                a = _nearest_line(vertical, cx - half, cy, tol, reach)
-                b = _nearest_line(vertical, cx + half, cy, tol, reach)
-            else:
-                a = _nearest_line(horizontal, cy - half, cx, tol, reach)
-                b = _nearest_line(horizontal, cy + half, cx, tol, reach)
-            if a is None or b is None or abs(b - a) <= 2 * tol:
-                continue
-            key = (horiz, round(min(a, b) / tol), round(max(a, b) / tol), round(metres, 2))
-            if key in seen:
-                continue
-            seen.add(key)
-            implied.append(abs(b - a) / metres)
-        return len(implied), implied
+            want = metres * p
+            best_pos = None      # (midpoint distance, implied)
+            for spans, coord, along in ((h_spans, cx, cy), (v_spans, cy, cx)):
+                for lo, hi, alo, ahi in spans:
+                    span = hi - lo
+                    if abs(span - want) > tol:
+                        continue
+                    inside = lo - tol <= coord <= hi + tol
+                    near = alo - 4 * tol <= along <= ahi + 4 * tol
+                    if inside and near:
+                        d = abs(coord - (lo + hi) / 2)
+                        if best_pos is None or d < best_pos[0]:
+                            best_pos = (d, span / metres)
+                    else:
+                        weak.setdefault(round(metres, 2), span / metres)
+            if best_pos is not None:
+                # OCR loops emit one string many times; cap its votes.
+                if sum(1 for v in strong_values_list if v == round(metres, 2)) < 3:
+                    strong.append(best_pos[1])
+                    strong_values_list.append(round(metres, 2))
+                strong_values.add(round(metres, 2))
+        weak_only = [e for v, e in weak.items() if v not in strong_values]
+        return len(strong) + 0.5 * len(weak_only), strong, weak_only
 
-    # Candidate scales: the largest single dimension can't exceed the plan,
-    # the smallest can't be under a few pixels.
     max_m = max(d[0] for d in dims)
     lo_p = max(2.0, 4 * tol / max_m)
     hi_p = max(lo_p * 1.5, fp_long_px / max(0.5, max_m))
-    best_count, best_implied = 0, []
+    best = (0.0, [], [])
     p = lo_p
     while p <= hi_p:
-        n, implied = matches(p)
-        if n > best_count:
-            best_count, best_implied = n, implied
+        res = evaluate(p)
+        if res[0] > best[0]:
+            best = res
         p *= 1.01
-    # OCR over-reports (looped repeats, mis-reads), so demand a floor of
-    # agreeing strings rather than a large fraction of a noisy total.
+    score, strong, weak = best
     needed = max(min_pairs, min(8, int(math.ceil(min_frac * len(dims)))))
-    if best_count < needed:
-        report["estimates"] = [round(e, 1) for e in best_implied]
+    pool = strong if len(strong) >= min_pairs else strong + weak
+    report["estimates"] = [round(e, 1) for e in pool]
+    report["strong"] = len(strong)
+    report["weak"] = len(weak)
+    if len(pool) < needed:
         return None, report
-    med = statistics.median(best_implied)
-    agreeing = [e for e in best_implied if abs(e - med) <= agreement * med]
-    report["estimates"] = [round(e, 1) for e in best_implied]
+    med = statistics.median(pool)
+    agreeing = [e for e in pool if abs(e - med) <= agreement * med]
     report["used"] = len(agreeing)
     if len(agreeing) < needed:
         return None, report
     ppm = statistics.median(agreeing)
     report["ppm"] = round(ppm, 2)
     return ppm, report
+
+
+def footprint_px(plan: dict, ppm_guess: float) -> list[float] | None:
+    """Bounding box of the building in image pixels (rooms + walls), or None."""
+    pts = [q for r in plan.get("rooms", []) for q in (r.get("polygon") or [])]
+    pts += [p for w in plan.get("walls", []) for p in (w["start"], w["end"])]
+    if not pts:
+        return None
+    xs = [p[0] * ppm_guess for p in pts]
+    ys = [p[1] * ppm_guess for p in pts]
+    return [min(xs), min(ys), max(xs), max(ys)]
 
 
 def rescale_plan(plan: dict, factor: float) -> dict:

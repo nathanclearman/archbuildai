@@ -25,17 +25,17 @@ def _draw_readiness(layout, model_type):
     col = box.column()
     col.alert = True
     col.label(text="Setup needed: " + "; ".join(problems), icon='ERROR')
-    box.label(text="Edit > Preferences > Add-ons > FloorPlan3D", icon='PREFERENCES')
+    box.label(text="Edit > Preferences > Add-ons > ArchbuildAI", icon='PREFERENCES')
     if model_type == 'HYBRID' and st.get("python") is None and not env["cv_missing"]:
         box.label(text="(Hybrid will still build geometry; labels fall back to YOLO)", icon='INFO')
 
 
 class FP3D_PT_MainPanel(bpy.types.Panel):
-    bl_label = "FloorPlan3D"
+    bl_label = "ArchbuildAI"
     bl_idname = "FP3D_PT_main"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "FloorPlan3D"
+    bl_category = "ArchbuildAI"
 
     def draw(self, context):
         layout = self.layout
@@ -185,7 +185,7 @@ class FP3D_PT_AdjustPanel(bpy.types.Panel):
     bl_idname = "FP3D_PT_adjust"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "FloorPlan3D"
+    bl_category = "ArchbuildAI"
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
@@ -201,7 +201,7 @@ class FP3D_PT_ExportPanel(bpy.types.Panel):
     bl_idname = "FP3D_PT_export"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "FloorPlan3D"
+    bl_category = "ArchbuildAI"
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
@@ -214,7 +214,7 @@ class FP3D_PT_ClaudePanel(bpy.types.Panel):
     bl_idname = "FP3D_PT_claude"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "FloorPlan3D"
+    bl_category = "ArchbuildAI"
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
