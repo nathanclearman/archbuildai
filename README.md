@@ -12,7 +12,7 @@ Floor plan in, parsed walls, doors, windows and named rooms out:
 
 <img src="docs/example_plan_2.png" width="820">
 
-<img src="docs/example_plan.jpg" width="820">
+<img src="docs/example_plan_1_upright.jpg" width="820">
 
 ## How it works
 
