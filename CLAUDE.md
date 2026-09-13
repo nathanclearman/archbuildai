@@ -1,6 +1,8 @@
-# FloorPlan3D — AI-Powered Floor Plan to Blender 3D Model Pipeline
+# ArchbuildAI (codename FloorPlan3D) — AI-Powered Floor Plan to Blender 3D Model Pipeline
 
 ## Project Overview
+
+Product name: **ArchbuildAI** (the Python module/extension id stays `floorplan3d`; `fp3d_` props stay). This file is the Claude Code project brief, not the user README — see README.md.
 
 A Blender add-on that takes 2D floor plan images as input and generates editable 3D architectural models using a hybrid AI pipeline: a locally-run specialized computer vision model for precise floor plan parsing, with optional Claude API integration for higher-level reasoning tasks.
 
