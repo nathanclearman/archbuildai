@@ -37,53 +37,76 @@ from schema import FloorPlan, serialize  # type: ignore
 
 _SVG_NS = "{http://www.w3.org/2000/svg}"
 
-# CubiCasa svg class name → our canonical category
+# CubiCasa svg class name → our canonical category.
+#
+# Matched token-wise against the element's space-separated class string
+# (see walk()): real CubiCasa classes are compound ("Wall External",
+# "Door Swing Beside", "Window Regular", "Space Bedroom"), so the first
+# token carries the category. "Space" is CubiCasa's room wrapper — the
+# corpus does NOT use a literal "Room" class; "Room" is retained only for
+# the synthetic/legacy fixture layout. Token matching (not substring)
+# matters: a substring test would mis-classify "SpaceDimensionsLabel" as
+# a room.
 CUBI_CLASS_MAP = {
     "Wall": "wall",
     "Railing": "wall",
     "Door": "door",
     "Window": "window",
     "Room": "room",
+    "Space": "room",
 }
 
-# CubiCasa room-class names → our canonical room label vocabulary.
+# CubiCasa room-class token → our canonical room label vocabulary.
 #
-# Every value here MUST appear in synthesize.US_ROOM_LABELS, otherwise
-# the training target JSON contains labels the VLM emits but that the
-# refiner's in-vocab normalizer and MIN_ROOM_DIMS don't recognize —
-# vocabulary drift, the bug Cluster E partially fixed. Previous version
-# leaked "storage", "balcony", and "room" into training targets.
+# Keys are the actual tokens the CubiCasa5k corpus uses inside its
+# "Space <X> [<Y>]" room classes — verified against the real SVGs, NOT
+# guessed. The corpus does NOT use compound names like "Bathroom" or
+# "DiningRoom"; it uses "Bath" (often "Bath Shower") and "Dining". An
+# earlier version of this map keyed on the guessed compound names, so
+# token matching never fired and ~1000 bathrooms + ~190 dining rooms
+# were silently dropped from every CubiCasa target. Matched token-wise
+# (see _room_label_from_class) against the space-separated class string.
+#
+# Every non-None value here MUST appear in synthesize.US_ROOM_LABELS,
+# otherwise the training target JSON contains labels the VLM emits but
+# that the refiner's in-vocab normalizer and MIN_ROOM_DIMS don't
+# recognize — vocabulary drift, the bug Cluster E partially fixed.
 #
 # Remapping rationale:
-#   "Storage" → "closet"   (closet is the US-vocab analog of a small
-#                           enclosed storage room)
-#   "Outdoor" → None       (balconies aren't interior floor-plan rooms;
-#   "Balcony" → None        dropping them yields a cleaner interior
-#                           footprint than mis-mapping)
-#   "Undefined" → None     (genuinely unknown is best signalled by
-#                           absence — forcing a generic "room" label
-#                           poisons the vocabulary with a catchall the
-#                           model would then reproduce at inference)
+#   "Bath"    → "bathroom"  (corpus token; "Bath Shower" matches too)
+#   "Dining"  → "dining_room"
+#   "Laundry" → "laundry_room" (from "Utility Laundry")
+#   "Storage" → "closet"    (US-vocab analog of a small enclosed store)
+#   "Den"     → "den"
+#   "Outdoor" → None        (terraces/balconies/porches all carry the
+#   "Balcony" → None         "Outdoor" token — not interior rooms)
+#   "Undefined" / "UserDefined" → None  (genuinely unknown is best
+#                           signalled by absence — a generic catch-all
+#                           label poisons the vocabulary)
 #
-# Entries mapping to None cause the walker in _parse_svg to skip that
-# room entirely — the walls and doors around it are still emitted, so
-# the room boundary shows up geometrically but isn't labelled as a
-# ghost category.
+# Tokens absent here (Sauna, Attic, Alcove, TechnicalRoom, the generic
+# "Space Room") match nothing and fall through to None — the room is
+# skipped. Its surrounding walls/doors are still emitted, so the
+# boundary shows up geometrically but isn't labelled as a ghost
+# category.
 CUBI_ROOM_LABELS: dict[str, str | None] = {
     "LivingRoom": "living_room",
     "Kitchen": "kitchen",
     "Bedroom": "bedroom",
-    "Bathroom": "bathroom",
+    "Bath": "bathroom",
+    "Dining": "dining_room",
     "Hallway": "hallway",
     "Corridor": "hallway",
     "Entry": "foyer",
-    "DiningRoom": "dining_room",
     "Storage": "closet",
-    "Garage": "garage",
     "Closet": "closet",
+    "Garage": "garage",
+    "Laundry": "laundry_room",
+    "Den": "den",
     "Outdoor": None,
     "Balcony": None,
     "Undefined": None,
+    "UserDefined": None,
 }
 
 
@@ -95,17 +118,45 @@ class Sample:
 
 
 class CubiCasaLoader:
-    """Iterate (image, target_json) pairs from a CubiCasa5k directory tree."""
+    """Iterate (image, target_json) pairs from a CubiCasa5k directory tree.
 
-    def __init__(self, root: str | Path, pixels_per_meter: float = 50.0):
+    `split` selects the official CubiCasa5k fold: "train" / "val" / "test"
+    read the matching `{split}.txt` in the dataset root and yield ONLY the
+    sample dirs listed there. `split=None` (default) walks every sample —
+    convenient for fixtures and ad-hoc inspection, but NEVER use None for
+    training against this corpus or the official test fold leaks into
+    training. `train.py` passes split="train" so test/val stay held out.
+    """
+
+    def __init__(self, root: str | Path, pixels_per_meter: float = 50.0,
+                 split: str | None = None):
         self.root = Path(root)
         self.ppm = pixels_per_meter
+        self.split = split
+        self._allowed = self._load_split(split) if split else None
+
+    def _load_split(self, split: str) -> set:
+        """Resolve the official split file to a set of sample dirs."""
+        split_file = self.root / f"{split}.txt"
+        if not split_file.exists():
+            raise FileNotFoundError(
+                f"CubiCasa split file not found: {split_file} "
+                f"(expected train.txt/val.txt/test.txt in the dataset root)"
+            )
+        allowed = set()
+        for line in split_file.read_text().splitlines():
+            rel = line.strip().strip("/")
+            if rel:
+                allowed.add((self.root / rel).resolve())
+        return allowed
 
     def __iter__(self) -> Iterator[Sample]:
         if not self.root.exists():
             raise FileNotFoundError(f"CubiCasa5k root not found: {self.root}")
         for sample_dir in sorted(self.root.rglob("model.svg")):
             sample_dir = sample_dir.parent
+            if self._allowed is not None and sample_dir.resolve() not in self._allowed:
+                continue
             image = sample_dir / "F1_scaled.png"
             if not image.exists():
                 image = sample_dir / "F1_original.png"
@@ -140,8 +191,9 @@ class CubiCasaLoader:
         def walk(elem, ctm):
             ctm = _compose(ctm, _parse_transform(elem.attrib.get("transform", "")))
             cls = elem.attrib.get("class", "")
-            kind = next((v for k, v in CUBI_CLASS_MAP.items() if k in cls), None)
-            polygon = _parse_polygon(elem) if kind is not None else []
+            tokens = cls.split()
+            kind = next((v for k, v in CUBI_CLASS_MAP.items() if k in tokens), None)
+            polygon = _element_geometry(elem) if kind is not None else []
             if kind is not None and polygon:
                 polygon = [_apply(ctm, p) for p in polygon]
                 if kind == "wall":
@@ -208,6 +260,46 @@ class CubiCasaLoader:
             rooms=rooms,
             scale={"pixels_per_meter": int(self.ppm)},
         )
+
+
+def _element_geometry(elem) -> list[tuple[float, float]]:
+    """Return a classified element's geometry, in the element's own frame.
+
+    Real CubiCasa wraps every wall / door / window / room in a classified
+    `<g>` whose actual shape is a *bare* child `<polygon>` / `<rect>` /
+    `<path>` (no class) — the classed group itself has no geometry. The
+    older synthetic/fixture layout instead puts the geometry directly on
+    the classed element. Handle both:
+
+      1. If the element itself is a geometry primitive, use it (fixture).
+      2. Otherwise return the first bare child primitive (real corpus).
+
+    Children that carry their own class are skipped: a door / window is
+    nested inside its wall's `<g>`, and pulling the door's polygon up
+    into the wall would corrupt both. Those nested entities are emitted
+    on their own when walk() recurses into them.
+
+    A child primitive may carry its own transform; it is composed in here
+    so the returned points are in `elem`'s frame, which the caller then
+    maps through the ancestor ctm.
+    """
+    pts = _parse_polygon(elem)
+    if pts:
+        return pts
+    for child in elem:
+        tag = child.tag.replace(_SVG_NS, "")
+        if tag not in ("polygon", "rect", "path"):
+            continue
+        if child.attrib.get("class"):
+            continue  # a classified primitive is its own entity, not this one's shape
+        pts = _parse_polygon(child)
+        if not pts:
+            continue
+        ct = _parse_transform(child.attrib.get("transform", ""))
+        if ct != _IDENTITY:
+            pts = [_apply(ct, p) for p in pts]
+        return pts
+    return []
 
 
 def _parse_polygon(elem) -> list[tuple[float, float]]:
@@ -346,15 +438,23 @@ def _polygon_bbox_center(polygon):
 
 def _room_label_from_class(class_attr: str) -> str | None:
     """Return the canonical US_ROOM_LABELS value for a CubiCasa svg class
-    string, or None if the class either matches a None-mapped CubiCasa
-    category (Outdoor, Balcony, Undefined — not interior rooms) or
-    doesn't match anything in CUBI_ROOM_LABELS at all. Callers must
-    skip the room when None is returned — previously this returned a
-    literal "room" string that leaked an out-of-vocabulary label into
-    the training target.
+    string, or None if the class matches a None-mapped category (Outdoor,
+    Balcony, Undefined — not interior rooms) or doesn't match anything in
+    CUBI_ROOM_LABELS at all. Callers must skip the room when None is
+    returned — previously this returned a literal "room" string that
+    leaked an out-of-vocabulary label into the training target.
+
+    Matched token-wise: CubiCasa room classes are space-separated
+    ("Space Bath Shower", "Space Entry Lobby"), so we test whole tokens
+    rather than substrings. A substring test would let "Bath" match
+    inside an unrelated token and, worse, made the earlier compound-name
+    keys ("Bathroom") fail to match the corpus's actual "Bath" token.
+    Dict order disambiguates multi-token classes — "Room LivingRoom"
+    resolves via the earlier "LivingRoom" key, not a generic fallback.
     """
+    tokens = class_attr.split()
     for key, label in CUBI_ROOM_LABELS.items():
-        if key in class_attr:
+        if key in tokens:
             return label
     return None
 
@@ -399,15 +499,20 @@ def build_training_set(
     synthetic_root: str | Path | None = None,
     shuffle: bool = True,
     seed: int = 0,
+    cubicasa_split: str | None = None,
 ) -> list[Sample]:
     """Walk all available datasets and return a combined list of Samples.
+
+    Pass `cubicasa_split="train"` to train only on the official train fold
+    and keep val/test held out (required for a valid CubiCasa benchmark).
+    `cubicasa_split=None` loads every sample — only safe for fixtures.
 
     ResPlan and CFP loaders will be added as separate methods when we
     download those corpora — the current bottleneck is CubiCasa5k + synth.
     """
     samples: list[Sample] = []
     if cubicasa_root:
-        samples.extend(list(CubiCasaLoader(cubicasa_root)))
+        samples.extend(list(CubiCasaLoader(cubicasa_root, split=cubicasa_split)))
     if synthetic_root:
         samples.extend(list(_load_synthetic(synthetic_root)))
     if shuffle:
@@ -487,13 +592,25 @@ class RealMLSLoader:
                 yield Sample(image_path=img, target_json=text, source="real_mls")
 
 
-def build_eval_set(real_mls_root: str | Path | None = None) -> list[Sample]:
+def build_eval_set(
+    real_mls_root: str | Path | None = None,
+    cubicasa_root: str | Path | None = None,
+    cubicasa_split: str = "test",
+) -> list[Sample]:
     """Return the held-out eval set. Kept separate from `build_training_set`
     so it's structurally impossible to accidentally train on eval data.
+
+    `cubicasa_root` scores against the official CubiCasa fold named by
+    `cubicasa_split` (default "test"). Ground truth comes from the same
+    SVG->JSON converter used in training, so the VLM and any baseline are
+    scored in one metric space. Only valid if the trained model held this
+    fold out — see `build_training_set(cubicasa_split="train")`.
     """
     samples: list[Sample] = []
     if real_mls_root:
         samples.extend(list(RealMLSLoader(real_mls_root)))
+    if cubicasa_root:
+        samples.extend(list(CubiCasaLoader(cubicasa_root, split=cubicasa_split)))
     return samples
 
 

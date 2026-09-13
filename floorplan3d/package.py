@@ -1,9 +1,20 @@
 """
-Package the FloorPlan3D Blender add-on into a .zip for installation.
+Package the FloorPlan3D add-on as a Blender extension zip (Blender 4.2+).
 
 Usage:
-    python package.py                  # Creates floorplan3d_addon.zip
-    python package.py --output my.zip  # Custom output filename
+    python package.py                  # floorplan3d_addon.zip, no YOLO weights
+    python package.py --with-weights   # also bundle blender_addon/weights/*.pt (~100 MB)
+    python package.py --output my.zip
+
+Layout inside the zip (extension layout: manifest at the root):
+    blender_manifest.toml, __init__.py, operators.py, ..., api/, weights/ (opt),
+    vlm/   <- the VLM runtime copied from ../model/ (inference.py, prompts.py,
+              schema.py, cv_walls.py, claude_refiner.py) so the shipped add-on
+              needs no repo checkout. The fine-tuned adapter is never bundled:
+              Hybrid uses the base model only; the Qwen-only backend takes an
+              adapter folder from the add-on preferences.
+
+Install: Blender > Edit > Preferences > Get Extensions > (v) > Install from Disk.
 """
 
 import argparse
@@ -13,55 +24,61 @@ from pathlib import Path
 
 
 ADDON_DIR = Path(__file__).parent / "blender_addon"
-EXCLUDE_PATTERNS = {"__pycache__", ".pyc", ".pyo", ".DS_Store"}
+MODEL_DIR = Path(__file__).parent / "model"
+VLM_RUNTIME_FILES = ["inference.py", "prompts.py", "schema.py", "cv_walls.py", "claude_refiner.py"]
+EXCLUDE_DIRS = {"__pycache__", "vlm"}          # vlm/ is regenerated from model/ below
+EXCLUDE_SUFFIXES = {".pyc", ".pyo"}
+EXCLUDE_NAMES = {".DS_Store"}
 
 
-def should_include(path):
+def should_include(path, with_weights=False):
     """Check if a file should be included in the package."""
-    for pattern in EXCLUDE_PATTERNS:
-        if pattern in str(path):
-            return False
+    path = Path(path)
+    if path.name in EXCLUDE_NAMES or path.suffix in EXCLUDE_SUFFIXES:
+        return False
+    if path.suffix == ".pt" and not with_weights:
+        return False
     return True
 
 
-def package_addon(output_path):
-    """Create a zip package of the Blender add-on."""
+def package_addon(output_path, with_weights=False):
+    """Create the extension zip."""
     output_path = Path(output_path)
+    manifest = ADDON_DIR / "blender_manifest.toml"
+    if not manifest.exists():
+        raise SystemExit(f"missing {manifest}")
+    missing = [f for f in VLM_RUNTIME_FILES if not (MODEL_DIR / f).exists()]
+    if missing:
+        raise SystemExit(f"VLM runtime files missing from {MODEL_DIR}: {missing}")
 
-    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+    n_files = 0
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(ADDON_DIR):
-            # Skip __pycache__ directories
-            dirs[:] = [d for d in dirs if d != "__pycache__"]
-
+            skip = set(EXCLUDE_DIRS) | (set() if with_weights else {"weights"})
+            dirs[:] = [d for d in dirs if d not in skip]
             for filename in files:
                 filepath = Path(root) / filename
-                if not should_include(filepath):
+                if not should_include(filepath, with_weights):
                     continue
+                zf.write(filepath, str(filepath.relative_to(ADDON_DIR)))
+                n_files += 1
+        for f in VLM_RUNTIME_FILES:
+            zf.write(MODEL_DIR / f, f"vlm/{f}")
+            n_files += 1
 
-                # Archive path: floorplan3d/relative_path
-                arcname = "floorplan3d" / filepath.relative_to(ADDON_DIR)
-                zf.write(filepath, arcname)
-
-    print(f"Add-on packaged: {output_path}")
-    print(f"  Size: {output_path.stat().st_size / 1024:.1f} KB")
-    print()
-    print("Install in Blender:")
-    print(f"  1. Open Blender > Edit > Preferences > Add-ons")
-    print(f"  2. Click 'Install...' and select {output_path.name}")
-    print(f"  3. Enable 'FloorPlan3D' in the add-ons list")
-    print(f"  4. Open the N-panel (press N) > FloorPlan3D tab")
+    print(f"Extension packaged: {output_path}  ({n_files} files, "
+          f"{output_path.stat().st_size / 1024 / 1024:.1f} MB)")
+    print("Install in Blender 4.2+: Edit > Preferences > Get Extensions > v > Install from Disk")
+    print("Then: Preferences > Add-ons > FloorPlan3D > install packages / download base model")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Package FloorPlan3D Blender add-on")
-    parser.add_argument(
-        "--output", "-o",
-        default="floorplan3d_addon.zip",
-        help="Output zip file path",
-    )
+    parser = argparse.ArgumentParser(description="Package the FloorPlan3D Blender extension")
+    parser.add_argument("--output", "-o", default="floorplan3d_addon.zip", help="Output zip path")
+    parser.add_argument("--with-weights", action="store_true",
+                        help="Bundle blender_addon/weights/*.pt (YOLO geometry backend) into the zip")
     args = parser.parse_args()
-
-    package_addon(args.output)
+    package_addon(args.output, with_weights=args.with_weights)
 
 
 if __name__ == "__main__":

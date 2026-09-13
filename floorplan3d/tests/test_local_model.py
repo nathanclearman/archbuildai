@@ -8,6 +8,7 @@ Blender's bundled Python, which has no torch. The subprocess failed at
 inference failed" instead of actionable guidance to set FP3D_PYTHON.
 """
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -234,6 +235,51 @@ class TestResolverCache(unittest.TestCase):
         self.assertFalse(local_model._RESOLVED_PYTHON_CACHE)
 
 
+def _make_fake_daemon(response_payload=None):
+    """Build a MagicMock standing in for subprocess.Popen(...)'s return
+    value with daemon-protocol-compatible stdin/stdout/stderr streams.
+
+    The mock answers ONE READY handshake on stderr and any number of
+    successful JSON responses on stdout (one per request). Tests that
+    need a different daemon behaviour (death between calls, malformed
+    JSON, slow ready) build their own mock — this is the happy-path
+    default.
+    """
+    from unittest.mock import MagicMock
+    payload = response_payload if response_payload is not None else {"ok": True, "result": {}}
+    response_line = json.dumps(payload) + "\n"
+
+    m = MagicMock()
+    m.poll.return_value = None  # alive
+    m.returncode = None
+
+    # stderr: one "READY\n" then empties (no further diagnostics).
+    # The client's _wait_for_ready_unlocked stops on the first READY.
+    m.stderr = MagicMock()
+    m.stderr.readline.side_effect = ["READY\n"] + [""] * 1000
+
+    # stdin: capture written bytes for assertions; .closed is needed
+    # by _close_daemon_unlocked's "close if not already closed" check.
+    m.stdin = MagicMock()
+    m.stdin.closed = False
+    m.stdin._written = []
+
+    def stdin_write(s):
+        m.stdin._written.append(s)
+        return len(s)
+
+    m.stdin.write.side_effect = stdin_write
+
+    # stdout: same canned response per readline() call. _close_daemon
+    # never reads stdout, so an EOF tail is unnecessary.
+    m.stdout = MagicMock()
+    m.stdout.readline.side_effect = [response_line] * 1000
+
+    # wait() must not raise — the test path through close() calls it.
+    m.wait.return_value = 0
+    return m
+
+
 class TestPredictForwardsFlags(unittest.TestCase):
     """LocalModelClient.predict assembles a subprocess command. The
     specific flags it forwards (--cv-only, --refine, --quantize) are
@@ -244,10 +290,11 @@ class TestPredictForwardsFlags(unittest.TestCase):
     """
 
     def _run_predict_with_mocked_subprocess(self, **kwargs):
-        """Invoke predict() with subprocess.run faked to capture the
-        command. Returns the cmd list and the fake client (for path
-        assertions). Uses a tmp file to satisfy the isfile check and
-        a stub returning empty JSON so no real inference runs."""
+        """Invoke predict() with BOTH subprocess.run (one-shot CV path)
+        and subprocess.Popen (daemon VLM path) faked. Captures the
+        cmd from whichever path predict() actually takes so the same
+        helper covers both contracts.
+        """
         import tempfile
         from unittest.mock import MagicMock
 
@@ -271,11 +318,22 @@ class TestPredictForwardsFlags(unittest.TestCase):
             result.stderr = ""
             return result
 
+        def fake_popen(cmd, **_):
+            captured["cmd"] = cmd
+            return _make_fake_daemon()
+
         with patch("local_model.subprocess.run", side_effect=fake_run), \
+                patch("local_model.subprocess.Popen", side_effect=fake_popen), \
                 patch("local_model.INFERENCE_SCRIPT") as script:
             script.exists.return_value = True
             script.__str__ = lambda self: "/fake/inference.py"
-            client.predict(img_path, **kwargs)
+            try:
+                client.predict(img_path, **kwargs)
+            finally:
+                # Reset the daemon handle so __del__ during teardown
+                # doesn't try to wait/kill a MagicMock with non-mock
+                # subprocess machinery underneath.
+                client._daemon = None
 
         return captured["cmd"]
 
@@ -298,6 +356,308 @@ class TestPredictForwardsFlags(unittest.TestCase):
         self.assertIn("--cv-only", cmd)
         self.assertIn("--refine", cmd)
 
+    def test_serve_flag_in_daemon_path(self):
+        # Daemon path must spawn with --serve. A regression that drops
+        # this flag would have the daemon try one-shot inference with
+        # no --image arg and exit immediately, looking to the client
+        # like a startup failure.
+        cmd = self._run_predict_with_mocked_subprocess()
+        self.assertIn("--serve", cmd)
+
+    def test_cv_only_path_does_not_use_serve(self):
+        # CV-only path must NOT spawn the daemon — that's the whole
+        # point of routing it through one-shot subprocess.run.
+        cmd = self._run_predict_with_mocked_subprocess(cv_only=True)
+        self.assertNotIn("--serve", cmd)
+        self.assertIn("--cv-only", cmd)
+
+
+class TestDaemonLifecycle(unittest.TestCase):
+    """Daemon protocol contract: spawn once on first VLM predict(),
+    reuse across subsequent calls, respawn on death, restart on
+    quantize-config change, clean up on close().
+    """
+
+    def _make_client(self):
+        """Build a client with mocked filesystem guards. Returns the
+        client and a captured-state dict the tests inspect."""
+        client = LocalModelClient(
+            weights_dir=local_model.DEFAULT_WEIGHTS_DIR,
+            python_bin="/dev/null/fake-python",
+        )
+        return client
+
+    def _patches(self, popen_side_effect):
+        """Yields the patch context manager set for daemon-path tests."""
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(
+            patch("local_model.subprocess.Popen", side_effect=popen_side_effect)
+        )
+        script = stack.enter_context(patch("local_model.INFERENCE_SCRIPT"))
+        script.exists.return_value = True
+        script.__str__ = lambda self: "/fake/inference.py"
+        return stack
+
+    def _tmp_image(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            return f.name
+
+    def test_daemon_reused_across_calls(self):
+        # Two predict() calls must result in exactly ONE Popen — the
+        # whole point of the daemon is to amortize the 30-90s load
+        # cost across all calls in a session.
+        spawn_count = [0]
+
+        def fake_popen(_cmd, **_):
+            spawn_count[0] += 1
+            return _make_fake_daemon()
+
+        img = self._tmp_image()
+        client = self._make_client()
+        try:
+            with self._patches(fake_popen):
+                client.predict(img)
+                client.predict(img)
+        finally:
+            client._daemon = None
+
+        self.assertEqual(
+            spawn_count[0], 1,
+            "daemon must be reused across predict() calls — got "
+            f"{spawn_count[0]} Popen invocations for 2 predicts",
+        )
+
+    def test_daemon_respawns_after_death(self):
+        # A daemon that died between calls (OOM, crash) must respawn
+        # transparently. Without this, every Blender session would
+        # require an explicit re-init after the first GPU OOM.
+        spawn_count = [0]
+        daemons: list = []
+
+        def fake_popen(_cmd, **_):
+            spawn_count[0] += 1
+            d = _make_fake_daemon()
+            daemons.append(d)
+            return d
+
+        img = self._tmp_image()
+        client = self._make_client()
+        try:
+            with self._patches(fake_popen):
+                client.predict(img)
+                # Simulate daemon death between calls: poll() now
+                # returns a non-None exit code.
+                daemons[0].poll.return_value = 137  # SIGKILL
+                client.predict(img)
+        finally:
+            client._daemon = None
+
+        self.assertEqual(
+            spawn_count[0], 2,
+            "daemon must respawn after the previous one died",
+        )
+
+    def test_daemon_restarts_on_quantize_change(self):
+        # quantize affects model loading, not per-request behavior.
+        # A running daemon loaded with quantize=False cannot serve
+        # a quantize=True request without restarting.
+        spawn_count = [0]
+        spawned_cmds: list = []
+
+        def fake_popen(cmd, **_):
+            spawn_count[0] += 1
+            spawned_cmds.append(cmd)
+            return _make_fake_daemon()
+
+        img = self._tmp_image()
+        client = self._make_client()
+        try:
+            with self._patches(fake_popen):
+                client.predict(img, quantize=False)
+                client.predict(img, quantize=True)
+        finally:
+            client._daemon = None
+
+        self.assertEqual(spawn_count[0], 2)
+        self.assertNotIn("--quantize", spawned_cmds[0])
+        self.assertIn("--quantize", spawned_cmds[1])
+
+    def test_request_payload_carries_image_and_refine(self):
+        # Per-request fields (image path, refine flag) ride on the
+        # JSON request, not CLI flags — the daemon parses them out
+        # of the line written to its stdin.
+        spawned: list = []
+
+        def fake_popen(_cmd, **_):
+            d = _make_fake_daemon()
+            spawned.append(d)
+            return d
+
+        img = self._tmp_image()
+        client = self._make_client()
+        try:
+            with self._patches(fake_popen):
+                client.predict(img, refine=True)
+        finally:
+            client._daemon = None
+
+        written = "".join(spawned[0].stdin._written)
+        req = json.loads(written.strip())
+        self.assertEqual(req["image"], img)
+        self.assertTrue(req["refine"])
+
+    def test_close_shuts_down_daemon(self):
+        # close() must terminate the daemon — without it the daemon
+        # outlives Blender (orphaned to init on Unix) and holds the
+        # GPU pinned until the user manually kills it.
+        spawned: list = []
+
+        def fake_popen(_cmd, **_):
+            d = _make_fake_daemon()
+            spawned.append(d)
+            return d
+
+        img = self._tmp_image()
+        client = self._make_client()
+        with self._patches(fake_popen):
+            client.predict(img)
+            client.close()
+
+        self.assertIsNone(client._daemon)
+        # close() must close stdin (EOF signals the daemon to exit
+        # its read loop) and wait for the process to terminate.
+        spawned[0].stdin.close.assert_called()
+        spawned[0].wait.assert_called()
+
+    def test_error_response_raises(self):
+        # Daemon responses with ok=false must surface as an exception
+        # at the client. Silently returning the error dict would let
+        # downstream code consume "rooms": missing as if the model
+        # had returned an empty plan.
+        def fake_popen(_cmd, **_):
+            return _make_fake_daemon(
+                response_payload={"ok": False, "error": "boom"}
+            )
+
+        img = self._tmp_image()
+        client = self._make_client()
+        try:
+            with self._patches(fake_popen):
+                with self.assertRaises(RuntimeError) as cm:
+                    client.predict(img)
+                self.assertIn("boom", str(cm.exception))
+        finally:
+            client._daemon = None
+
+    def test_startup_failure_diagnoses_and_cleans_up(self):
+        # A daemon that exits before printing READY (corrupt weights,
+        # OOM at load) must produce a fixable error message AND leave
+        # the client in a clean state so the next predict() can try
+        # again (e.g. with --quantize set differently).
+        def fake_popen(_cmd, **_):
+            from unittest.mock import MagicMock
+            m = MagicMock()
+            m.poll.return_value = 1  # already exited
+            m.returncode = 1
+            m.stderr = MagicMock()
+            # No READY; only a traceback to read on drain.
+            m.stderr.readline.side_effect = [""]
+            m.stderr.read.return_value = "CUDA out of memory\n"
+            m.stdin = MagicMock()
+            m.stdin.closed = False
+            m.wait.return_value = 1
+            return m
+
+        img = self._tmp_image()
+        client = self._make_client()
+        with self._patches(fake_popen):
+            with self.assertRaises(RuntimeError) as cm:
+                client.predict(img)
+            self.assertIn("CUDA out of memory", str(cm.exception))
+            self.assertIsNone(client._daemon)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestShippablePaths(unittest.TestCase):
+    """The shipped add-on must work without the repo: bundled runtime dir,
+    Blender's own interpreter as a last-resort candidate, and a status probe
+    the preferences panel can render."""
+
+    def setUp(self):
+        local_model._RESOLVED_PYTHON_CACHE.clear()
+
+    def tearDown(self):
+        local_model._RESOLVED_PYTHON_CACHE.clear()
+        local_model.reconfigure()
+
+    def test_no_home_directory_guessing(self):
+        import inspect
+        src = inspect.getsource(local_model._resolve_model_dir)
+        self.assertNotIn("Desktop", src)
+        self.assertNotIn("home()", src)
+
+    def test_model_dir_env_override_and_reconfigure(self):
+        with patch.dict("os.environ", {"FP3D_QWEN_MODEL_DIR": "/tmp/fp3d-runtime", "FP3D_WEIGHTS_DIR": "/tmp/fp3d-w"}):
+            local_model.reconfigure()
+            # compare resolved paths: macOS maps /tmp -> /private/tmp
+            self.assertEqual(local_model.INFERENCE_SCRIPT, Path("/tmp/fp3d-runtime").resolve() / "inference.py")
+            self.assertEqual(local_model.DEFAULT_WEIGHTS_DIR, Path("/tmp/fp3d-w").resolve())
+        local_model.reconfigure()
+        self.assertNotEqual(str(local_model.DEFAULT_WEIGHTS_DIR), "/tmp/fp3d-w")
+
+    def test_bundled_vlm_dir_is_inside_the_addon(self):
+        self.assertEqual(local_model.BUNDLED_VLM_DIR.name, "vlm")
+        self.assertEqual(local_model.BUNDLED_VLM_DIR.parent.name, "blender_addon")
+
+    def test_blender_python_is_tried_last_not_never(self):
+        env_empty = {k: v for k, v in __import__("os").environ.items() if k != "FP3D_PYTHON"}
+        probed = []
+
+        def probe(c):
+            probed.append(c)
+            return c == sys.executable
+
+        with patch.dict("os.environ", env_empty, clear=True), \
+                patch("local_model._is_blender_python", return_value=True):
+            resolved = _resolve_python_bin(probe=probe)
+        self.assertEqual(resolved, sys.executable)
+        self.assertEqual(probed[-1], sys.executable)
+        self.assertEqual(probed[0], "python3")
+
+    def test_base_model_cache_detection(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d, patch.dict("os.environ", {"HF_HUB_CACHE": d}):
+            self.assertFalse(local_model.is_base_model_cached("Qwen/Qwen2.5-VL-7B-Instruct"))
+            snap = Path(d) / "models--Qwen--Qwen2.5-VL-7B-Instruct" / "snapshots" / "abc"
+            snap.mkdir(parents=True)
+            (snap / "config.json").write_text("{}")
+            self.assertTrue(local_model.is_base_model_cached("Qwen/Qwen2.5-VL-7B-Instruct"))
+
+    def test_environment_status_shape(self):
+        st = local_model.environment_status(probe=lambda c: False)
+        for key in ("inference_script", "python", "python_error", "base_model_cached", "adapter", "ready", "base_model"):
+            self.assertIn(key, st)
+        self.assertIsNone(st["python"])
+        self.assertIn("Preferences", st["python_error"])
+        self.assertFalse(st["ready"])
+
+
+class TestBackendSelection(unittest.TestCase):
+    def test_env_override_wins(self):
+        with patch.dict("os.environ", {"FP3D_VLM_BACKEND": "torch"}):
+            self.assertEqual(local_model.preferred_backend(), "torch")
+            self.assertIn("torch", local_model._probe_imports())
+        with patch.dict("os.environ", {"FP3D_VLM_BACKEND": "mlx"}):
+            self.assertEqual(local_model.preferred_backend(), "mlx")
+            self.assertIn("mlx_vlm", local_model._probe_imports())
+
+    def test_status_reports_backend_and_matching_model(self):
+        with patch.dict("os.environ", {"FP3D_VLM_BACKEND": "mlx"}):
+            st = local_model.environment_status(probe=lambda c: False)
+        self.assertEqual(st["backend"], "mlx")
+        self.assertEqual(st["base_model"], local_model.MLX_BASE_MODEL)

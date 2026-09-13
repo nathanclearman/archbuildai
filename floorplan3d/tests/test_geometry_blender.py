@@ -15,7 +15,20 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
-import bpy
+try:
+    import bpy
+except ImportError:  # plain pytest run outside Blender
+    bpy = None
+
+# test_geometry.py installs a MagicMock `bpy` into sys.modules so the pure
+# helpers can be tested outside Blender. This file needs the real thing, so
+# under pytest we skip unless bpy is genuine (its version is a real tuple).
+if bpy is None or not isinstance(getattr(getattr(bpy, "app", None), "version", None), tuple):
+    import pytest
+    pytest.skip(
+        "requires real Blender — run: blender --background --python tests/test_geometry_blender.py",
+        allow_module_level=True,
+    )
 
 
 def clear_scene():

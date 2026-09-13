@@ -134,6 +134,100 @@ class CubiCasaLoaderTest(unittest.TestCase):
         self.assertEqual(self.plan["scale"]["pixels_per_meter"], 50)
 
 
+REAL_FORMAT_SVG = """<?xml version="1.0"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="150" viewBox="0 0 200 150">
+  <g id="Model" class="Model">
+    <g class="Floor">
+      <g class="Floorplan">
+        <!-- Real CubiCasa: classified <g> with a BARE child <polygon> as
+             its geometry, and openings nested inside the wall group. -->
+        <g class="Wall External">
+          <polygon points="0,0 200,0 200,10 0,10"/>
+          <g class="Window Regular" transform="translate(80,0)">
+            <polygon points="0,2 40,2 40,8 0,8"/>
+          </g>
+        </g>
+        <g class="Wall External">
+          <polygon points="0,140 200,140 200,150 0,150"/>
+        </g>
+        <g class="Wall">
+          <polygon points="95,10 105,10 105,140 95,140"/>
+          <g class="Door Swing Beside" transform="translate(0,60)">
+            <polygon points="90,0 110,0 110,20 90,20"/>
+          </g>
+        </g>
+        <!-- Rooms are "Space <Label>", NOT "Room <Label>". -->
+        <g class="Space LivingRoom">
+          <polygon points="10,10 90,10 90,140 10,140"/>
+        </g>
+        <g class="Space Bedroom">
+          <polygon points="110,10 190,10 190,140 110,140"/>
+        </g>
+        <!-- Non-interior space must be dropped, not emitted as a room. -->
+        <g class="Space Undefined">
+          <polygon points="0,0 200,0 200,150 0,150"/>
+        </g>
+        <!-- A decoy whose class merely starts with "Space" — must NOT be
+             treated as a room (token match, not substring). -->
+        <g class="SpaceDimensionsLabel">
+          <text x="0" y="0">3.5m</text>
+        </g>
+      </g>
+    </g>
+  </g>
+</svg>"""
+
+
+class RealFormatCubiCasaTest(unittest.TestCase):
+    """Guards against the cubicasa_mini fixture's blind spot: that fixture
+    puts geometry directly on classified elements, but the real corpus
+    wraps each entity in a classified <g> whose shape is a bare child
+    primitive, and labels rooms "Space <X>" rather than "Room <X>".
+    A loader that only handled the fixture layout silently produced
+    EMPTY targets on all 5000 real plans — walls/doors/windows/rooms all
+    zero — which this test exists to catch."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        sample_dir = Path(self._tmp.name) / "sample_real"
+        sample_dir.mkdir()
+        (sample_dir / "model.svg").write_text(REAL_FORMAT_SVG)
+        # Loader requires an image alongside the svg; a stub byte is enough
+        # since the loader only records the path, it doesn't open the image.
+        (sample_dir / "F1_scaled.png").write_bytes(b"\x89PNG\r\n")
+        samples = list(CubiCasaLoader(self._tmp.name))
+        self.assertEqual(len(samples), 1)
+        self.plan = json.loads(samples[0].target_json)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_geometry_extracted_from_bare_child_primitives(self):
+        # Three walls, one door, one window — all geometry lives in bare
+        # child <polygon>s of classified <g>s. Zero here means the loader
+        # regressed to fixture-only parsing.
+        self.assertEqual(len(self.plan["walls"]), 3)
+        self.assertEqual(len(self.plan["doors"]), 1)
+        self.assertEqual(len(self.plan["windows"]), 1)
+
+    def test_space_class_maps_to_rooms(self):
+        labels = sorted(r["label"] for r in self.plan["rooms"])
+        # LivingRoom + Bedroom in; Undefined dropped; SpaceDimensionsLabel
+        # decoy must not appear as a room.
+        self.assertEqual(labels, ["bedroom", "living_room"])
+
+    def test_nested_opening_not_swallowed_by_wall(self):
+        # The door/window nested inside the wall <g> must be emitted as
+        # their own entities, and must NOT corrupt the wall's own polygon.
+        schema.validate(self.plan)
+        for w in self.plan["walls"]:
+            self.assertGreater(
+                abs(w["start"][0] - w["end"][0]) + abs(w["start"][1] - w["end"][1]),
+                0.0, "a wall collapsed to a point — opening polygon leaked in",
+            )
+
+
 class BuildTrainingSetTest(unittest.TestCase):
     def test_reads_cubicasa_and_shuffles_deterministically(self):
         a = build_training_set(cubicasa_root=FIXTURE_ROOT, shuffle=True, seed=7)
@@ -143,6 +237,61 @@ class BuildTrainingSetTest(unittest.TestCase):
     def test_missing_root_is_skipped_not_crashed(self):
         # Passing None should produce an empty list without raising.
         self.assertEqual(build_training_set(), [])
+
+
+class CubiCasaSplitTest(unittest.TestCase):
+    """The official train/val/test fold files must actually partition the
+    corpus. Regression guard for the contamination bug where split files
+    existed on disk but were never read, so the test fold leaked into
+    training and invalidated any CubiCasa benchmark."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        # Three minimal samples in distinct dirs.
+        self.dirs = []
+        for name in ("aaa", "bbb", "ccc"):
+            d = self.root / "high_quality" / name
+            d.mkdir(parents=True)
+            (d / "model.svg").write_text(REAL_FORMAT_SVG)
+            (d / "F1_scaled.png").write_bytes(b"\x89PNG\r\n")
+            self.dirs.append(d)
+        # Official-style split files: train=aaa,bbb  test=ccc  val=(empty)
+        (self.root / "train.txt").write_text("/high_quality/aaa/\n/high_quality/bbb/\n")
+        (self.root / "test.txt").write_text("/high_quality/ccc/\n")
+        (self.root / "val.txt").write_text("")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _stems(self, split):
+        return sorted(s.image_path.parent.name
+                      for s in CubiCasaLoader(self.root, split=split))
+
+    def test_split_none_loads_everything(self):
+        self.assertEqual(self._stems(None), ["aaa", "bbb", "ccc"])
+
+    def test_train_and_test_are_disjoint(self):
+        train = set(self._stems("train"))
+        test = set(self._stems("test"))
+        self.assertEqual(train, {"aaa", "bbb"})
+        self.assertEqual(test, {"ccc"})
+        self.assertEqual(train & test, set(), "test fold leaked into train")
+
+    def test_training_set_holds_out_test_fold(self):
+        train = build_training_set(cubicasa_root=self.root, cubicasa_split="train",
+                                   shuffle=False)
+        names = {s.image_path.parent.name for s in train}
+        self.assertNotIn("ccc", names, "held-out test sample in training set")
+
+    def test_missing_split_file_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            list(CubiCasaLoader(self.root, split="nonexistent"))
+
+    def test_eval_set_loads_test_fold(self):
+        ev = build_eval_set(cubicasa_root=self.root, cubicasa_split="test")
+        self.assertEqual(sorted(s.image_path.parent.name for s in ev), ["ccc"])
 
 
 # ---------- real-MLS eval set ----------

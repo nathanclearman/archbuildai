@@ -156,44 +156,31 @@ class TestWallGeometryHelpers(unittest.TestCase):
 
 
 class TestMockModelOutput(unittest.TestCase):
-    """Test the mock model output for development."""
+    """The built-in sample plans behind the "Generate Sample" button must
+    be self-consistent: every door/window points at a real wall."""
 
-    def test_mock_output_valid(self):
-        # Manually load the mock data (can't import local_model due to bpy dep)
-        mock_data = {
-            "scale": {"pixels_per_meter": 50},
-            "walls": [
-                {"start": [0, 0], "end": [6, 0], "thickness": 0.15},
-                {"start": [6, 0], "end": [6, 4], "thickness": 0.15},
-                {"start": [6, 4], "end": [0, 4], "thickness": 0.15},
-                {"start": [0, 4], "end": [0, 0], "thickness": 0.15},
-                {"start": [3, 0], "end": [3, 4], "thickness": 0.1},
-            ],
-            "doors": [
-                {"position": [3, 2], "width": 0.9, "type": "hinged", "wall_index": 4},
-            ],
-            "windows": [
-                {"position": [4.5, 4], "width": 1.2, "wall_index": 2},
-            ],
-            "rooms": [
-                {"label": "living_room", "polygon": [[3, 0], [6, 0], [6, 4], [3, 4]], "area": 12.0},
-                {"label": "bedroom", "polygon": [[0, 0], [3, 0], [3, 4], [0, 4]], "area": 12.0},
-            ],
+    def setUp(self):
+        sys.path.insert(0, str(PROJECT_DIR / "blender_addon" / "api"))
+        import sample_plans  # type: ignore  # no bpy dependency
+        self.samples = {
+            "apartment": sample_plans.get_mock_output(),
+            "studio": sample_plans.get_mock_studio(),
+            "three_bedroom": sample_plans.get_mock_three_bedroom(),
         }
 
-        # Validate structure
-        self.assertIn("walls", mock_data)
-        self.assertIn("doors", mock_data)
-        self.assertIn("windows", mock_data)
-        self.assertIn("rooms", mock_data)
-
-        # Validate all door wall_indices are valid
-        for door in mock_data["doors"]:
-            self.assertLess(door["wall_index"], len(mock_data["walls"]))
-
-        # Validate all window wall_indices are valid
-        for window in mock_data["windows"]:
-            self.assertLess(window["wall_index"], len(mock_data["walls"]))
+    def test_mock_outputs_valid(self):
+        for name, data in self.samples.items():
+            with self.subTest(sample=name):
+                for key in ("scale", "walls", "doors", "windows", "rooms"):
+                    self.assertIn(key, data)
+                n_walls = len(data["walls"])
+                self.assertGreater(n_walls, 0)
+                for door in data["doors"]:
+                    self.assertTrue(0 <= door["wall_index"] < n_walls)
+                for window in data["windows"]:
+                    self.assertTrue(0 <= window["wall_index"] < n_walls)
+                for room in data["rooms"]:
+                    self.assertGreaterEqual(len(room["polygon"]), 3)
 
 
 class TestSignedPolygonArea(unittest.TestCase):

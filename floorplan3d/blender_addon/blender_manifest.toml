@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "floorplan3d"
+version = "1.1.0"
+name = "FloorPlan3D"
+tagline = "Turn a 2D floor plan image into an editable 3D model"
+maintainer = "Nathan Clearman <nathanclearman@gmail.com>"
+type = "add-on"
+blender_version_min = "4.2.0"
+# MIT (GPL-compatible, accepted by Blender). See README "Licensing" for dependency terms.
+license = ["SPDX:MIT"]
+tags = ["3D View", "Import-Export", "Modeling"]
+
+[permissions]
+network = "Downloads model weights and packages; optional Claude API calls"
+files = "Reads plan images; caches packages and models in your home dir"

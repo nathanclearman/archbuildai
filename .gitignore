@@ -47,3 +47,40 @@ floorplan3d/model/data/synthetic/
 # OS
 .DS_Store
 Thumbs.db
+
+# Logs
+*.log
+
+# Test caches
+.pytest_cache/
+
+# Claude Code local state
+.claude/worktrees/
+.claude/settings.local.json
+
+# Local virtualenv (name not covered by venv/.venv/env above)
+floorplan_env/
+
+# Generated/eval data — regenerable (synthesize.py) or local-only
+floorplan3d/model/data/synthetic_vlm/
+floorplan3d/model/data/synth_eval/
+floorplan3d/model/data/synth_eval_heldout/
+floorplan3d/model/data/mls_qualitative/
+floorplan3d/model/data/synthetic_smoketest/
+
+# Local-only research files — never commit
+/papercole/
+
+# Stale nested clone at repo root (pending removal decision)
+/archbuildai/
+
+# Local debug / scratch outputs written into the model data dir during
+# development — never commit (regenerable, machine-specific)
+floorplan3d/model/data/debug_*
+floorplan3d/model/data/last_*_output.json
+floorplan3d/model/data/story_*_output.json
+floorplan3d/model/data/test_output.*
+
+
+# VLM runtime copied into the add-on by package.py (source of truth: floorplan3d/model/)
+floorplan3d/blender_addon/vlm/

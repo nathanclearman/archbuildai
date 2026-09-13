@@ -183,33 +183,79 @@ Floor Plan Image
 
 ---
 
-## File Structure (Proposed)
+## File Structure (Actual)
 
 ```
 floorplan3d/
-├── blender_addon/
-│   ├── __init__.py              # Add-on registration, bl_info
-│   ├── operators.py             # Generate, adjust, export operators
-│   ├── panels.py                # UI panel definitions
-│   ├── geometry.py              # bpy mesh generation from JSON
-│   ├── materials.py             # Default material assignment
+├── blender_addon/               # THE Blender add-on (v1.1.0) — single source of truth
+│   ├── __init__.py              # bl_info, registration, scene props, user-site shim
+│   ├── operators.py             # Generate / sample / adjust / export / Premium AI operators
+│   ├── panels.py                # N-panel UI (Model dropdown, stories, stairs, Premium AI)
+│   ├── geometry.py              # bpy mesh generation: walls, openings, floors, ceilings,
+│   │                            #   stairs, furniture, exterior/roofs, sanitize + dedupe
+│   ├── materials.py             # Material assignment
+│   ├── preferences.py           # Add-on prefs: env status, pip installer, base-model download, overrides
+│   ├── blender_manifest.toml    # Blender 4.2+ extension manifest (package.py builds an extension zip)
+│   ├── correction*.py           # Interactive 2D "Review Before 3D" correction mode
+│   ├── vlm/                     # (build output, git-ignored) VLM runtime copied from model/ by package.py
+│   ├── weights/                 # YOLO detection.pt / segmentation.pt (git-ignored, ~100 MB)
 │   └── api/
-│       ├── local_model.py       # Local CV model inference wrapper
-│       └── claude_client.py     # Optional Claude API client
-├── model/
-│   ├── train.py                 # Fine-tuning script
-│   ├── inference.py             # Inference entry point
-│   ├── config.yaml              # Model and training config
-│   └── data/
-│       └── README.md            # Dataset download instructions
-├── tests/
-│   ├── test_geometry.py         # Geometry generation unit tests
-│   ├── test_parser.py           # Model output validation tests
-│   └── sample_plans/            # Test floor plan images
-├── CLAUDE.md                    # This file
-├── requirements.txt
-└── README.md
+│       ├── sample_plans.py      # built-in sample plans for "Generate Sample"
+│       ├── hybrid.py            # YOLO-geometry + VLM-label glue (pure python)
+│       ├── cleanup.py           # CV post-pass: clip walls to footprint, drop slivers, close outline
+│       ├── autoscale.py         # pixels-per-metre from OCR'd dimension strings (pure python)
+│       ├── setup_env.py         # first-run installer helpers (pip into Blender's user site, HF download)
+│       ├── yolo_model.py        # "YOLO" backend (in-process ultralytics)
+│       ├── local_model.py       # Qwen2.5-VL daemon client (repo model/, resolves ML venv)
+│       ├── qwen_client.py       # "Qwen2.5-VL (trained)" backend adapter over local_model
+│       ├── claude_vision_client.py  # "Premium Vision" parser (Claude API)
+│       ├── claude_client.py     # Premium furniture / critique / modify / exterior
+│       └── local_llm_client.py  # Same features via Ollama / MLX server
+├── model/                       # Qwen2.5-VL pipeline: train.py, inference.py, evaluate.py,
+│   ├── ...                      #   synthesize.py, dataset.py, schema.py, cv_walls.py
+│   └── weights/                 # LoRA adapter + train_config.json (git-ignored)
+├── tests/                       # pytest suite (+ test_geometry_blender.py for real Blender)
+├── package.py                   # Zip the add-on (--with-weights bundles the .pt files)
+└── requirements.txt
+papercole/                       # Research paper — local-only, git-ignored (see layout rule)
 ```
+
+## Blender Add-on: How It Is Installed and Run
+
+- Blender 5.0 / 5.1 / 5.2 on this Mac load the add-on through a symlink:
+  `~/Library/Application Support/Blender/<ver>/scripts/addons/floorplan3d -> floorplan3d/blender_addon`.
+  Editing the repo edits the installed add-on; reload with F8 / disable+enable. Do not copy
+  the add-on into the addons folder again — that recreates the divergence fixed on 2026-09-12
+  (backups of the old divergent copies: `~/Library/Application Support/Blender/floorplan3d_backups/`).
+- Model dropdown backends (default **Hybrid**): HYBRID = YOLO geometry (walls, openings, room
+  polygons; in-process ultralytics in Blender's Python) + room names read off the image by the local
+  Qwen2.5-VL base model (grounded OCR over the whole plan, then a per-room crop pass for anything
+  unlabeled; `api/hybrid.py` snaps names to polygons). Both CV paths run `api/cleanup.py` first so the
+  outside shape matches the plan (walls outside the room-polygon footprint are trimmed/dropped, sliver
+  rooms removed, uncovered outline edges get an exterior wall). YOLO = geometry only, heuristic labels.
+  QWEN = the fine-tuned adapter end to end (reads labels well, draws a memorized grid layout on real
+  plans — see memory `project_qwen_failure_diagnosis`; 7-10 min per plan). CLAUDE_VISION = Premium.
+  The CubiCasa backend was removed 2026-09-12 (unusable on MLS-style plans).
+- The VLM runs as `floorplan3d/model/inference.py --serve` (ops: extract, ocr_labels, ocr_dimensions,
+  ocr_crop; `--backend auto|torch|mlx`). On Apple Silicon the OCR ops run on **MLX** (mlx-vlm,
+  `mlx-community/Qwen2.5-VL-7B-Instruct-8bit`, ~8 GB, several× the torch/MPS token rate); the fine-tuned
+  adapter (extract op) always runs on torch and is loaded lazily. FP3D_VLM_BACKEND overrides. Hybrid also
+  reads the plan's dimension strings and rescales the model (`api/autoscale.py`; Scale Factor becomes the
+  starting guess; toggle `fp3d_auto_scale`). It runs in a
+  Python with torch+transformers+peft; `api/local_model.py` finds it automatically (FP3D_PYTHON env →
+  non-Blender sys.executable → python3/python → repo `.venv`, `floorplan_env`, `model/venv`). One daemon
+  per Blender session, stopped on add-on unregister. Decoding budget 6144 tokens (FP3D_MAX_NEW_TOKENS);
+  truncated JSON is salvaged element-by-element.
+- Test fixtures under `tests/fixtures/` are thumbnails (≤200 px); the CV backends return almost
+  nothing on them by design. Use `model/data/mls_qualitative/*.png|jpg` for real predictions.
+- Headless checks: `blender --factory-startup --background --python floorplan3d/tests/test_geometry_blender.py`.
+- License: the project's own code is MIT (LICENSE, manifest). Ultralytics (AGPL) and the CubiCasa-trained
+  YOLO weights (non-commercial) are the only encumbered pieces; see floorplan3d/README.md.
+- Shipping: `python floorplan3d/package.py --with-weights` builds an extension zip (manifest at root,
+  `vlm/` runtime bundled from `model/`, no adapter). Validate with `blender --command extension validate <zip>`.
+  A shipped install has no repo: `api/local_model.py` resolves the runtime to the bundled `vlm/`, and the
+  add-on Preferences install the CV and VLM packages into Blender's own Python (user site) and download the
+  base model; Blender's interpreter is then the last-resort VLM python. Never add home-directory paths.
 
 ---
 
@@ -220,3 +266,12 @@ floorplan3d/
 - **Hand-drawn plans are hard.** The local model will struggle with sketchy, inconsistent line work. Consider this a Phase 2+ problem or route these to Claude for interpretation.
 - **Blender API threading.** `bpy` is not thread-safe. All Blender operations must happen on the main thread. Use background threads only for model inference and API calls, then pass results back via a timer or modal operator.
 - **Add-on packaging.** The local model weights will need to be distributed separately or downloaded on first run — they'll be too large to bundle in a `.zip` add-on.
+
+---
+
+## Repo Layout Rule: Add-on vs Paper
+
+- `floorplan3d/` is the product: Blender add-on (`blender_addon/`), ML pipeline (`model/`), tests. Tracked in git.
+- `papercole/` is the research paper: drafts, evidence, figures, and the analysis scripts in `papercole/experiments/`. Git-ignored, local-only, never committed.
+- New experiment / statistics scripts go in `papercole/experiments/` and import the pipeline via `MODEL_DIR` (see its README). Do not add paper-only scripts to `floorplan3d/model/`.
+- `floorplan3d/model/data/` holds datasets and eval sets only; debug outputs there are git-ignored.

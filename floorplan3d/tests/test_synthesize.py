@@ -451,7 +451,8 @@ class PhotometricAugTest(unittest.TestCase):
         # below 255 — otherwise the fold didn't render at all.
         rng = random.Random(1)
         out = synthesize._apply_fold_crease(self._white(128), rng)
-        darkened = sum(1 for p in out.getdata() if min(p) < 250)
+        raw = out.tobytes()  # RGB triples; avoids the deprecated getdata()
+        darkened = sum(1 for i in range(0, len(raw), 3) if min(raw[i:i + 3]) < 250)
         self.assertGreater(darkened, 0)
 
     def test_fold_crease_is_rng_deterministic(self):

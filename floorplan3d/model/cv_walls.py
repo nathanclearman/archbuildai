@@ -71,8 +71,8 @@ def extract(image_path: str | Path, cfg: CVConfig | None = None) -> dict:
     )
     segments: list[tuple[float, float, float, float]] = []
     if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
+        for line in np.asarray(lines).reshape(-1, 4):
+            x1, y1, x2, y2 = (float(v) for v in line)
             length = float(np.hypot(x2 - x1, y2 - y1))
             if length < cfg.wall_min_length_px:
                 continue

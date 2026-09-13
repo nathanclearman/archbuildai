@@ -44,10 +44,9 @@ wget -O data/cubicasa5k.zip \
 unzip -q data/cubicasa5k.zip -d data/cubicasa5k
 rm data/cubicasa5k.zip
 
-# Synthetic augmentation (CPU, ~18-20 min for 15k samples at seed 0).
-# 15k matches the count in bootstrap.sh's SYNTH_COUNT default and the
-# corpus size used for the 7B QLoRA plan.
-python synthesize.py --out data/synthetic --count 15000 --seed 0
+# Synthetic augmentation (CPU, ~6-20 min for 15k samples at seed 0).
+# Deterministic: seed 0 reproduces the exact corpus used in the paper.
+python synthesize.py --out data/synthetic_vlm --count 15000 --seed 0
 ```
 
 ResPlan and CFP are optional — add them later if you want to push accuracy
@@ -57,19 +56,36 @@ further.
 
 ```bash
 # 7B profile, ~20 GPU-hours at $2.49/hr ≈ $50
+# --cubicasa-split train is the DEFAULT: holds CubiCasa val+test OUT of
+# training so the test fold is a valid benchmark. Confirm the startup log
+# says "split: ~19190 train" (cubicasa=~4190, NOT 5000).
 python train.py \
   --base Qwen/Qwen2.5-VL-7B-Instruct \
+  --base-revision <pin a HF commit SHA for reproducibility> \
   --cubicasa data/cubicasa5k \
-  --synthetic data/synthetic \
+  --synthetic data/synthetic_vlm \
   --out weights \
   --epochs 2 \
   --batch-size 1 \
   --grad-accum 16 \
-  --lr 2e-5
+  --lr 2e-5 \
+  --seed 0 \
+  --report-to tensorboard
 ```
 
-Checkpoints save to `weights/` every 500 steps. Training can be resumed
-with `--resume weights/checkpoint-<n>`.
+Checkpoints save to `weights/` every 100 steps (resume with
+`--resume weights/checkpoint-<n>`). On finish you get `weights/adapter/`,
+`weights/processor/`, `weights/train_config.json`, `weights/run_manifest.json`
+(git SHA + versions + data counts + seed), and a loss curve under `weights/runs/`.
+
+**Ablation run** (proves the synthetic data is what wins) — same command with
+`--synthetic` omitted, to a separate dir:
+
+```bash
+python train.py --base Qwen/Qwen2.5-VL-7B-Instruct \
+  --cubicasa data/cubicasa5k --out weights_nosynth \
+  --epochs 2 --batch-size 1 --grad-accum 16 --lr 2e-5 --seed 0
+```
 
 ## 5. Smoke test inference
 

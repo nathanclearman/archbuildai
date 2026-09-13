@@ -1,93 +1,57 @@
 """
-Optional Claude API client for higher-level reasoning tasks.
+Local LLM client for AI features via Ollama or MLX.
 
-Uses Claude for complex architectural reasoning:
-- Furniture auto-placement based on room type and size
-- Natural language modification requests
-- Layout quality feedback and suggestions
-- Interpreting ambiguous/low-confidence results from the local parser
-- Reference image analysis for exterior style replication (vision API)
+Provides the same interface as ClaudeClient but connects to a local
+OpenAI-compatible endpoint (e.g., mlx_lm.server or Ollama).  This allows
+furniture suggestions, layout critique, and natural language modifications
+to work offline and without API credits.
 
-The core floor plan parsing pipeline works entirely offline without this module.
+Setup (pick one):
+  MLX:    mlx_lm.server --model mlx-community/Qwen2.5-32B-Instruct-4bit --port 8080
+  Ollama: ollama serve   (API at localhost:11434)
 """
 
 import json
-import os
+import re
 
 
-# Model tiers — user selects in the Blender UI
-MODEL_SONNET_46 = "claude-sonnet-4-6"          # Best value — near-Opus quality (default)
-MODEL_SONNET_45 = "claude-sonnet-4-5-20250929" # Previous gen, still solid
-MODEL_OPUS = "claude-opus-4-6"                 # Most capable, complex reasoning
+class LocalLLMClient:
+    """Client for local LLM inference via OpenAI-compatible API.
 
-
-class ClaudeClient:
-    """Client for Claude API integration (optional smart layer).
-
-    Supports Sonnet 4.6 (default, best value) and Opus 4.6 (complex reasoning).
-    Model selection is controlled by the user in the Blender UI panel.
+    Works with any server that exposes /v1/chat/completions:
+    - mlx_lm.server  (default, best perf on Apple Silicon)
+    - Ollama
+    - llama.cpp server
+    - LM Studio
     """
 
-    def __init__(self, api_key, model=None):
-        if not api_key or not api_key.strip():
-            raise ValueError("Claude API key is required")
-        self.api_key = api_key.strip()
-        self.model = model or MODEL_SONNET_46
-        self.base_url = "https://api.anthropic.com/v1"
+    def __init__(self, model="mlx-community/Qwen2.5-32B-Instruct-4bit",
+                 base_url="http://localhost:8080"):
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+
+    # ── Public methods (same interface as ClaudeClient) ──────────
 
     def suggest_furniture(self, rooms_data):
-        """Suggest furniture placement based on room type and dimensions.
-
-        Args:
-            rooms_data: List of room dicts from the parsed floor plan.
-
-        Returns:
-            dict: Furniture placement suggestions per room.
-        """
+        """Suggest furniture placement based on room type and dimensions."""
         prompt = self._build_furniture_prompt(rooms_data)
         response = self._call_api(prompt)
         return self._parse_json_response(response, "furniture suggestions")
 
     def interpret_modification(self, current_plan, natural_language_request):
-        """Interpret a natural language modification request.
-
-        Args:
-            current_plan: Current floor plan JSON data.
-            natural_language_request: User's modification request in plain English.
-
-        Returns:
-            dict: Modified floor plan data.
-        """
+        """Interpret a natural language modification request."""
         prompt = self._build_modification_prompt(current_plan, natural_language_request)
         response = self._call_api(prompt)
         return self._parse_json_response(response, "modified plan")
 
     def resolve_ambiguity(self, floor_plan_data, confidence_report):
-        """Resolve ambiguous detections from the local model.
-
-        When the local CV model flags low-confidence detections, Claude
-        can apply architectural reasoning to resolve them.
-
-        Args:
-            floor_plan_data: Current parsed floor plan with confidence scores.
-            confidence_report: Dict of low-confidence elements to resolve.
-
-        Returns:
-            dict: Corrected floor plan data.
-        """
+        """Resolve ambiguous detections from the local CV model."""
         prompt = self._build_ambiguity_prompt(floor_plan_data, confidence_report)
         response = self._call_api(prompt)
         return self._parse_json_response(response, "corrected plan")
 
     def critique_layout(self, floor_plan_data):
-        """Provide design feedback and layout optimization suggestions.
-
-        Args:
-            floor_plan_data: Parsed floor plan data.
-
-        Returns:
-            dict: Critique with suggestions.
-        """
+        """Provide design feedback and layout optimization suggestions."""
         prompt = self._build_critique_prompt(floor_plan_data)
         response = self._call_api(prompt)
         return self._parse_json_response(response, "layout critique")
@@ -96,135 +60,64 @@ class ClaudeClient:
                           reference_image_path=""):
         """Generate exterior shell configuration based on an architectural style.
 
-        Args:
-            floor_plan_data: Parsed floor plan data (walls, rooms, doors, windows).
-            style_prompt: User's style description (e.g. "modern Korean house").
-            reference_image_path: Optional path to a reference photo for vision.
-
-        Returns:
-            dict: Exterior configuration (roof, facade, details).
+        Note: reference_image_path is accepted for API compatibility but
+        ignored — local LLM models typically lack vision support.
         """
-        has_ref = bool(
-            reference_image_path and os.path.isfile(reference_image_path)
-        )
-        prompt = self._build_exterior_prompt(
-            floor_plan_data, style_prompt, has_reference_image=has_ref
-        )
-        response = self._call_api(
-            prompt, max_tokens=4096,
-            image_path=reference_image_path if has_ref else None,
-            temperature=0.8,  # higher temperature for more variety
-        )
+        prompt = self._build_exterior_prompt(floor_plan_data, style_prompt)
+        response = self._call_api(prompt, max_tokens=4096)
         return self._parse_json_response(response, "exterior configuration")
 
-    def _call_api(self, prompt, max_tokens=4096, image_path=None,
-                  temperature=None):
-        """Make a request to the Claude API.
+    # ── API call ─────────────────────────────────────────────────
 
-        Uses the Messages API with the configured model.
-        Supports optional image attachment for vision tasks.
-
-        Args:
-            prompt: Text prompt string.
-            max_tokens: Maximum tokens in response.
-            image_path: Optional path to an image file for vision API.
-            temperature: Sampling temperature (0.0-1.0). Higher = more variety.
-        """
-        try:
-            import requests
-        except ImportError:
-            raise ImportError(
-                "The 'requests' package is required for Claude API calls. "
-                "Install it in Blender's Python:\n"
-                "  <blender>/python/bin/python -m pip install requests"
-            )
-
-        headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-
-        # Build content — either plain text or image + text for vision
-        if image_path and os.path.isfile(image_path):
-            import base64
-            max_size_mb = 20
-            file_size = os.path.getsize(image_path)
-            if file_size > max_size_mb * 1024 * 1024:
-                raise ValueError(
-                    f"Image too large ({file_size / 1024 / 1024:.0f}MB). "
-                    f"Max {max_size_mb}MB. Resize or use a lower-res export."
-                )
-            with open(image_path, "rb") as f:
-                image_data = base64.standard_b64encode(f.read()).decode("utf-8")
-
-            ext = os.path.splitext(image_path)[1].lower()
-            media_types = {
-                ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                ".png": "image/png", ".gif": "image/gif",
-                ".webp": "image/webp",
-            }
-            media_type = media_types.get(ext, "image/jpeg")
-
-            content = [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": image_data,
-                    },
-                },
-                {"type": "text", "text": prompt},
-            ]
-        else:
-            content = prompt  # Plain string for text-only
+    def _call_api(self, prompt, max_tokens=4096):
+        """Call a local OpenAI-compatible /v1/chat/completions endpoint."""
+        import requests
 
         payload = {
             "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": content}],
+            "temperature": 0.3,
+            "stream": False,
         }
-        if temperature is not None:
-            payload["temperature"] = temperature
 
-        response = requests.post(
-            f"{self.base_url}/messages",
-            headers=headers,
-            json=payload,
-            timeout=120,
-        )
+        try:
+            response = requests.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=payload,
+                timeout=300,  # local models can be slow on first load
+            )
+        except requests.ConnectionError:
+            raise RuntimeError(
+                f"Cannot connect to local LLM at {self.base_url}. "
+                "Is your model server running?\n\n"
+                "Start it with one of:\n"
+                "  MLX:    mlx_lm.server --model <model> --port 8080\n"
+                "  Ollama: ollama serve"
+            )
+        except requests.Timeout:
+            raise RuntimeError(
+                "Local LLM request timed out (300s). The model may still "
+                "be loading. Try again in a moment."
+            )
 
-        # Extract the actual error message from the API response body
         if not response.ok:
             try:
                 error_body = response.json()
-                error_obj = error_body.get("error", {})
-                if isinstance(error_obj, dict):
-                    error_msg = error_obj.get("message", response.text)
-                else:
-                    error_msg = str(error_obj)
+                error_msg = (
+                    error_body.get("error", {}).get("message")
+                    or error_body.get("error", response.text)
+                )
             except Exception:
                 error_msg = response.text
             raise RuntimeError(
-                f"Claude API error {response.status_code}: {error_msg}"
+                f"Local LLM error {response.status_code}: {error_msg}"
             )
 
         data = response.json()
-        content = data.get("content")
-        if not content:
-            raise RuntimeError("Claude API returned an empty response")
-        # Find the first text content block
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                return block["text"]
-        # Fallback: try first block's text directly
-        if isinstance(content[0], dict) and "text" in content[0]:
-            return content[0]["text"]
-        raise RuntimeError(
-            f"Claude API response contained no text content (got types: "
-            f"{[b.get('type', '?') for b in content if isinstance(b, dict)]})"
-        )
+        return data["choices"][0]["message"]["content"]
+
+    # ── Prompt builders (identical to ClaudeClient) ──────────────
 
     @staticmethod
     def _build_furniture_prompt(rooms_data):
@@ -306,8 +199,7 @@ class ClaudeClient:
         )
 
     @staticmethod
-    def _build_exterior_prompt(floor_plan_data, style_prompt,
-                               has_reference_image=False):
+    def _build_exterior_prompt(floor_plan_data, style_prompt):
         walls = floor_plan_data.get("walls", [])
         rooms = floor_plan_data.get("rooms", [])
         n_windows = len(floor_plan_data.get("windows", []))
@@ -319,37 +211,7 @@ class ClaudeClient:
             f"(total area ~{total_area:.0f} m²), {n_doors} doors, {n_windows} windows.\n"
             f"Rooms: {', '.join(room_labels)}\n"
         )
-
-        # Vision preamble when a reference image is attached
-        if has_reference_image:
-            vision_preamble = (
-                "A reference photograph of the desired architectural style is attached above. "
-                "Analyse it carefully and REPLICATE its architecture — not just colours:\n\n"
-                "MASSING ANALYSIS (most important!):\n"
-                "1. VOLUMES: Is the building one box or MULTIPLE interlocking box volumes "
-                "at different heights? Count how many distinct volumes you see. If there are "
-                "2+ volumes at different heights, use raised_volume detail with appropriate "
-                "extra_height and coverage.\n"
-                "2. ROOF: What type? Flat, modern_flat, gable, hip, shed? How steep? "
-                "How far does the overhang extend? What material?\n"
-                "3. CLADDING: What is the PRIMARY wall material? Is it wood (vertical or "
-                "horizontal boards), stucco, concrete, brick? Which parts use which material?\n"
-                "4. ACCENT MATERIALS: Are there secondary materials creating contrast? "
-                "Brick accent walls? Stone sections? White render panels?\n"
-                "5. WINDOWS: How large are they? Are there floor-to-ceiling windows or "
-                "normal-sized windows with dark frames?\n"
-                "6. DETAILS: Fascia/trim wrapping the roof edge? Exposed beams? Columns?\n\n"
-                "CRITICAL: The reference image should dictate the ARCHITECTURAL MASSING "
-                "(box volumes, roof shape, material zoning) — not just the colour palette. "
-                "Mid-century modern homes are defined by interlocking flat-roofed rectangular "
-                "volumes at different heights with warm wood cladding + white render contrast. "
-                "Use raised_volume to create the taller box section.\n\n"
-            )
-        else:
-            vision_preamble = ""
-
         return (
-            vision_preamble +
             "You are an expert architect specialising in residential exterior design. "
             "Given the floor plan summary and an architectural style, design a "
             "visually rich exterior shell as a structured JSON config.\n\n"
@@ -371,7 +233,6 @@ class ClaudeClient:
             "   Examples: orange → material clay_tile + color [0.85, 0.45, 0.15], "
             "red → material clay_tile + color [0.70, 0.18, 0.12], "
             "green → material metal + color [0.25, 0.45, 0.30]\n\n"
-            # -- Roof guidelines --
             "CRITICAL: The roof type MUST match the architectural style. Use these guidelines:\n"
             '- Modern / contemporary / minimalist → "modern_flat" (flat roof with parapet walls)\n'
             '- Modern Korean (hanok-inspired) → "hip" with pitch 20-30, large overhang 0.8-1.2, clay_tile\n'
@@ -396,7 +257,6 @@ class ClaudeClient:
             '- Prairie → "hip" with pitch 10-20, overhang 1.0-1.5, metal or shingle\n'
             '- Colonial → "gable" with pitch 35-45, overhang 0.3, shingle\n'
             '- Cottage → "gable" with pitch 40-55, overhang 0.4, shingle or clay_tile\n\n'
-            # -- JSON schema --
             "Return a JSON object with this exact schema:\n"
             "{\n"
             '  "roof": {\n'
@@ -405,14 +265,13 @@ class ClaudeClient:
             '    "overhang": metres (0.2-1.5),\n'
             '    "parapet_height": metres (only for modern_flat, 0.4-0.8),\n'
             '    "material": one of "clay_tile","slate","metal","shingle","thatch","concrete","zinc","copper",\n'
-            '    "color": [r,g,b] (OPTIONAL — for user-specified roof colors like orange, red, green. Values 0.0-1.0)\n'
+            '    "color": [r,g,b] (OPTIONAL — for user-specified roof colors. Values 0.0-1.0)\n'
             "  },\n"
             '  "facade": {\n'
             '    "foundation": {"height": 0.2-0.5, "material": "concrete"|"stone"|"brick"},\n'
             '    "cladding": {"material": "white_stucco"|"warm_stucco"|"stone"|"brick"|"light_wood"'
             '|"dark_wood"|"concrete"|"glass"|"charcoal"|"white_concrete"|"corten"|"zinc", '
-            '"color": [r,g,b] (OPTIONAL — use to specify exact wall color when the user '
-            'requests a specific color like pink, yellow, cream, etc. Values 0.0-1.0)},\n'
+            '"color": [r,g,b] (OPTIONAL — use for exact wall color. Values 0.0-1.0)},\n'
             '    "trim": {"material": "dark_wood"|"light_wood"|"metal"|"concrete"|"black_metal", "width": metres},\n'
             '    "window_frames": {"material": "dark_wood"|"light_wood"|"metal"|"black_metal"|"charcoal", "depth": metres},\n'
             '    "door_surround": {"material": "stone"|"dark_wood"|"light_wood"|"concrete"|"black_metal", "width": metres}\n'
@@ -452,7 +311,6 @@ class ClaudeClient:
             '    {"type": "chimney", "width": 0.5-0.8, "depth": 0.3-0.5, "material": "brick"|"stone"}\n'
             "  ]\n"
             "}\n\n"
-            # -- Style identity (MUST-HAVE features) --
             "STYLE IDENTITY — these features DEFINE each style. Without them it looks generic:\n"
             "- Mid-century modern: MUST have raised_volume (extra_height 0.8-1.5, coverage 0.3-0.5) "
             "to create interlocking box volumes at different heights — this is the #1 defining feature. "
@@ -464,7 +322,7 @@ class ClaudeClient:
             "No ornamentation. Pure geometry. modern_flat roof.\n"
             "- Craftsman: MUST have exposed_beams (dark_wood), columns (tapered, stone base), "
             "deep gable roof. Natural materials (stone, wood). Covered porch via pergola.\n"
-            "- Mediterranean: Hip clay_tile roof (pitch 20-30°), warm_stucco walls "
+            "- Mediterranean: Hip clay_tile roof (pitch 20-30), warm_stucco walls "
             "(warm yellow/ochre — NOT white_stucco), pilasters (stone) at corners, "
             "cornice, window_sills (stone). Warm palette. "
             "Columns use standoff 0.0-0.3 to stay near walls.\n"
@@ -476,33 +334,7 @@ class ClaudeClient:
             "- Scandinavian: shed/gable metal roof, light_wood cladding, large windows, "
             "canopy, planter_box, clean fascia_board.\n"
             "- Victorian: Steep gable, pilasters, cornice, chimney, balcony, accent_band. Ornate.\n"
-            "- Brutalist: modern_flat, concrete everything, columns, bold accent_band, canopy.\n"
-            "- Tropical: pergola, louver_screen, planter_box, canopy, exposed_beams. Open, airy.\n"
-            "- Spanish Colonial: Hip clay_tile roof (low pitch 15-25°), warm_stucco walls "
-            "(warm yellow/ochre), exposed_beams (dark_wood), arched openings, "
-            "columns (stucco/stone), wrought-iron balcony. Warm earthy palette.\n"
-            "- Tudor: Steep gable roof with shingle or slate, white_stucco walls, "
-            "exposed_beams (dark_wood) for half-timber effect, chimney (brick), "
-            "diamond-pane windows (dark_wood frames). High contrast black/white.\n"
-            "- Art Deco: modern_flat or stepped parapet, white_concrete or white_stucco, "
-            "accent_band (metal or charcoal), geometric cornice, columns (metal), "
-            "glass_wall. Streamlined, symmetrical, bold geometric ornament.\n"
-            "- Cape Cod: Gable shingle roof (steep pitch 40-50°), light_wood cladding "
-            "(painted white or cream — use color override), dormer windows, "
-            "chimney (brick), window_sills. Simple, symmetrical, New England charm.\n"
-            "- Prairie (Frank Lloyd Wright): modern_flat or hip roof with VERY deep overhang "
-            "(1.0-1.5m), horizontal accent_band, exposed_beams, canopy, "
-            "brick or stone cladding. Strong horizontal lines, earth tones.\n"
-            "- Japanese/Korean: Hip or gable roof with clay_tile, dark_wood cladding, "
-            "canopy (dark_wood), cornice, planter_box, columns. "
-            "Minimalist, natural materials, deep eaves.\n"
-            "- Colonial: Gable shingle roof (pitch 35-45°), brick or light_wood cladding, "
-            "columns (white_concrete, classical), pilasters, cornice, "
-            "symmetrical window placement. Formal, balanced facade.\n"
-            "- Cottage: Steep gable with shingle or clay_tile, stone + light_wood cladding, "
-            "chimney (stone), pergola, planter_box, window_sills. "
-            "Charming, irregular, garden-integrated.\n\n"
-            # -- Creative guidelines --
+            "- Brutalist: modern_flat, concrete everything, columns, bold accent_band, canopy.\n\n"
             "CREATIVE GUIDELINES — be INNOVATIVE and use MULTIPLE detail types:\n"
             "- Modern: glass_wall, columns (black_metal), canopy (concrete), louver_screen, "
             "fascia_board, planter_box\n"
@@ -519,7 +351,6 @@ class ClaudeClient:
             "clerestory_windows, columns\n"
             "- Industrial: glass_wall, exposed_beams (metal), accent_band (corten), "
             "columns (black_metal), accent_band (metal)\n\n"
-            # -- Window proportions --
             "WINDOW STYLE GUIDELINES — match window proportions to architectural style:\n"
             "- Modern / contemporary / minimalist: sill 0.1-0.3, height 2.0-2.4, width 1.5-2.5\n"
             "- Mid-century modern: sill 0.0-0.2, height 2.2-2.5, width 2.0-3.0 (floor-to-ceiling glass)\n"
@@ -528,44 +359,17 @@ class ClaudeClient:
             "- Mediterranean: sill 0.7-0.9, height 1.3-1.6, width 1.0-1.4\n"
             "- Scandinavian: sill 0.3-0.5, height 1.6-2.0\n"
             "- Brutalist: sill 0.3, height 1.8-2.2, width 1.5-2.0\n\n"
-            # -- Material contrast rule --
             "MATERIAL CONTRAST RULE: Do NOT use the same material for everything! "
             "A real building uses at least 3 DISTINCT materials. For example:\n"
             "- MCM: dark_wood cladding + white_stucco contrast panels + black_metal frames + brick accent wall\n"
             "- Modern: white_stucco walls + charcoal trim + glass + black_metal columns\n"
             "- Craftsman: stone foundation + light_wood cladding + dark_wood beams\n"
             "Each detail's material MUST contrast with the cladding material.\n\n"
-            # -- Signature feature --
             "SIGNATURE FEATURE — THIS IS CRITICAL:\n"
             "Every great house has 1-2 unique, style-defining features that make it memorable. "
             "You MUST include 1-2 'signature' details that go BEYOND the standard template — "
             "something creative, exotic, and vital to the style that elevates it from generic "
             "to iconic. Think like a famous architect designing their masterpiece.\n\n"
-            "Examples of signature features by style (pick or invent your own):\n"
-            "- Mid-century modern: a dramatic stone chimney rising through the roofline, "
-            "a butterfly roof canopy over the entry, a breeze-block screen wall, "
-            "a floating concrete planter integrated into the facade\n"
-            "- Modern minimalist: a bold cantilevered concrete volume, a full-height "
-            "vertical garden wall, a dramatic deep-set entry portal, a corten rain screen\n"
-            "- Mediterranean: an arched loggia/colonnade, a decorative tile accent wall, "
-            "a courtyard-facing balcony with ornate ironwork, a bell tower element\n"
-            "- Craftsman: massive river-stone chimney, wraparound covered porch with "
-            "tapered columns on stone piers, a porte-cochère\n"
-            "- Scandinavian: a dramatic sauna-style wood-clad volume, living roof with "
-            "greenery, an asymmetric shed roof creating a soaring interior\n"
-            "- Industrial: a glass-enclosed stair tower, exposed steel cross-bracing, "
-            "a rooftop water-tower element, corrugated metal accent panels\n"
-            "- Victorian: a turret/tower volume, ornate gable trim (vergeboard), "
-            "a wraparound veranda, decorative fish-scale shingle accent\n"
-            "- Brutalist: a massive sculpted concrete canopy, a geometric light-well, "
-            "deeply recessed windows creating shadow patterns\n"
-            "- Tropical: a double-height louver screen wall, a thatched pavilion, "
-            "a planted green wall facade, open-air breezeway\n\n"
-            "Use existing detail types creatively to create these features. For example, "
-            "a chimney can be made tall and dramatic with stone material, a louver_screen "
-            "can become a breeze-block screen, a pergola can become a porte-cochère. "
-            "The signature feature should be the FIRST thing someone notices about the house.\n\n"
-            # -- Closing instructions --
             "IMPORTANT: The details array must NOT be empty — include at least 5 details "
             "that make the building look like real ICONIC architecture of the requested style. "
             "1-2 of those details should be your SIGNATURE features — bold, creative, style-defining. "
@@ -578,9 +382,11 @@ class ClaudeClient:
             "Return valid JSON only. Do NOT include any text before or after the JSON."
         )
 
+    # ── Response parsing (same as ClaudeClient) ──────────────────
+
     @staticmethod
     def _parse_json_response(response_text, context="response"):
-        """Parse JSON from Claude's response, handling markdown code blocks."""
+        """Parse JSON from LLM response, handling markdown code blocks."""
         # Try direct parse first
         try:
             return json.loads(response_text)
@@ -588,7 +394,6 @@ class ClaudeClient:
             pass
 
         # Try extracting from markdown code blocks
-        import re
         match = re.search(r"```(?:json)?\s*\n(.*?)\n```", response_text, re.DOTALL)
         if match:
             try:
@@ -596,4 +401,4 @@ class ClaudeClient:
             except json.JSONDecodeError:
                 pass
 
-        raise ValueError(f"Could not parse {context} from Claude response")
+        raise ValueError(f"Could not parse {context} from local LLM response")

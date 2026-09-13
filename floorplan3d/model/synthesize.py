@@ -2499,28 +2499,52 @@ _FONT_CANDIDATES = (
     "Arial.ttf",
 )
 _FONT_CACHE: dict[int, object] = {}
+# Smallest pixel size the active platform font can actually rasterize.
+# Some fonts (macOS Helvetica.ttc on Pillow 12) throw "division by zero"
+# in FreeType below ~8px; probed lazily and cached.
+_MIN_RENDERABLE_SIZE: int | None = None
+
+
+def _load_font(size: int):
+    for name in _FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(name, size)
+        except (OSError, IOError):
+            continue
+    # Last resort — PIL's bundled default. Size may be ignored on old
+    # Pillow, but labels still render without clipping on small rooms
+    # because the fitter will pick the layout that fits.
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _min_renderable_size() -> int:
+    """Probe the active font for the smallest size that renders without
+    raising. Cached. Falls back to 1 if every probed size works."""
+    global _MIN_RENDERABLE_SIZE
+    if _MIN_RENDERABLE_SIZE is not None:
+        return _MIN_RENDERABLE_SIZE
+    from PIL import Image, ImageDraw
+    probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+    smallest = 1
+    for size in range(1, 13):
+        try:
+            probe.textbbox((0, 0), "Mg", font=_load_font(size), anchor="lt")
+        except OSError:
+            smallest = size + 1
+    _MIN_RENDERABLE_SIZE = smallest
+    return smallest
 
 
 def _get_font(size: int):
-    """Return a scalable font at the requested pixel size, cached."""
-    from PIL import ImageFont
+    """Return a scalable font at the requested pixel size (clamped to a
+    size the platform can rasterize), cached."""
+    size = max(int(size), _min_renderable_size())
     if size in _FONT_CACHE:
         return _FONT_CACHE[size]
-    font = None
-    for name in _FONT_CANDIDATES:
-        try:
-            font = ImageFont.truetype(name, size)
-            break
-        except (OSError, IOError):
-            continue
-    if font is None:
-        # Last resort — PIL's bundled default. Size may be ignored on old
-        # Pillow, but labels still render without clipping on small rooms
-        # because the fitter will pick the layout that fits.
-        try:
-            font = ImageFont.load_default(size=size)
-        except TypeError:
-            font = ImageFont.load_default()
+    font = _load_font(size)
     _FONT_CACHE[size] = font
     return font
 
@@ -2542,9 +2566,30 @@ def _wrap_words(words: list[str], n_lines: int) -> list[str]:
 
 
 def _measure(draw, font, text: str) -> tuple[int, int]:
-    """Return (width, height) in pixels for a single-line string."""
-    x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=font, anchor="lt")
-    return x1 - x0, y1 - y0
+    """Return (width, height) in pixels for a single-line string.
+
+    Some platform fonts (notably macOS ``Helvetica.ttc`` on Pillow 12)
+    raise ``OSError: division by zero`` inside FreeType's ``getbbox`` at
+    very small pixel sizes (<=7px). The original training corpus was
+    generated on Linux with DejaVuSans, which is unaffected, so this only
+    bites local regeneration. We fall back to measuring at 2x and halving
+    — proportional and crash-free — so label fitting still works.
+    """
+    try:
+        x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=font, anchor="lt")
+        return x1 - x0, y1 - y0
+    except OSError:
+        size = getattr(font, "size", 0) or 0
+        if size:
+            big = _get_font(size * 2)
+            try:
+                x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=big,
+                                               anchor="lt")
+                return (x1 - x0) / 2.0, (y1 - y0) / 2.0
+            except OSError:
+                pass
+        # Last resort: estimate from glyph count so fitting still converges.
+        return len(text) * size * 0.55, float(size)
 
 
 def _draw_label_fitted(draw, centroid_px, text: str,

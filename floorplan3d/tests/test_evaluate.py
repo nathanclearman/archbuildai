@@ -320,6 +320,40 @@ class AggregateTest(unittest.TestCase):
         self.assertEqual(agg["mean_wall_length_ratio"], 1.0)
         self.assertEqual(agg["wall_length_ratio_defined_n"], 1)
 
+    def test_roomful_metrics_exclude_zero_room_gts(self):
+        # A perfect roomful sample plus a valid sample whose GT has no rooms
+        # (the converter dropped out-of-vocab labels). The all-sample room
+        # mean is diluted to 0.5; the *_roomful mean stays 1.0.
+        roomful = SampleMetrics(
+            slug="has_rooms", valid=True,
+            wall_count_pred=1, wall_count_gt=1,
+            door_count_pred=0, door_count_gt=0,
+            window_count_pred=0, window_count_gt=0,
+            room_count_pred=2, room_count_gt=2,
+            wall_length_ratio=1.0,
+            room_iou_coverage=1.0, room_iou_precision=1.0, room_iou_recall=1.0,
+            room_label_accuracy=1.0, room_label_accuracy_matched=1.0,
+            matched_rooms=2,
+        )
+        roomless = SampleMetrics(
+            slug="no_rooms", valid=True,
+            wall_count_pred=3, wall_count_gt=3,
+            door_count_pred=0, door_count_gt=0,
+            window_count_pred=0, window_count_gt=0,
+            room_count_pred=0, room_count_gt=0,
+            wall_length_ratio=1.0,
+            room_iou_coverage=0.0, room_iou_precision=0.0, room_iou_recall=0.0,
+            room_label_accuracy=0.0, room_label_accuracy_matched=0.0,
+            matched_rooms=0,
+        )
+        agg = aggregate([roomful, roomless])
+        self.assertEqual(agg["n_gt_zero_rooms"], 1)
+        self.assertEqual(agg["n_gt_with_rooms"], 1)
+        # Diluted all-sample mean vs undiluted roomful mean.
+        self.assertEqual(agg["mean_room_iou_coverage"], 0.5)
+        self.assertEqual(agg["mean_room_iou_coverage_roomful"], 1.0)
+        self.assertEqual(agg["mean_room_label_accuracy_matched_roomful"], 1.0)
+
 
 class RunEvalTest(unittest.TestCase):
     """End-to-end loop against the shipped real_mls fixtures."""

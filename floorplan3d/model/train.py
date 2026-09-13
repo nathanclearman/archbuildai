@@ -43,11 +43,78 @@ _sys.path.insert(0, str(Path(__file__).parent))
 from prompts import SYSTEM_PROMPT, USER_PROMPT  # type: ignore  # noqa: E402
 
 
+def _git_commit() -> dict:
+    """Best-effort git provenance. Never raises — a manifest that says
+    'unknown' is fine; a training run that crashes on `git` is not."""
+    import subprocess
+    here = str(Path(__file__).parent)
+
+    def _run(args):
+        try:
+            return subprocess.run(["git", "-C", here, *args],
+                                  capture_output=True, text=True,
+                                  timeout=5).stdout.strip()
+        except Exception:
+            return ""
+
+    sha = _run(["rev-parse", "HEAD"]) or "unknown"
+    dirty = bool(_run(["status", "--porcelain"]))
+    return {"commit": sha, "dirty": dirty}
+
+
+def _lib_versions() -> dict:
+    """Resolved versions of the libraries that affect numerics/output."""
+    from importlib import metadata
+    out = {}
+    for pkg in ("torch", "transformers", "peft", "bitsandbytes",
+                "accelerate", "pillow"):
+        try:
+            out[pkg] = metadata.version(pkg)
+        except Exception:
+            out[pkg] = "absent"
+    import platform
+    out["python"] = platform.python_version()
+    return out
+
+
+def write_run_manifest(out: Path, cfg: "TrainConfig", *,
+                       n_train: int, n_eval: int, base_revision: str | None) -> None:
+    """Write a reproducibility manifest beside the adapter: git SHA, library
+    versions, exact data counts, the held-out fold, seed, and a UTC stamp.
+    This is what lets a reviewer (or future you) reconstruct the run — the
+    adapter alone doesn't say what fold or commit produced it."""
+    from datetime import datetime, timezone
+    manifest = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "git": _git_commit(),
+        "library_versions": _lib_versions(),
+        "base_model": cfg.base_model,
+        "base_model_revision": base_revision,
+        "cubicasa_split_trained_on": cfg.cubicasa_split,
+        "cubicasa_root": cfg.cubicasa_root,
+        "synthetic_root": cfg.synthetic_root,
+        "n_train_samples": n_train,
+        "n_eval_samples": n_eval,
+        "seed": cfg.seed,
+        "config": cfg.__dict__,
+    }
+    (out / "run_manifest.json").write_text(json.dumps(manifest, indent=2))
+    print(f"wrote run manifest: {out / 'run_manifest.json'}")
+
+
 @dataclass
 class TrainConfig:
     base_model: str = "Qwen/Qwen2.5-VL-7B-Instruct"
+    # Pin the exact HF revision (commit/tag) of the base model. "main"
+    # drifts as Qwen pushes updates, which silently changes your results;
+    # pin a commit SHA for a reproducible paper.
+    base_revision: str | None = None
     cubicasa_root: str | None = None
     synthetic_root: str | None = None
+    # Official CubiCasa5k fold to TRAIN on. "train" holds val/test out so
+    # the held-out test fold is a valid benchmark. Set to None only for
+    # fixtures — None trains on every sample, contaminating any test eval.
+    cubicasa_split: str | None = "train"
     output_dir: str = "model/weights"
     epochs: int = 2
     per_device_batch_size: int = 1
@@ -77,6 +144,10 @@ class TrainConfig:
     # the run. 100 is enough for a stable eval_loss signal without
     # holding the training loop hostage.
     eval_max_samples: int = 100
+    # Where the HF Trainer streams metrics. "none" (default) keeps the run
+    # log-free as before; "tensorboard" writes event files to
+    # output_dir/runs so you get a training/eval-loss curve for the paper.
+    report_to: str = "none"
 
 
 # Prompt-side token budget the pre-filter has to subtract BEFORE
@@ -117,6 +188,7 @@ def build_samples(cfg: TrainConfig):
         synthetic_root=cfg.synthetic_root,
         shuffle=True,
         seed=cfg.seed,
+        cubicasa_split=cfg.cubicasa_split,
     )
     if not samples:
         raise RuntimeError(
@@ -124,36 +196,49 @@ def build_samples(cfg: TrainConfig):
             "extraction, or --synthetic at an output of synthesize.py."
         )
 
-    kept, dropped, char_budget = _filter_oversized_samples(samples, cfg.max_length)
+    from transformers import AutoProcessor  # type: ignore
+    tokenizer = AutoProcessor.from_pretrained(
+        cfg.base_model, trust_remote_code=True).tokenizer
+    kept, dropped, tok_budget = _filter_oversized_samples(
+        samples, cfg.max_length, tokenizer)
     if dropped:
         print(
-            f"pre-filter: dropped {dropped}/{len(samples)} samples with "
-            f"target JSON over {char_budget} chars (~{cfg.max_length} tokens). "
-            f"These would have crashed format_conversation mid-training."
+            f"pre-filter: dropped {dropped}/{len(samples)} samples whose target "
+            f"exceeds {tok_budget} tokens (max_length {cfg.max_length} - "
+            f"{PROMPT_OVERHEAD_TOKENS} prompt/image overhead). Exact token count; "
+            f"these would have crashed format_conversation mid-training."
         )
     print(f"loaded {len(kept)} samples")
     return kept
 
 
-def _filter_oversized_samples(samples, max_length):
-    """Drop samples whose raw target JSON exceeds the char budget.
+def _filter_oversized_samples(samples, max_length, tokenizer=None):
+    """Drop samples whose tokenized target won't fit alongside the prompt.
 
-    The budget accounts for both the per-sample prompt overhead
-    (PROMPT_OVERHEAD_TOKENS: system prompt + image tokens + role
-    markers — 1100-1500 tokens in practice for a 900px Qwen2.5-VL
-    input) and the conservative chars-per-token floor. The previous
-    version of this filter multiplied `max_length * 4.0` against the
-    raw target, ignoring prompt overhead entirely — a target with
-    ~12k chars passed the filter, tokenized to ~3000 target tokens +
-    ~1100 overhead = 4100 total, and crashed format_conversation
-    mid-training at step 496 (after ~4 hours of pod clock, no
-    checkpoint, full restart).
+    EXACT when a tokenizer is given: counts real target tokens and keeps only
+    those with target_tokens <= max_length - PROMPT_OVERHEAD_TOKENS. The prior
+    char-based estimate (MAX_TARGET_CHARS_PER_TOKEN=3.0) overcounted chars per
+    token for dense floor-plan JSON — coordinates/brackets tokenize closer to
+    ~2 chars/token — so oversized samples slipped through and crashed
+    format_conversation mid-training (e.g. a 6585-token sample at step 11,
+    with ~147/19200 samples over a 6144 budget but only ~10 caught). Measured
+    overhead is ~1300-1400 tokens; PROMPT_OVERHEAD_TOKENS=1500 keeps a margin.
+    Falls back to the char heuristic only when no tokenizer is available
+    (unit tests without model files on disk).
 
-    Returns (kept, dropped_count, char_budget). Pure function so it's
-    unit-testable without a dataset on disk.
+    Returns (kept, dropped_count, budget). Pure given its inputs, so still
+    unit-testable.
     """
-    available = max(0, max_length - PROMPT_OVERHEAD_TOKENS)
-    char_budget = int(available * MAX_TARGET_CHARS_PER_TOKEN)
+    token_budget = max(0, max_length - PROMPT_OVERHEAD_TOKENS)
+    if tokenizer is not None:
+        kept = [
+            s for s in samples
+            if len(tokenizer(s.target_json, add_special_tokens=False).input_ids)
+            <= token_budget
+        ]
+        return kept, len(samples) - len(kept), token_budget
+    # Fallback: coarse char estimate (no tokenizer, e.g. unit tests).
+    char_budget = int(token_budget * MAX_TARGET_CHARS_PER_TOKEN)
     kept = [s for s in samples if len(s.target_json) <= char_budget]
     return kept, len(samples) - len(kept), char_budget
 
@@ -295,18 +380,40 @@ class FloorPlanDS:
         return len(self.samples)
 
     def __getitem__(self, idx):
+        # Lazy import: qwen_vl_utils is a hard project dep (requirements.txt),
+        # but keeping it out of module scope preserves the `python train.py
+        # --help` no-ML-env contract documented at line 30. Python caches the
+        # import after first call, so per-batch overhead is zero.
+        from qwen_vl_utils.vision_process import smart_resize
         s = self.samples[idx]
         image = Image.open(s.image_path).convert("RGB")
-        # Downscale very large plans to keep token count tractable.
-        if max(image.size) > 1024:
-            image.thumbnail((1024, 1024))
+        # Qwen-aligned downscale (multiples of 28 = vision patch size;
+        # area capped at max_pixels). LANCZOS preserves the 2-3 px wall
+        # lines that PIL's default BICUBIC smears at heavy downscale
+        # ratios — the same input distribution inference.py sees, so the
+        # LoRA learns from and is sampled against identical image
+        # statistics. Drift here is silent: training-time and inference-
+        # time image preprocessing MUST match or eval metrics flag the
+        # divergence only after a full run. Keep this in sync with
+        # inference.py's run_vlm.
+        target_h, target_w = smart_resize(
+            image.height, image.width, factor=28, max_pixels=1024 * 1024
+        )
+        image = image.resize((target_w, target_h), Image.LANCZOS)
         return format_conversation(self.processor, image, s.target_json, self.max_length)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default=TrainConfig.base_model)
+    parser.add_argument("--base-revision", default=TrainConfig.base_revision,
+                        help="Pin the base model to an exact HF commit/tag for "
+                             "a reproducible run (default: latest 'main').")
     parser.add_argument("--cubicasa")
+    parser.add_argument("--cubicasa-split", default=TrainConfig.cubicasa_split,
+                        help="Official CubiCasa fold to train on (train/val/"
+                             "test). Default 'train' holds val+test out for a "
+                             "valid benchmark. Pass 'none' only for fixtures.")
     parser.add_argument("--synthetic")
     parser.add_argument("--out", default=TrainConfig.output_dir)
     parser.add_argument("--epochs", type=int, default=TrainConfig.epochs)
@@ -328,6 +435,10 @@ def main():
                              "a stable eval_loss; anything larger just makes "
                              "each eval pause longer without improving signal.")
     parser.add_argument("--seed", type=int, default=TrainConfig.seed)
+    parser.add_argument("--report-to", default=TrainConfig.report_to,
+                        help="HF Trainer logging backend: 'none' (default) or "
+                             "'tensorboard' to emit a loss curve under "
+                             "<out>/runs for the paper.")
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
 
@@ -348,9 +459,14 @@ def main():
             f"is mirrored, or pass both with the same value."
         )
 
+    # "none" (any case) disables fold filtering; otherwise pass through.
+    cubicasa_split = None if str(args.cubicasa_split).lower() == "none" else args.cubicasa_split
+
     cfg = TrainConfig(
         base_model=args.base,
+        base_revision=args.base_revision,
         cubicasa_root=args.cubicasa,
+        cubicasa_split=cubicasa_split,
         synthetic_root=args.synthetic,
         output_dir=args.out,
         epochs=args.epochs,
@@ -363,6 +479,7 @@ def main():
         eval_steps=args.eval_steps,
         eval_max_samples=args.eval_max_samples,
         seed=args.seed,
+        report_to=args.report_to,
     )
 
     # Heavy imports here so --help works without ML deps.
@@ -400,9 +517,11 @@ def main():
     )
 
     print(f"loading base model: {cfg.base_model}")
-    processor = AutoProcessor.from_pretrained(cfg.base_model, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(
+        cfg.base_model, revision=cfg.base_revision, trust_remote_code=True)
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         cfg.base_model,
+        revision=cfg.base_revision,
         quantization_config=bnb_config,
         device_map="auto",
         torch_dtype=torch.bfloat16,
@@ -469,6 +588,12 @@ def main():
         output_dir=cfg.output_dir,
         num_train_epochs=cfg.epochs,
         per_device_train_batch_size=cfg.per_device_batch_size,
+        # Eval MUST also be batch-1. The VLM data_collator's multi-sample path
+        # torch.cat's per-image pixel_values/grids whose patch counts differ
+        # across plans, which crashes the FIRST eval (eval batch defaults to 8)
+        # even though batch-1 training is fine. Matching eval to the train
+        # batch size keeps the collator on its proven single-sample path.
+        per_device_eval_batch_size=1,
         gradient_accumulation_steps=cfg.grad_accum,
         learning_rate=cfg.learning_rate,
         warmup_ratio=cfg.warmup_ratio,
@@ -503,7 +628,7 @@ def main():
         # H100 on PIL; 2 is enough for a single-GPU VLM job and avoids
         # worker-fork overhead that larger values impose.
         dataloader_num_workers=cfg.dataloader_num_workers,
-        report_to="none",
+        report_to=cfg.report_to,
         remove_unused_columns=False,
         seed=cfg.seed,
     )
@@ -524,6 +649,8 @@ def main():
     trainer.save_model(str(out / "adapter"))
     processor.save_pretrained(str(out / "processor"))
     (out / "train_config.json").write_text(json.dumps(cfg.__dict__, indent=2))
+    write_run_manifest(out, cfg, n_train=len(train_samples),
+                       n_eval=len(eval_samples), base_revision=cfg.base_revision)
     print(f"done. adapter + processor saved to {out}")
 
 

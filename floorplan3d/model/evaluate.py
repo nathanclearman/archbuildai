@@ -348,6 +348,13 @@ def aggregate(per_sample: list[SampleMetrics]) -> dict:
     """
     n = len(per_sample)
     valid = [m for m in per_sample if m.valid]
+    # Room IoU/label metrics are 0 for every predictor when the GT itself
+    # has no rooms (e.g. CubiCasa plans whose labels fall outside our
+    # vocabulary — ~6.5% of the test fold). Averaging those in silently
+    # drags every room score down equally. Report a parallel "roomful"
+    # block over GTs that actually contain rooms so the room metrics
+    # aren't diluted, while keeping the all-sample block for transparency.
+    valid_roomful = [m for m in valid if m.room_count_gt > 0]
 
     def abs_err(field_pred: str, field_gt: str):
         return [abs(getattr(m, field_pred) - getattr(m, field_gt)) for m in per_sample]
@@ -379,6 +386,14 @@ def aggregate(per_sample: list[SampleMetrics]) -> dict:
         "mean_room_label_accuracy": _mean([m.room_label_accuracy for m in valid]),
         "mean_room_label_accuracy_matched": _mean([m.room_label_accuracy_matched for m in valid]),
         "mean_matched_room_recall": _mean([recall(m) for m in valid]),
+        # Room metrics over GTs that actually have rooms (undiluted).
+        "n_gt_with_rooms": sum(1 for m in per_sample if m.room_count_gt > 0),
+        "n_gt_zero_rooms": sum(1 for m in per_sample if m.room_count_gt == 0),
+        "mean_room_iou_coverage_roomful": _mean([m.room_iou_coverage for m in valid_roomful]),
+        "mean_room_iou_precision_roomful": _mean([m.room_iou_precision for m in valid_roomful]),
+        "mean_room_iou_recall_roomful": _mean([m.room_iou_recall for m in valid_roomful]),
+        "mean_room_label_accuracy_matched_roomful": _mean([m.room_label_accuracy_matched for m in valid_roomful]),
+        "mean_matched_room_recall_roomful": _mean([recall(m) for m in valid_roomful]),
     }
 
 
@@ -443,15 +458,90 @@ def cv_predictor(_samples: Iterable[Sample] | None = None, ppm: float = 50.0) ->
 
 
 def vlm_predictor(_samples: Iterable[Sample] | None = None,
-                  weights_dir: Path | str | None = None) -> Predictor:
+                  weights_dir: Path | str | None = None,
+                  max_new_tokens: int = 8192) -> Predictor:
     """Fine-tuned VLM predictor. Same lazy-import discipline as cv.
     Default weights dir is resolved relative to this file, not CWD, so
-    direct callers don't get surprised by CWD-sensitive path resolution."""
-    from inference import run_vlm  # type: ignore
+    direct callers don't get surprised by CWD-sensitive path resolution.
+
+    The 7B model is loaded ONCE here and reused across every image —
+    `run_vlm` reloads per call, which would reload the model 400x on a
+    full test fold (hours of pure load time). max_new_tokens defaults to
+    8192 (not inference.py's 2048) because ~14% of CubiCasa test plans
+    serialize to >2048 output tokens; a tighter cap truncates the JSON
+    and scores a correct-but-cut-off prediction as a parse failure."""
+    from inference import _load_vlm, _run_vlm_inference  # type: ignore
     weights = Path(weights_dir) if weights_dir is not None else Path(__file__).parent / "weights"
+    model, processor = _load_vlm(weights)
 
     def _predict(image_path: str) -> Plan:
-        return run_vlm(image_path, weights)
+        return _run_vlm_inference(model, processor, image_path,
+                                  max_new_tokens=max_new_tokens)
+    return _predict
+
+
+# CubiCasa images are all named F1_scaled.png, so the filename stem is not
+# unique — the parent dir (the plan id, e.g. 1191) is. Generic stems route
+# to the parent name; everything else keeps its own stem.
+_GENERIC_STEMS = {"F1_scaled", "F1_original"}
+
+
+def _eval_slug(image_path: str | Path) -> str:
+    p = Path(image_path)
+    return p.parent.name if p.stem in _GENERIC_STEMS else p.stem
+
+
+def base_vlm_predictor(_samples: Iterable[Sample] | None = None,
+                       base_model: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+                       max_new_tokens: int = 8192) -> Predictor:
+    """Zero-shot base VLM predictor (NO fine-tuned adapter). This is the
+    contamination-free generative extractor used for the budget-sweep
+    experiment: it never trained on CubiCasa, so scoring it on the test fold
+    is valid, and it runs on Apple Silicon (fp16/MPS) with no GPU and no
+    training. Loaded once and reused across images, like vlm_predictor.
+
+    Same prompt path as the fine-tuned model (reuses _run_vlm_inference), so
+    the only difference vs. --predictor vlm is the absence of the adapter."""
+    import torch  # type: ignore
+    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration  # type: ignore
+    from inference import _run_vlm_inference  # type: ignore
+
+    processor = AutoProcessor.from_pretrained(base_model, trust_remote_code=True)
+    dtype = torch.float16 if torch.backends.mps.is_available() else torch.bfloat16
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        base_model, torch_dtype=dtype, device_map="auto", trust_remote_code=True)
+    model.eval()
+
+    def _predict(image_path: str) -> Plan:
+        return _run_vlm_inference(model, processor, image_path,
+                                  max_new_tokens=max_new_tokens)
+    return _predict
+
+
+def dir_predictor(_samples: Iterable[Sample] | None = None,
+                  pred_dir: Path | str | None = None) -> Predictor:
+    """Score pre-computed predictions from a directory of JSON files.
+
+    This is how an EXTERNAL model — notably the original CubiCasa CNN — is
+    benchmarked in this metric space without importing its dependencies:
+    run that model separately, dump one canonical-schema JSON per plan into
+    pred_dir (named by plan id, e.g. 1191.json, or by image stem), then
+    `evaluate.py --predictor dir --pred-dir <that dir>`. Looked up by the
+    same slug rule used for scoring, with a stem fallback.
+    """
+    base = Path(pred_dir) if pred_dir is not None else None
+    if base is None or not base.is_dir():
+        raise FileNotFoundError(f"--pred-dir not a directory: {pred_dir}")
+
+    def _predict(image_path: str) -> Plan:
+        p = Path(image_path)
+        for key in (_eval_slug(p), p.stem, p.parent.name):
+            f = base / f"{key}.json"
+            if f.exists():
+                return json.loads(f.read_text())
+        raise FileNotFoundError(
+            f"no prediction JSON for {_eval_slug(p)} (or {p.stem}) in {base}"
+        )
     return _predict
 
 
@@ -463,6 +553,8 @@ PREDICTOR_BUILDERS: dict[str, Callable[..., Predictor]] = {
     "null": null_predictor,
     "cv": cv_predictor,
     "vlm": vlm_predictor,
+    "base-vlm": base_vlm_predictor,
+    "dir": dir_predictor,
 }
 
 
@@ -471,26 +563,72 @@ PREDICTOR_BUILDERS: dict[str, Callable[..., Predictor]] = {
 ERROR_MSG_MAX_CHARS = 200
 
 
-def run_eval(samples: Iterable[Sample], predict: Predictor) -> tuple[list[SampleMetrics], dict]:
+def run_eval(samples: Iterable[Sample], predict: Predictor,
+             dump_dir: Path | str | None = None,
+             resume: bool = False) -> tuple[list[SampleMetrics], dict]:
+    import time
     per_sample: list[SampleMetrics] = []
-    for s in samples:
+    samples = list(samples)
+    n = len(samples)
+    # When dumping, persist the raw geometry run_eval otherwise discards. The
+    # bare prediction goes to <dump>/<slug>.json — the exact layout
+    # dir_predictor reads — so a dump re-scores with `--predictor dir
+    # --pred-dir <dump>` and zero GPU. Ground truth goes to <dump>/gt/<slug>.json
+    # so it does not shadow predictions during that re-score, and so the
+    # registration / wall-length analyses are self-contained (no dataset or
+    # SVG reload). A dump_index.json records which slugs have a usable
+    # prediction, so analyses can separate "model failed to parse" from
+    # "model produced geometry we then scored".
+    dump = Path(dump_dir) if dump_dir else None
+    dump_index: dict[str, dict] = {}
+    if dump is not None:
+        (dump / "gt").mkdir(parents=True, exist_ok=True)
+    for i, s in enumerate(samples, 1):
+        t0 = time.time()
         gt = json.loads(s.target_json)
+        slug = _eval_slug(s.image_path)
         err: str | None = None
-        try:
-            pred = predict(str(s.image_path))
-            validate(pred)
-        except Exception as e:
-            # Any predictor failure (missing deps, malformed output, schema
-            # violation) becomes a row with valid=False carrying the
-            # exception message, so eval always produces a complete report
-            # and downstream consumers don't need stderr to diagnose.
-            # Truncated to keep the aggregate JSON readable when dozens of
-            # samples fail with the same long stack trace message.
-            err = f"{type(e).__name__}: {e}"[:ERROR_MSG_MAX_CHARS]
-            print(f"[eval] {s.image_path.name}: predictor failed: {err}", file=sys.stderr)
-            pred = None
-        m = evaluate_sample(s.image_path.stem, pred, gt, error=err)
+        pred = None
+        # Resume/checkpoint: if a prior run already dumped a valid prediction
+        # for this slug, reuse it instead of re-running (expensive GPU/MPS)
+        # inference. The dump is thus a crash-safe checkpoint — a machine that
+        # sleeps, shuts down, or loses power loses at most the in-flight plan,
+        # and re-invoking with --resume continues from where it stopped.
+        if resume and dump is not None and (dump / f"{slug}.json").exists():
+            try:
+                pred = json.loads((dump / f"{slug}.json").read_text())
+                validate(pred)
+                print(f"[eval] {i}/{n} {s.image_path.name} RESUMED (cached)",
+                      file=sys.stderr, flush=True)
+            except Exception:
+                pred = None  # partial/corrupt dump -> fall through and re-run
+        if pred is None:
+            try:
+                pred = predict(str(s.image_path))
+                validate(pred)
+            except Exception as e:
+                # Any predictor failure (missing deps, malformed output, schema
+                # violation) becomes a row with valid=False carrying the
+                # exception message, so eval always produces a complete report
+                # and downstream consumers don't need stderr to diagnose.
+                # Truncated to keep the aggregate JSON readable when dozens of
+                # samples fail with the same long stack trace message.
+                err = f"{type(e).__name__}: {e}"[:ERROR_MSG_MAX_CHARS]
+                print(f"[eval] {s.image_path.name}: predictor failed: {err}", file=sys.stderr)
+                pred = None
+        m = evaluate_sample(slug, pred, gt, error=err)
         per_sample.append(m)
+        if dump is not None:
+            (dump / "gt" / f"{slug}.json").write_text(json.dumps(gt))
+            if pred is not None:
+                (dump / f"{slug}.json").write_text(json.dumps(pred))
+            dump_index[slug] = {"valid": pred is not None,
+                                "image": str(s.image_path), "error": err}
+            (dump / "dump_index.json").write_text(json.dumps(dump_index, indent=2))
+        # Live progress: flushed per-sample so long MPS runs aren't a black box.
+        print(f"[eval] {i}/{n} {s.image_path.name} "
+              f"{'OK' if err is None else 'FAIL'} {time.time() - t0:.1f}s",
+              file=sys.stderr, flush=True)
     agg = aggregate(per_sample)
     return per_sample, agg
 
@@ -524,20 +662,69 @@ def format_report(per_sample: list[SampleMetrics], agg: dict) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--real-mls", required=True, help="path to real_mls dataset root")
+    ap.add_argument("--real-mls", help="path to real_mls dataset root")
+    ap.add_argument("--cubicasa", help="path to CubiCasa5k root; scores against "
+                    "the official held-out fold (see --cubicasa-split)")
+    ap.add_argument("--cubicasa-split", default="test",
+                    help="CubiCasa fold to evaluate on (default 'test'). Only "
+                         "valid if the model trained with this fold held out.")
     ap.add_argument("--predictor", choices=tuple(PREDICTOR_BUILDERS), default="null")
     ap.add_argument("--weights", default=str(Path(__file__).parent / "weights"),
                     help="VLM weights dir (only used with --predictor vlm)")
+    ap.add_argument("--max-new-tokens", type=int, default=8192,
+                    help="VLM generation cap. Default 8192 so dense plans "
+                         "(~14%% of CubiCasa test exceed 2048) aren't truncated "
+                         "into parse failures.")
     ap.add_argument("--ppm", type=float, default=50.0,
                     help="pixels-per-meter prior for the CV predictor")
+    ap.add_argument("--pred-dir",
+                    help="dir of pre-computed prediction JSONs (--predictor dir); "
+                         "e.g. dumped CubiCasa-CNN outputs to benchmark as baseline")
+    ap.add_argument("--dump-pred", metavar="DIR",
+                    help="persist raw predictions to DIR (one <slug>.json per "
+                         "plan, plus gt/<slug>.json and dump_index.json). The "
+                         "prediction layout is a drop-in --pred-dir, so the run "
+                         "re-scores with `--predictor dir` and no GPU; the gt/ "
+                         "copies make register_iou.py / wall_length_split.py "
+                         "self-contained.")
+    ap.add_argument("--resume", action="store_true",
+                    help="treat an existing --dump-pred DIR as a checkpoint: "
+                         "reuse already-dumped predictions and only run inference "
+                         "for the plans still missing. Safe to re-invoke after a "
+                         "crash, sleep, or shutdown without redoing finished work.")
     ap.add_argument("--json", action="store_true",
                     help="emit machine-readable JSON instead of the human report")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="cap the eval set to N samples, selected EVENLY across "
+                         "the complexity range (so the subset stays complexity-"
+                         "stratified). 0 = all. Use to bound GPU cost on the "
+                         "base-vlm budget sweep.")
     args = ap.parse_args()
 
-    samples = build_eval_set(real_mls_root=args.real_mls)
+    if not args.real_mls and not args.cubicasa:
+        ap.error("provide --real-mls and/or --cubicasa")
+
+    samples = build_eval_set(
+        real_mls_root=args.real_mls,
+        cubicasa_root=args.cubicasa,
+        cubicasa_split=args.cubicasa_split,
+    )
     if not samples:
-        print(f"[eval] no samples under {args.real_mls}", file=sys.stderr)
+        srcs = " / ".join(filter(None, [args.real_mls, args.cubicasa]))
+        print(f"[eval] no samples under {srcs}", file=sys.stderr)
         sys.exit(1)
+
+    if args.limit and len(samples) > args.limit:
+        # Sort by GT complexity (element count) and take evenly-spaced indices,
+        # so the capped set still spans simple->complex plans — essential for
+        # the budget sweep, which is ABOUT the complexity axis.
+        def _complexity(s):
+            d = json.loads(s.target_json)
+            return len(d["walls"]) + len(d["doors"]) + len(d["windows"]) + len(d["rooms"])
+        ordered = sorted(samples, key=_complexity)
+        step = len(ordered) / args.limit
+        samples = [ordered[min(len(ordered) - 1, int(i * step))] for i in range(args.limit)]
+        print(f"[eval] limit: {args.limit} complexity-stratified samples", file=sys.stderr)
 
     build = PREDICTOR_BUILDERS[args.predictor]
     kwargs: dict = {}
@@ -545,9 +732,19 @@ def main():
         kwargs["ppm"] = args.ppm
     elif args.predictor == "vlm":
         kwargs["weights_dir"] = args.weights
+        kwargs["max_new_tokens"] = args.max_new_tokens
+    elif args.predictor == "base-vlm":
+        kwargs["max_new_tokens"] = args.max_new_tokens
+    elif args.predictor == "dir":
+        if not args.pred_dir:
+            ap.error("--predictor dir requires --pred-dir")
+        kwargs["pred_dir"] = args.pred_dir
     predict = build(samples, **kwargs)
 
-    per_sample, agg = run_eval(samples, predict)
+    if args.resume and not args.dump_pred:
+        ap.error("--resume requires --dump-pred DIR (the checkpoint location)")
+    per_sample, agg = run_eval(samples, predict, dump_dir=args.dump_pred,
+                               resume=args.resume)
 
     if args.json:
         print(json.dumps({
