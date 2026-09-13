@@ -10,7 +10,7 @@ natural-language edits) use the Claude API with your own key.
 
 | Input: a listing floor plan | Output: the generated Blender model |
 |---|---|
-| ![input](docs/example_input.png) | ![3d](docs/example_3d.png) |
+| ![input](docs/example_input.png) | ![3d](docs/example_model.png) |
 
 ## How it works
 
