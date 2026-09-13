@@ -8,9 +8,9 @@ objects you can edit, render, or export. Everything runs locally on your machine
 Optional "Premium" features (furniture placement, exterior generation, layout critique,
 natural-language edits) use the Claude API with your own key.
 
-| Input plan → detected geometry and labels | Generated 3D model |
+| Input: a listing floor plan | Output: the generated Blender model |
 |---|---|
-| ![overlay](docs/example_overlay.png) | ![3d](docs/example_3d.png) |
+| ![input](docs/example_input.png) | ![3d](docs/example_3d.png) |
 
 ## How it works
 
